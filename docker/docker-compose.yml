@@ -1,0 +1,35 @@
+# Docker Compose definition for the local PartGraph Dgraph instance.
+#
+# Security posture: every port is bound to 127.0.0.1 (loopback) only. Dgraph
+# standalone ships without authentication, so the loopback binding is the
+# access control. Do NOT bind these ports to all interfaces or expose them
+# publicly.
+#
+# Image pinning: the image is pinned to a specific tag (v25.3.4) rather than a
+# content digest. For a single-developer local tool this is an accepted risk:
+# the tag is immutable in practice for a released version, and a digest pin
+# would make routine upstream patch upgrades unnecessarily painful. Production
+# deployments should pin to a digest.
+
+services:
+  dgraph:
+    image: dgraph/standalone:v25.3.4
+    # Explicit container name so integration tests can filter by name and never
+    # match a foreign container (e.g. a cve-graph stack on the same machine).
+    container_name: partgraph-dgraph
+    restart: unless-stopped
+    ports:
+      # host_ip:host_port:container_port — host ports are offset by +1 because
+      # 8080/9080 are reserved by other local stacks on this machine.
+      - "127.0.0.1:8081:8080"   # Alpha HTTP / health
+      - "127.0.0.1:9081:9080"   # Alpha gRPC (pydgraph)
+      - "127.0.0.1:8001:8000"   # Ratel / admin UI
+    volumes:
+      # Named volume keeps all Dgraph state across `db down` and restarts.
+      - "partgraph_dgraph_data:/dgraph"
+
+volumes:
+  partgraph_dgraph_data:
+    # Explicit name so the volume is not prefixed with the compose project name;
+    # integration tests assert the volume name ends with partgraph_dgraph_data.
+    name: partgraph_dgraph_data

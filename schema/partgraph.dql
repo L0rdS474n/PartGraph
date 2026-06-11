@@ -1,0 +1,172 @@
+# PartGraph Dgraph schema (DQL).
+#
+# Applied via `partgraph db apply-schema` (pydgraph alter over gRPC on
+# 127.0.0.1:9081). All predicates and node types for the electronic-component
+# graph are declared here. Promoted numeric parameters are SI-normalised at
+# ingestion time; the long tail of attributes is modelled via AttrValue nodes.
+#
+# Vector search requires Dgraph >= v24; this project pins dgraph/standalone
+# v25.3.4. The `embedding` predicate uses an HNSW index with the cosine metric.
+
+# ---------------------------------------------------------------------------
+# Identity and naming
+# ---------------------------------------------------------------------------
+
+# Deduplication key: "mpn_norm|mfr_norm". @upsert enables conflict-free upserts.
+xid:            string @index(exact) @upsert .
+
+# Manufacturer part number (raw) and its normalised form (uppercase, [A-Z0-9]).
+mpn:            string @index(exact, trigram) .
+mpn_norm:       string @index(exact, trigram) .
+
+# PartFamily display name (e.g. "MAX232").
+family_name:    string @index(exact, term, trigram) .
+
+# Free-text description used for full-text search.
+description:    string @index(fulltext) .
+
+# Generic display name for Manufacturer / Category / Package / Tag nodes.
+name:           string @index(exact, term, trigram) .
+
+# ---------------------------------------------------------------------------
+# Datasheet
+# ---------------------------------------------------------------------------
+
+# Datasheet URL (PDFs are never stored, only linked).
+url:            string @index(exact) .
+# Datasheet provenance metadata.
+source:         string .
+verified_at:    datetime .
+http_status:    int .
+
+# ---------------------------------------------------------------------------
+# Promoted numeric parameters (SI-normalised floats)
+# ---------------------------------------------------------------------------
+
+voltage_min:    float @index(float) .
+voltage_max:    float @index(float) .
+current_max:    float @index(float) .
+resistance:     float @index(float) .
+capacitance:    float @index(float) .
+inductance:     float @index(float) .
+frequency_max:  float @index(float) .
+power:          float @index(float) .
+tolerance_pct:  float @index(float) .
+
+# ---------------------------------------------------------------------------
+# Long-tail attributes (AttrValue nodes)
+# ---------------------------------------------------------------------------
+
+attr_name:      string @index(term) .
+attr_value:     string @index(term) .
+attr_value_num: float @index(float) .
+
+# ---------------------------------------------------------------------------
+# Semantic search and commercial metadata
+# ---------------------------------------------------------------------------
+
+# Sentence-embedding vector for semantic similarity search.
+embedding:      float32vector @index(hnsw(metric: "cosine")) .
+
+stock:          int @index(int) .
+is_basic:       bool @index(bool) .
+price_usd:      float @index(float) .
+lcsc_id:        string @index(exact) .
+
+# Provenance markers, e.g. "jlcparts@2026-06-11".
+source_refs:    [string] .
+
+# ---------------------------------------------------------------------------
+# Edge predicates (graph relationships)
+# ---------------------------------------------------------------------------
+
+# Part -> related nodes (multi-valued, reverse-traversable).
+made_by:        [uid] @reverse .
+in_category:    [uid] @reverse .
+in_package:     [uid] @reverse .
+datasheet:      [uid] @reverse .
+tagged:         [uid] @reverse .
+attr:           [uid] @reverse .
+
+# Part -> single parent variant (e.g. MAX232ACPE+ -> MAX232).
+variant_of:     uid @reverse .
+
+# Symmetric, multi-valued equivalence between parts (prepared, unused in v1).
+equivalent_to:  [uid] @reverse .
+
+# Category hierarchy: Category -> parent Category.
+parent:         uid @reverse .
+
+# ---------------------------------------------------------------------------
+# Node types
+# ---------------------------------------------------------------------------
+
+type Part {
+    xid
+    mpn
+    mpn_norm
+    description
+    voltage_min
+    voltage_max
+    current_max
+    resistance
+    capacitance
+    inductance
+    frequency_max
+    power
+    tolerance_pct
+    embedding
+    stock
+    is_basic
+    price_usd
+    lcsc_id
+    source_refs
+    made_by
+    in_category
+    in_package
+    datasheet
+    tagged
+    attr
+    variant_of
+    equivalent_to
+}
+
+type PartFamily {
+    family_name
+    description
+    source_refs
+}
+
+type Manufacturer {
+    name
+    source_refs
+}
+
+type Category {
+    name
+    parent
+    source_refs
+}
+
+type Package {
+    name
+    source_refs
+}
+
+type Datasheet {
+    url
+    source
+    verified_at
+    http_status
+    source_refs
+}
+
+type Tag {
+    name
+}
+
+type AttrValue {
+    attr_name
+    attr_value
+    attr_value_num
+}

@@ -1,0 +1,26 @@
+# Conda environment for PartGraph contributors.
+#
+# The project maintainer uses a pre-existing conda environment; this file is
+# provided so external contributors can reproduce a working environment.
+#
+#   conda env create -f environment.yml
+#   conda activate partgraph
+#   pip install -e ".[dev]"
+#
+# Python dependencies mirror pyproject.toml and are installed via pip so the
+# package metadata (and the `partgraph` console script) stay authoritative.
+name: partgraph
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - typer
+      - rich
+      - pydgraph
+      - httpx
+      - pyyaml
+      - requests
+      - pytest
+      - ruff

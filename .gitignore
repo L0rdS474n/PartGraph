@@ -1,0 +1,48 @@
+# --- Data (never redistributed; every user builds the database locally) ---
+data/
+staging/
+exports/
+dgraph-export/
+*.sqlite3
+*.jsonl
+*.csv
+
+# --- Secrets and local environment ---
+.env
+.env.*
+*.env
+# The committed example file carries only placeholders and must be tracked.
+!.env.example
+
+# --- Models and embedding caches ---
+models/
+model_cache/
+*.gguf
+*.bin
+*.safetensors
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+*.whl
+
+# --- Tool / agent state and caches ---
+.remember/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.log
+.claude/
+
+# --- OS noise ---
+.DS_Store
+Thumbs.db

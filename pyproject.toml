@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "partgraph"
+version = "0.1.0"
+description = "Local Dgraph graph database for electronic components: manufacturers, variants, parameters and datasheet links, with future semantic search."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "L0rdS474n" }]
+keywords = ["dgraph", "electronics", "components", "graph-database", "datasheet"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+dependencies = [
+    "typer",
+    "rich",
+    "pydgraph",
+    "httpx",
+    "pyyaml",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/L0rdS474n/PartGraph"
+Repository = "https://github.com/L0rdS474n/PartGraph"
+
+# The console script targets a zero-argument callable.  `partgraph.cli:main`
+# wraps the module-level `app` Typer object (which the test-suite imports
+# directly) so both the entry point and `from partgraph.cli import app` work.
+[project.scripts]
+partgraph = "partgraph.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests that require a running Dgraph instance (deselect with -m 'not integration')",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "W",    # pycodestyle warnings
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "PL",   # pylint
+    "BLE",  # flake8-blind-except
+    "RUF",  # ruff-specific rules
+]
+
+# The test suite is the executable contract and uses patterns that are
+# idiomatic in tests but noisy under the production ruleset: magic values in
+# assertions, intentional module-level / lazy imports, subprocess.run without an
+# explicit check, and so on. Relax exactly those rules for tests/ only; the
+# src/ tree keeps the full ruleset.
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "PLR2004",  # magic value used in comparison (expected in assertions)
+    "PLW1510",  # subprocess.run without explicit check (tests inspect output)
+    "PLC0415",  # import not at top level (tests use guarded/lazy imports)
+    "B007",     # loop control variable not used within the loop body
+    "E501",     # line too long (long assertion messages)
+    "F401",     # imported but unused (intentional import-for-collection-error)
+    "F841",     # local variable assigned but never used
+    "I001",     # import block is un-sorted (test import ordering is documented)
+    "RUF005",   # consider iterable unpacking instead of concatenation
+    "RUF100",   # unused noqa (test files carry their own documented noqas)
+    "SIM102",   # nested if (kept explicit for readability in tests)
+]

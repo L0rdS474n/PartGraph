@@ -1,0 +1,35 @@
+name: CI
+
+# Least-privilege default token: the CI job only needs to read the repository.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  CI:
+    name: CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project with dev extras
+        run: pip install -e ".[dev]"
+
+      - name: Lint with ruff
+        run: ruff check .
+
+      # Unit tests only. Integration tests require a running Dgraph instance and
+      # are executed locally (they need a local Docker setup), never in CI.
+      - name: Run unit tests
+        run: pytest -m "not integration"
