@@ -157,14 +157,17 @@ def cleanup_marker_nodes(dgraph_pydgraph_client):
             node["uid"] for node in data.get("nodes", [])
         ]
         if uids_to_delete:
-            # Explicitly delete the marker and xid predicates as well as the
-            # whole node. In Dgraph v25, `<uid> * * .` alone does not reliably
-            # clear an unindexed predicate from the `has()` posting list, so we
-            # delete the named predicates too for deterministic teardown.
+            # Explicitly delete the marker, xid and embedding predicates as well
+            # as the whole node. In Dgraph v25, `<uid> * * .` alone does NOT
+            # reliably clear an indexed `float32vector` predicate (the embedding
+            # value survives and lingers in the hnsw index — a stale vector of a
+            # different dimension then poisons later inserts). Deleting the named
+            # predicates explicitly is required for deterministic teardown.
             parts: list[str] = []
             for uid in uids_to_delete:
                 parts.append(f"<{uid}> <{TEST_MARKER_PREDICATE}> * .")
                 parts.append(f"<{uid}> <xid> * .")
+                parts.append(f"<{uid}> <embedding> * .")
                 parts.append(f"<{uid}> * * .")
             mutation = pydgraph.Mutation(del_nquads="\n".join(parts).encode())
             txn.mutate(mutation=mutation)

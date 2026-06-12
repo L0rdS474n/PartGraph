@@ -14,8 +14,9 @@ loads the heavy model stack.
 Write contract (AC-EW)
 ----------------------
 Each successfully embedded part produces a mutation object that is *exactly*
-``{"uid": "<resolved_uid>", "embedding": [...]}`` — the resolved uid string
-(never a blank node), the embedding vector, and nothing else. A part without an
+``{"uid": "<resolved_uid>", "embedding": "[...]"}`` — the resolved uid string
+(never a blank node) and the embedding encoded as Dgraph's ``float32vector``
+string literal (see :func:`_vector_literal`), and nothing else. A part without an
 ``xid`` (so it cannot be resolved to an existing node) or whose embedding text is
 empty produces no mutation, so the run never mints new nodes.
 """
@@ -201,6 +202,21 @@ def _select_eligible_parts(parts: list[Any]) -> tuple[list[tuple[Any, str]], int
     return eligible, skipped
 
 
+def _vector_literal(vector: list[float]) -> str:
+    """Encode a float vector as Dgraph's ``float32vector`` string literal.
+
+    A ``float32vector`` predicate written through a JSON mutation must receive its
+    value as the bracketed *string* ``"[0.1, 0.2, ...]"`` — NOT a native JSON
+    array of floats. Passing a raw list makes Dgraph read each element as a
+    separate ``FLOAT`` edge and reject the mutation with *"Input for predicate
+    'embedding' of type vector is not vector. Did you forget to add quotes before
+    []?"*. This mirrors the inline literal the read side
+    (:func:`partgraph.query.dql_builder.build_semantic_dql`) feeds to
+    ``similar_to`` — both sides use the same bracketed-string form.
+    """
+    return "[" + ", ".join(repr(float(component)) for component in vector) + "]"
+
+
 def _build_batch_payload(
     window: list[tuple[Any, str]],
     vectors: list[list[float]],
@@ -208,9 +224,11 @@ def _build_batch_payload(
 ) -> tuple[list[dict[str, Any]], int]:
     """Return ``(payload, skipped)`` for one batch.
 
-    Each payload object is exactly ``{"uid": <resolved_uid>, "embedding": [...]}``
-    (resolved uid from the lookup, else the part's own ``uid``). A part that
-    resolves to no uid is skipped (never minted as a new node).
+    Each payload object is exactly ``{"uid": <resolved_uid>, "embedding": "[...]"}``
+    — the resolved uid (from the lookup, else the part's own ``uid``) and the
+    embedding encoded as Dgraph's vector string literal (see
+    :func:`_vector_literal`). A part that resolves to no uid is skipped (never
+    minted as a new node).
     """
     payload: list[dict[str, Any]] = []
     skipped = 0
@@ -219,7 +237,7 @@ def _build_batch_payload(
         if not isinstance(resolved, str) or not resolved:
             skipped += 1
             continue
-        payload.append({"uid": resolved, "embedding": vector})
+        payload.append({"uid": resolved, "embedding": _vector_literal(vector)})
     return payload, skipped
 
 

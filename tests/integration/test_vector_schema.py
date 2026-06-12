@@ -5,9 +5,10 @@ G2 — Applying schema/partgraph.dql via the project's schema-apply path
      (pydgraph gRPC on 127.0.0.1:9081) succeeds.
      Live schema (HTTP /admin or /alter on 8081) shows `embedding` as
      float32vector with hnsw index metric cosine.
-     Smoke test: write >=2 ephemeral marker nodes with fixed 4-dim vectors,
-     run DQL `similar_to(embedding, 2, "<fixed vector>")`, expect >=1 result,
-     then CLEAN UP marker nodes in teardown.
+     Smoke test: write >=2 ephemeral marker nodes with fixed 384-dim vectors
+     (matching the production embedding dimension), run DQL
+     `similar_to(embedding, 2, "<fixed vector>")`, expect >=1 result, then CLEAN
+     UP marker nodes — including the embedding predicate — in teardown.
 
 All tests are marked @pytest.mark.integration and skip gracefully when
 Dgraph is not reachable or pydgraph is not installed.
@@ -37,12 +38,19 @@ DGRAPH_GRPC_ADDR = "127.0.0.1:9081"
 SCHEMA_REL = "schema/partgraph.dql"
 MARKER_PREDICATE = "partgraph_test_marker"
 
-# Fixed 4-dimensional vector — deterministic, no randomness.
-FIXED_VECTOR_4D = [0.1, 0.2, 0.3, 0.4]
-FIXED_VECTOR_STR = "[0.1,0.2,0.3,0.4]"
+# The smoke-test vectors MUST match the production embedding dimension
+# (all-MiniLM-L6-v2, 384-dim — ADR-0008). A single hnsw cosine index can only
+# hold vectors of one dimension, so writing a shorter smoke vector into the same
+# `embedding` predicate poisons later 384-dim inserts ("can not compute cosine
+# distance on vectors of different lengths"). Keeping the smoke vectors at 384-dim
+# makes the index dimensionally uniform.
+EMBED_DIM = 384
 
-# A second, slightly different vector so we have >=2 nodes to search against.
-SECOND_VECTOR_4D = [0.15, 0.25, 0.35, 0.45]
+# Fixed, deterministic vectors (no randomness); two distinct directions so
+# similar_to has >=2 nodes to rank.
+FIXED_VECTOR = [round(0.1 + 0.0001 * i, 4) for i in range(EMBED_DIM)]
+FIXED_VECTOR_STR = "[" + ",".join(str(v) for v in FIXED_VECTOR) + "]"
+SECOND_VECTOR = [round(0.2 + 0.0001 * i, 4) for i in range(EMBED_DIM)]
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +135,7 @@ def _delete_all_marker_nodes(client) -> None:
             for uid in uids:
                 parts.append(f"<{uid}> <{MARKER_PREDICATE}> * .")
                 parts.append(f"<{uid}> <xid> * .")
+                parts.append(f"<{uid}> <embedding> * .")
                 parts.append(f"<{uid}> * * .")
             mutation = pydgraph.Mutation(del_nquads="\n".join(parts).encode())
             txn.mutate(mutation=mutation)
@@ -211,22 +220,22 @@ def test_vector_similarity_smoke_test(
     cleanup_marker_nodes,
 ) -> None:
     """Given the schema with hnsw cosine embedding is applied.
-    When we write >=2 ephemeral marker nodes with fixed 4-dim vectors and
+    When we write >=2 ephemeral marker nodes with fixed 384-dim vectors and
     run a DQL similar_to query.
     Then we must get >=1 result back.
-    After the test, all marker nodes are removed by the cleanup_marker_nodes
-    fixture (runs in teardown regardless of outcome).
+    After the test, all marker nodes (and their embedding predicate) are removed
+    by the cleanup_marker_nodes fixture (runs in teardown regardless of outcome).
 
-    Vectors used:
-      Node A: [0.1, 0.2, 0.3, 0.4]
-      Node B: [0.15, 0.25, 0.35, 0.45]
-    Query vector: [0.1, 0.2, 0.3, 0.4] — top-2 similar_to.
+    Vectors used (384-dim, matching the production embedding dimension):
+      Node A: FIXED_VECTOR  = [0.1, 0.1001, 0.1002, ...]
+      Node B: SECOND_VECTOR = [0.2, 0.2001, 0.2002, ...]
+    Query vector: FIXED_VECTOR — top-2 similar_to.
     """
     client = dgraph_pydgraph_client
 
     # Write two marker nodes.
-    uid_a = _write_vector_node(client, "g2_smoke_node_a", FIXED_VECTOR_4D)
-    uid_b = _write_vector_node(client, "g2_smoke_node_b", SECOND_VECTOR_4D)
+    uid_a = _write_vector_node(client, "g2_smoke_node_a", FIXED_VECTOR)
+    uid_b = _write_vector_node(client, "g2_smoke_node_b", SECOND_VECTOR)
 
     assert uid_a or uid_b, (
         "Neither vector node was written successfully — check embedding schema."
