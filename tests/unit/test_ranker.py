@@ -745,3 +745,200 @@ def test_rank_row_uid_mpn_norm_tier_still_present_on_rich_part() -> None:
     assert hasattr(row, "tier"), (
         "RankedRow.tier must still be present on a rich part."
     )
+
+
+# ===========================================================================
+# AC-SR: PR4 semantic tier extension
+#
+# Pinned _TIER_SCORE (after PR4): exact=4, trig=3, fts=2, semantic=1, nearest=0
+#
+# Contract:
+#  - "semantic" is a HARD tier (below fts, above nearest).
+#  - uid in fts AND semantic -> kept at fts (higher tier wins).
+#  - semantic does NOT trigger the "nearest" banner.
+#  - semantic-only results -> rows at semantic tier, deterministic order.
+# ===========================================================================
+
+
+def test_ac_sr_1_tier_order_exact_trig_fts_semantic() -> None:
+    """AC-SR-1: Given blocks with one part each in exact, trig, fts, and semantic.
+    When rank_results is called.
+    Then the row order is exact, trig, fts, semantic (semantic below fts).
+
+    Pinned _TIER_SCORE: exact=4, trig=3, fts=2, semantic=1, nearest=0.
+    """
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "exact":    [_part("0xE1", "MAX232EXACT",    stock=0)],
+        "trig":     [_part("0xE2", "MAX232TRIG",     stock=0)],
+        "fts":      [_part("0xE3", "MAX232FTS",      stock=0)],
+        "semantic": [_part("0xE4", "SN75C1232SEM",   stock=0)],
+    }
+
+    result = rank_results(blocks, parsed)
+    mpn_norms = [row.mpn_norm for row in result.rows]
+
+    idx_exact = mpn_norms.index("MAX232EXACT")
+    idx_trig = mpn_norms.index("MAX232TRIG")
+    idx_fts = mpn_norms.index("MAX232FTS")
+    idx_sem = mpn_norms.index("SN75C1232SEM")
+
+    assert idx_exact < idx_trig, (
+        f"AC-SR-1: exact must precede trig. Order: {mpn_norms}"
+    )
+    assert idx_trig < idx_fts, (
+        f"AC-SR-1: trig must precede fts. Order: {mpn_norms}"
+    )
+    assert idx_fts < idx_sem, (
+        f"AC-SR-1: fts must precede semantic. Order: {mpn_norms}"
+    )
+
+
+def test_ac_sr_2_uid_in_fts_and_semantic_kept_at_fts() -> None:
+    """AC-SR-2: Given a uid that appears in both fts and semantic blocks.
+    When rank_results is called.
+    Then:
+    - The uid appears exactly once in the output.
+    - The surviving row is at the fts tier (higher tier wins on dedup).
+    """
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "exact":    [],
+        "trig":     [],
+        "fts":      [_part("0xDUP", "DUPPART232", stock=0)],
+        "semantic": [_part("0xDUP", "DUPPART232", stock=0)],
+    }
+
+    result = rank_results(blocks, parsed)
+    uids = [row.uid for row in result.rows]
+
+    assert uids.count("0xDUP") == 1, (
+        f"AC-SR-2: uid '0xDUP' must appear exactly once (dedup). "
+        f"All uids: {uids}"
+    )
+    survivor = next(row for row in result.rows if row.uid == "0xDUP")
+    assert "fts" in str(survivor.tier).lower(), (
+        f"AC-SR-2: surviving row must be at fts tier (fts > semantic). "
+        f"Got tier: {survivor.tier!r}"
+    )
+
+
+def test_ac_sr_3_semantic_above_nearest_no_nearest_banner() -> None:
+    """AC-SR-3: Given blocks with semantic rows only (no nearest).
+    When rank_results is called.
+    Then:
+    - nearest_match is False (semantic is a HARD tier — does not trigger the banner).
+    - Rows from the semantic block are present.
+    - Semantic rows rank above nearest rows (semantic score > nearest score).
+    """
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "exact":    [],
+        "trig":     [],
+        "fts":      [],
+        "semantic": [_part("0xS1", "MAX232SEM", stock=10)],
+    }
+
+    result = rank_results(blocks, parsed)
+
+    assert result.nearest_match is False, (
+        f"AC-SR-3: semantic block hit must NOT set nearest_match=True. "
+        f"Semantic is a hard tier. Got: nearest_match={result.nearest_match}"
+    )
+    assert any(row.uid == "0xS1" for row in result.rows), (
+        "AC-SR-3: semantic row must appear in results."
+    )
+
+
+def test_ac_sr_3_semantic_scores_above_nearest_tier() -> None:
+    """AC-SR-3 (ordering): Given blocks with semantic AND nearest rows.
+    When rank_results is called.
+    Then all semantic rows appear before all nearest rows in the output.
+    """
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "exact":    [],
+        "trig":     [],
+        "fts":      [],
+        "semantic": [_part("0xSEM", "SEMPART232", stock=0)],
+        "nearest":  [_part("0xNEAR", "NEARPART232", stock=0)],
+    }
+
+    result = rank_results(blocks, parsed)
+    uids = [row.uid for row in result.rows]
+
+    assert "0xSEM" in uids, "AC-SR-3: semantic row must be present."
+    assert "0xNEAR" in uids, "AC-SR-3: nearest row must be present."
+
+    idx_sem = uids.index("0xSEM")
+    idx_near = uids.index("0xNEAR")
+
+    assert idx_sem < idx_near, (
+        f"AC-SR-3: semantic row must rank above nearest row. "
+        f"Order: {uids}"
+    )
+
+
+def test_ac_sr_4_semantic_only_deterministic_order() -> None:
+    """AC-SR-4: Given semantic block only with 3 parts, no other blocks.
+    When rank_results is called twice.
+    Then:
+    - All 3 parts appear in the result.
+    - The order is the same on both calls (deterministic).
+    - nearest_match is False.
+    """
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "exact":    [],
+        "trig":     [],
+        "fts":      [],
+        "semantic": [
+            _part("0xSA3", "ZZZ232SEM", stock=0),
+            _part("0xSA1", "AAA232SEM", stock=0),
+            _part("0xSA2", "MMM232SEM", stock=0),
+        ],
+    }
+
+    result1 = rank_results(blocks, parsed)
+    result2 = rank_results(blocks, parsed)
+
+    mpn1 = [row.mpn_norm for row in result1.rows]
+    mpn2 = [row.mpn_norm for row in result2.rows]
+
+    assert len(mpn1) == 3, f"AC-SR-4: must return 3 rows. Got: {mpn1}"
+    assert mpn1 == mpn2, (
+        f"AC-SR-4: semantic-only result must be deterministic. "
+        f"Got different orders: {mpn1} vs {mpn2}"
+    )
+    assert result1.nearest_match is False, (
+        f"AC-SR-4: nearest_match must be False for semantic-only result. "
+        f"Got: {result1.nearest_match}"
+    )
+
+
+def test_ac_sr_existing_tier_scores_preserved() -> None:
+    """Regression guard: existing PR3 tier scores must still work after PR4 extension.
+
+    Given blocks with exact, trig, fts parts.
+    When rank_results is called.
+    Then exact > trig > fts ordering is preserved (PR3 contract).
+    This test must stay green to prove PR4 does not break PR3 tier ordering.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [_part("0xP01", "MAX232", stock=0)],
+        "trig":  [_part("0xP02", "MAX232A", stock=0)],
+        "fts":   [_part("0xP03", "SN65C1232", stock=0)],
+    }
+
+    result = rank_results(blocks, parsed)
+    mpn_norms = [row.mpn_norm for row in result.rows]
+
+    idx_exact = mpn_norms.index("MAX232")
+    idx_trig  = mpn_norms.index("MAX232A")
+    idx_fts   = mpn_norms.index("SN65C1232")
+
+    assert idx_exact < idx_trig < idx_fts, (
+        f"Regression: PR3 tier ordering must be preserved after PR4. "
+        f"Order: {mpn_norms}"
+    )

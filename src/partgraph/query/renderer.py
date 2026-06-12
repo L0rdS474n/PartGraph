@@ -10,6 +10,12 @@ All copy is English. Datasheet URLs are rendered without wrapping so they stay
 copy-pasteable under a wide terminal; the long-tail attribute and related-parts
 sections are labelled "All attributes" and "Related parts (by MPN)" — never
 "family" (PartFamily/variant_of are UNPOPULATED).
+
+Honesty (ADR-0008): semantic (embedding-similarity) hits are a fuzzy match, not
+an exact part-number match. They are labelled with a textual ``[Semantic]``
+match-type marker (a real column value, never colour-only) so a similarity hit
+can never be mistaken for an exact MPN match — consistent with the nearest-match
+banner.
 """
 
 from __future__ import annotations
@@ -34,6 +40,23 @@ _PARAM_DISPLAY: tuple[tuple[str, str], ...] = (
     ("frequency_max", "Hz"),
     ("tolerance_pct", "%"),
 )
+
+#: Human-readable match-type label per RankedRow tier. Lexical tiers share the
+#: plain "Match" label; the semantic tier is called out distinctly so a fuzzy
+#: embedding hit is never confused with an exact part-number match (ADR-0008).
+_MATCH_LABELS: dict[str, str] = {
+    "exact": "Exact",
+    "trig": "Match",
+    "fts": "Text",
+    "semantic": "[Semantic]",
+    "nearest": "Nearest",
+}
+
+
+def _match_label(tier: str) -> str:
+    """Return the textual match-type label for a row *tier*."""
+    return _MATCH_LABELS.get(tier, tier)
+
 
 #: Promoted predicates shown in the detail "Key parameters" section.
 _SHOW_PARAMS: tuple[tuple[str, str], ...] = (
@@ -91,9 +114,14 @@ def render_search_results(
         # Plain, ANSI-strippable banner lines.
         console.print(f"No exact match for: {parsed.raw_query}")
         console.print("Nearest matches (by parameter distance):")
+    elif results.rows and all(row.tier == "semantic" for row in results.rows):
+        # Pure semantic result: be explicit that these are embedding-similarity
+        # matches, not exact part-number matches (ADR-0008 honesty banner).
+        console.print("Semantic matches (by embedding similarity):")
 
     overflow = "fold" if no_truncate else "crop"
     table = Table(show_lines=False)
+    table.add_column("Match", no_wrap=True)
     table.add_column("MPN", no_wrap=True, overflow=overflow)
     table.add_column("Manufacturer", overflow=overflow)
     table.add_column("Package", overflow=overflow)
@@ -106,6 +134,7 @@ def render_search_results(
         datasheet = urls[0] if urls else ""
         stock = str(row.stock) if row.stock is not None else "-"
         table.add_row(
+            _match_label(row.tier),
             row.mpn or row.mpn_norm,
             row.manufacturer or "",
             row.package_name or "",

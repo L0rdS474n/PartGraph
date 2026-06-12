@@ -31,18 +31,23 @@ from partgraph.query.parser import ParsedQuery
 
 __all__ = ["RankedResults", "RankedRow", "rank_results"]
 
-#: Tier names in descending priority. Lower index = stronger match.
-_HARD_TIERS: tuple[str, ...] = ("exact", "trig", "fts")
+#: Tier names in descending priority. Lower index = stronger match. ``semantic``
+#: (PR4) is a HARD tier: it sits below the lexical tiers (exact/trig/fts) but is
+#: still a confident, datasheet-backed hit, so a semantic-only result must NOT
+#: trigger the nearest-match banner (ADR-0008 / AC-SR).
+_HARD_TIERS: tuple[str, ...] = ("exact", "trig", "fts", "semantic")
 
 #: The relaxed-pass block name.
 _NEAREST_TIER = "nearest"
 
-#: Numeric scores per tier (higher = ranked first). nearest is scored below the
-#: hard tiers but only ever appears on its own (hard blocks empty).
+#: Numeric scores per tier (higher = ranked first). ``semantic`` ranks strictly
+#: below ``fts`` and strictly above ``nearest``; ``nearest`` is the relaxed pass
+#: and only appears on its own (all hard blocks empty).
 _TIER_SCORE: dict[str, int] = {
-    "exact": 3,
-    "trig": 2,
-    "fts": 1,
+    "exact": 4,
+    "trig": 3,
+    "fts": 2,
+    "semantic": 1,
     "nearest": 0,
 }
 
@@ -207,8 +212,12 @@ def rank_results(blocks: dict[str, list[dict]], parsed: ParsedQuery) -> RankedRe
     nearest_match = (not hard_has_rows) and nearest_rows_present
 
     # Build rows, deduplicating by uid. The strongest tier seen for a uid wins.
+    # Every block (including ``nearest``) is iterated: when a hard tier already
+    # produced rows (so ``nearest_match`` is False), any ``nearest`` rows still
+    # surface but are ranked last by their tier score (0). When only the relaxed
+    # pass produced rows (``nearest_match`` True) the distance sort below applies.
     by_uid: dict[str, RankedRow] = {}
-    tier_order = (*_HARD_TIERS, _NEAREST_TIER) if nearest_match else _HARD_TIERS
+    tier_order = (*_HARD_TIERS, _NEAREST_TIER)
     for tier in tier_order:
         block = blocks.get(tier)
         if not isinstance(block, list):

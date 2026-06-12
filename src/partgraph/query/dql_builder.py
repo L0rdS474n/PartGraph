@@ -37,10 +37,19 @@ import re
 from partgraph.normalize.model import normalize_mpn
 from partgraph.query.parser import ParsedQuery
 
-__all__ = ["MAX_RESULT_LIMIT", "build_search_dql", "build_show_dql"]
+__all__ = [
+    "MAX_RESULT_LIMIT",
+    "build_search_dql",
+    "build_semantic_dql",
+    "build_show_dql",
+]
 
 #: Maximum number of rows any single block may return (ADR-0007 DoS bound).
 MAX_RESULT_LIMIT = 200
+
+#: Required embedding dimension (all-MiniLM-L6-v2; ADR-0008). Every vector that
+#: reaches the semantic builder must be exactly this long.
+EMBED_DIM = 384
 
 #: Tolerance fraction applied to each promoted predicate to form a ge/le bracket
 #: around the target value (ADR-PARAM). ``tolerance_pct`` is intentionally absent
@@ -323,6 +332,101 @@ def build_search_dql(
         header = "query search(" + ", ".join(var_decls) + ") "
 
     query_text = header + "{\n" + "\n".join(blocks) + "\n}"
+    return query_text, variables
+
+
+def build_semantic_dql(
+    vector: list[float],
+    k: int,
+    *,
+    parsed: ParsedQuery | None = None,
+) -> tuple[str, dict[str, str]]:
+    """Build the semantic (vector-similarity) search DQL and its variable map.
+
+    Returns ``(query_text, variables)`` for a single ``semantic`` block rooted on
+    ``similar_to(embedding, k, "[...]")``. The query selects the same render
+    fields as :func:`build_search_dql` so the ranker/renderer treat semantic rows
+    uniformly.
+
+    Security (ADR-INJECT / ADR-0008):
+    - The query vector is embedded as an **inline quoted literal**, never as a
+      ``$``-variable (Dgraph's ``similar_to`` requires a literal vector). To make
+      that safe, **every** element is forced through :func:`_fmt_float`
+      (``repr(float(x))`` validated against the strict numeric charset), so a
+      hostile non-float element raises ``ValueError``/``TypeError`` before it can
+      reach the query text and cannot break out of the literal.
+    - The *human* semantic query text is never part of the DQL: only the
+      validated float vector is inlined. Hybrid parametric/package filters from
+      *parsed* are added via the same injection-safe helpers PR3 uses
+      (``_param_filter_terms`` float literals; the package bound as ``$pkg``).
+
+    DoS (ADR-0007): ``k`` is clamped to ``[1, MAX_RESULT_LIMIT]`` so a single
+    request can never ask Dgraph for an unbounded neighbour set.
+
+    Args:
+        vector: The query embedding; must be length :data:`EMBED_DIM` (384).
+        k: Requested number of nearest neighbours (clamped to the DoS bound).
+        parsed: Optional parsed query supplying hybrid package / parametric
+            filters layered on top of the vector search.
+
+    Raises:
+        ValueError: If *vector* is not length 384, if any element is not a finite
+            float literal, or if a package code fails the injection-guard regex.
+        TypeError: If an element cannot be coerced to ``float``.
+    """
+    if len(vector) != EMBED_DIM:
+        raise ValueError(
+            f"Embedding vector must have exactly {EMBED_DIM} dimensions; "
+            f"got {len(vector)}."
+        )
+
+    # Validate-and-format every element. _fmt_float runs repr(float(x)) and the
+    # strict-charset fullmatch, so a non-numeric element raises here (never
+    # reaching the inline literal).
+    literal_parts = [_fmt_float(component) for component in vector]
+    vector_literal = "[" + ", ".join(literal_parts) + "]"
+
+    # Clamp k into [1, MAX_RESULT_LIMIT] (DoS bound; never 0/negative/huge).
+    clamped_k = max(1, min(int(k), MAX_RESULT_LIMIT))
+
+    variables: dict[str, str] = {}
+    var_decls: list[str] = []
+
+    has_package = parsed is not None and parsed.package is not None
+    package_var = "$pkg"
+    if has_package:
+        validated = _validate_package(parsed.package)  # type: ignore[arg-type,union-attr]
+        variables[package_var] = validated
+        var_decls.append(f"{package_var}: string")
+
+    # Hybrid parametric filters (float literals — injection-safe, ADR-PARAM).
+    param_terms = _param_filter_terms(parsed) if parsed is not None else []
+
+    filter_terms: list[str] = list(param_terms)
+    # A semantic hit is only useful when datasheet-backed (same as PR3 blocks).
+    filter_terms.append("has(datasheet)")
+
+    filter_clause = " @filter(" + " AND ".join(filter_terms) + ")"
+    # When a package is present, _render_fields emits
+    # ``in_package @filter(eq(name, $pkg))`` and the cascade prunes parts whose
+    # package filter is empty — so the package acts as a real constraint without
+    # inlining its value (mirrors the PR3 search blocks).
+    cascade = " @cascade(in_package)" if has_package else ""
+
+    body = _render_fields("    ", has_package=has_package, package_var=package_var)
+
+    header = ""
+    if var_decls:
+        header = "query semantic(" + ", ".join(var_decls) + ") "
+
+    query_text = (
+        f"{header}{{\n"
+        f"  semantic(func: similar_to(embedding, {clamped_k}, "
+        f'"{vector_literal}")){filter_clause}{cascade} {{\n'
+        f"{body}\n"
+        f"  }}\n"
+        f"}}"
+    )
     return query_text, variables
 
 

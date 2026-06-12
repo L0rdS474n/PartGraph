@@ -24,6 +24,13 @@ from rich.console import Console
 
 from partgraph import __version__
 from partgraph import schema as schema_module
+from partgraph.embed import get_encoder
+
+# ``get_encoder`` is imported at module level (not lazily) ON PURPOSE: the test
+# suite patches it as ``patch.object(cli, "get_encoder", ...)`` for both the
+# embed and the semantic-search paths. Importing partgraph.embed is cheap — it
+# does NOT import sentence_transformers (that happens lazily inside get_encoder),
+# so module import stays light and torch is never pulled in here.
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -556,6 +563,27 @@ _DB_QUERY_ERROR = (
     "Start it with `partgraph db up`."
 )
 
+#: Fixed, path-free hint shown when sentence-transformers (the optional [embed]
+#: extra) is not installed. Never interpolates an exception or path.
+_EMBED_EXTRA_HINT = (
+    "[red]Error:[/red] semantic embedding requires the optional 'embed' extra "
+    '(sentence-transformers). Install it with: pip install -e ".[embed]".'
+)
+
+#: Actionable hint when a semantic search returns nothing — usually because the
+#: embedding predicate has not been populated yet.
+_NO_EMBEDDINGS_HINT = (
+    "No semantic matches. The embedding index may be empty — run "
+    "`partgraph embed` first to generate embeddings."
+)
+
+#: Fixed, path-free error shown when the embed run fails (DB down / runtime
+#: error). The raw exception is never interpolated so no internal path leaks.
+_EMBED_DB_ERROR = (
+    "[red]Error:[/red] could not embed parts. Is the database running? "
+    "Start it with `partgraph db up`."
+)
+
 
 def _run_block_query(client, query_text: str, variables: dict[str, str]) -> dict:
     """Run a single read-only DQL query and return the parsed JSON response.
@@ -576,7 +604,7 @@ def _run_block_query(client, query_text: str, variables: dict[str, str]) -> dict
 @app.command()
 def search(
     query: str = typer.Argument(
-        ...,
+        "",
         help="Free-text component query, e.g. 'MAX232' or '10k 0402 1%'.",
     ),
     limit: int = typer.Option(
@@ -589,6 +617,16 @@ def search(
         "--no-truncate",
         help="Show full datasheet URLs and fields without cropping wide columns.",
     ),
+    semantic: str | None = typer.Option(
+        None,
+        "--semantic",
+        help=(
+            "Semantic search: embed this free-text description and rank parts by "
+            "embedding similarity (e.g. 'rs232 transceiver'). Any positional "
+            "query is then used only for parametric/package filters. Requires the "
+            'optional [embed] extra (pip install -e ".[embed]").'
+        ),
+    ),
 ) -> None:
     """Search the component graph by MPN, parameters and package.
 
@@ -597,16 +635,26 @@ def search(
     exact / trigram / full-text cascade. When no exact parametric match exists,
     a relaxed pass returns the nearest parts by parameter distance.
 
+    With --semantic, the supplied description is embedded and parts are ranked by
+    embedding similarity; the positional query (if any) then contributes only its
+    parametric/package filters (a hybrid search). Semantic hits are labelled
+    "[Semantic]" so a fuzzy match is never mistaken for an exact part number.
+
     Examples:
       partgraph search "MAX232"
       partgraph search "10k 0402 1%"
       partgraph search "100nF 0603"
       partgraph search "1.2V MAX232"
+      partgraph search --semantic "rs232 transceiver"
 
     All reads are read-only; this command never modifies the database. Use
     --limit to bound the result count and --no-truncate to print full URLs.
     The command searches related parts by MPN similarity.
     """
+    if semantic is not None:
+        _run_semantic_search(query, semantic, limit=limit, no_truncate=no_truncate)
+        return
+
     from partgraph.query.dql_builder import build_search_dql  # noqa: PLC0415
     from partgraph.query.parser import ParsedQuery, parse_query  # noqa: PLC0415
     from partgraph.query.ranker import rank_results  # noqa: PLC0415
@@ -671,6 +719,79 @@ def search(
     render_search_results(result, parsed, _console, no_truncate=no_truncate)
 
 
+def _run_semantic_search(
+    query: str,
+    semantic_text: str,
+    *,
+    limit: int,
+    no_truncate: bool,
+) -> None:
+    """Run a read-only semantic (embedding-similarity) search.
+
+    *semantic_text* is embedded into a query vector; the positional *query* (if
+    any) is parsed only for parametric/package filters layered onto the vector
+    search (a hybrid query). The path is strictly read-only and never mutates.
+
+    Error handling (path-free, never leaks an exception or filesystem path):
+    - empty *semantic_text* is rejected before the encoder or DB is touched;
+    - a missing [embed] extra (ImportError) exits 1 with the install hint and
+      issues NO Dgraph query;
+    - a DB failure exits 1 with the fixed "partgraph db up" message;
+    - an empty result prints an actionable "run `partgraph embed` first" hint.
+    """
+    from partgraph.query.dql_builder import build_semantic_dql  # noqa: PLC0415
+    from partgraph.query.parser import parse_query  # noqa: PLC0415
+    from partgraph.query.ranker import rank_results  # noqa: PLC0415
+    from partgraph.query.renderer import render_search_results  # noqa: PLC0415
+
+    # Reject an empty semantic query BEFORE the encoder or DB is touched.
+    if not semantic_text.strip():
+        _err_console.print("[red]Error:[/red] --semantic query cannot be empty.")
+        raise typer.Exit(code=1)
+
+    # Acquire the encoder first: if the [embed] extra is absent we must exit
+    # WITHOUT issuing any Dgraph query.
+    try:
+        encoder = get_encoder()
+    except ImportError as exc:
+        _err_console.print(_EMBED_EXTRA_HINT)
+        raise typer.Exit(code=1) from exc
+
+    # Embed the semantic description into a single query vector.
+    vectors = encoder([semantic_text])
+    query_vector = list(vectors[0])
+
+    # The positional query contributes parametric/package filters only — its free
+    # text is NOT embedded (the --semantic text drives the embedding).
+    parsed = parse_query(query) if query.strip() else None
+
+    stub = None
+    try:
+        client, stub = _build_dgraph_client()
+        query_text, variables = build_semantic_dql(query_vector, limit, parsed=parsed)
+        data = _run_block_query(client, query_text, variables)
+        result = rank_results(data, parsed if parsed is not None else parse_query(""))
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _err_console.print(_DB_QUERY_ERROR)
+        raise typer.Exit(code=1) from exc
+    finally:
+        if stub is not None:
+            stub.close()
+
+    if not result.rows:
+        _console.print(_NO_EMBEDDINGS_HINT)
+        return
+
+    render_search_results(
+        result,
+        parsed if parsed is not None else parse_query(""),
+        _console,
+        no_truncate=no_truncate,
+    )
+
+
 @app.command()
 def show(
     mpn: str = typer.Argument(
@@ -713,6 +834,153 @@ def show(
     part = part_block[0]
     part["_related"] = data.get("related", []) or []
     render_show_result(part, _console)
+
+
+# ---------------------------------------------------------------------------
+# embed command (read parts, generate embeddings, write back by uid)
+# ---------------------------------------------------------------------------
+
+#: Maximum Part nodes selected for embedding when no --limit is given. Bounds a
+#: single run; the full catalogue is embedded across repeated/paged runs.
+_EMBED_SELECT_DEFAULT = 200_000
+
+
+def _select_parts_for_embed(client, limit: int | None) -> list:
+    """Select Part nodes to embed via a READ-ONLY query, newest-uid first.
+
+    Returns a list of namespace objects exposing the fields
+    :func:`partgraph.embed.build_embed_text` needs (``uid``/``xid``/
+    ``description``/``category``/``package``/``tags``). The transaction is
+    ``read_only=True`` and always discarded — selection never mutates.
+    """
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    first = limit if limit is not None else _EMBED_SELECT_DEFAULT
+    first = max(1, min(int(first), _EMBED_SELECT_DEFAULT))
+    query = (
+        f"{{ q(func: type(Part), first: {first}) {{ "
+        "uid xid description stock "
+        "in_category { name } in_package { name } tagged { name } "
+        "} }"
+    )
+    data = _run_block_query(client, query, {})
+    parts = []
+    for raw in data.get("q", []) or []:
+        if not isinstance(raw, dict):
+            continue
+        category = (raw.get("in_category") or [{}])
+        package = (raw.get("in_package") or [{}])
+        tags = [
+            t.get("name")
+            for t in (raw.get("tagged") or [])
+            if isinstance(t, dict) and t.get("name")
+        ]
+        parts.append(
+            SimpleNamespace(
+                uid=raw.get("uid"),
+                xid=raw.get("xid"),
+                description=raw.get("description"),
+                category=category[0].get("name") if category else None,
+                package=package[0].get("name") if package else None,
+                tags=tags,
+            )
+        )
+    return parts
+
+
+@app.command()
+def embed(
+    limit: str | None = typer.Option(
+        None,
+        "--limit",
+        help=(
+            "Limit embedding to the first N parts (development/testing; the full "
+            "run embeds the whole catalogue). Must be a positive integer."
+        ),
+    ),
+) -> None:
+    """Generate semantic embeddings for parts and write them back to Dgraph.
+
+    Reads parts read-only, builds an embedding text per part (description +
+    category + package + tags), encodes them with the sentence-transformers
+    model and writes the embedding back by uid (uid+embedding payload only —
+    never a new node). This is a heavy, one-off run; embeddings persist in the
+    graph and power `partgraph search --semantic`.
+
+    Requires the optional [embed] extra (pip install -e ".[embed]"). Errors are
+    path-free: a missing extra or a stopped database exits 1 with a clear hint.
+    """
+    import time as _time  # noqa: PLC0415
+
+    from rich.progress import (  # noqa: PLC0415
+        BarColumn,
+        Progress,
+        TaskProgressColumn,
+        TextColumn,
+    )
+
+    from partgraph.embed import embed_write  # noqa: PLC0415
+    from partgraph.util.resources import (  # noqa: PLC0415
+        ResourceController,
+        get_system_reader,
+    )
+
+    parsed_limit = _validate_limit(limit)
+
+    # Acquire the encoder first: a missing [embed] extra must exit WITHOUT
+    # touching the database (no selection query, no mutation).
+    try:
+        encoder = get_encoder()
+    except ImportError as exc:
+        _err_console.print(_EMBED_EXTRA_HINT)
+        raise typer.Exit(code=1) from exc
+
+    controller = ResourceController()
+    # Attach a live reader so the controller paces the run off real system load.
+    controller.reader = get_system_reader()  # type: ignore[attr-defined]
+
+    start = _time.monotonic()
+    stub = None
+    summary: dict = {"embedded": 0, "skipped": 0}
+    try:
+        client, stub = _build_dgraph_client()
+        parts = _select_parts_for_embed(client, parsed_limit)
+        total = len(parts)
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=_console,
+            transient=True,
+        ) as progress_bar:
+            task = progress_bar.add_task("Embedding parts", total=total or None)
+
+            def _on_progress(done: int, total_count: int) -> None:
+                progress_bar.update(task, completed=done, total=total_count or None)
+
+            summary = embed_write(
+                iter(parts),
+                client,
+                encoder=encoder,
+                controller=controller,
+                progress=_on_progress,
+            )
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        # Any DB/runtime failure: never interpolate the exception, so no internal
+        # path can leak. Re-raised as a clean CLI exit.
+        _err_console.print(_EMBED_DB_ERROR)
+        raise typer.Exit(code=1) from exc
+    finally:
+        if stub is not None:
+            stub.close()
+
+    elapsed = _time.monotonic() - start
+    embedded = summary.get("embedded", 0)
+    _console.print(
+        f"[green]Embedded {embedded} parts in {elapsed:.1f}s.[/green]"
+    )
 
 
 def main() -> None:
