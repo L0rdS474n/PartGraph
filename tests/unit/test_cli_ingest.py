@@ -27,17 +27,14 @@ from __future__ import annotations
 
 import os
 
-# Force deterministic, color-free, wide help/error rendering regardless of the
-# host terminal. This MUST run before importing partgraph.cli / typer: Rich
-# Console instances cache their color+width decision at construction, and cli.py
-# builds its Console objects at import time. CI's 80-column no-TTY terminal
-# otherwise wraps long tokens (e.g. "--fetch", "ADR-0001") across lines and
-# injects ANSI codes, breaking exact-substring assertions. CliRunner's env=
-# param does not reach Rich's width/color detection, so it is set here.
+# Pin a wide terminal so Rich/Typer never wraps long tokens (e.g. "--fetch",
+# "ADR-0001") across lines in help/error output. Must precede the partgraph.cli
+# import: Rich caches terminal width at Console construction and cli.py builds
+# its Console objects at import time. (Color is handled separately by stripping
+# ANSI in _invoke, because CI emits ANSI even when NO_COLOR is set.)
 os.environ["COLUMNS"] = "200"
-os.environ["NO_COLOR"] = "1"
-os.environ.pop("FORCE_COLOR", None)
 
+import re  # noqa: E402
 import subprocess  # noqa: E402
 import sys  # noqa: E402
 from unittest.mock import MagicMock, patch  # noqa: E402
@@ -49,9 +46,33 @@ from partgraph.cli import app  # noqa: E402, F401 — env set above must precede
 
 RUNNER = CliRunner()
 
+# CI emits colored Rich output even when NO_COLOR is set; the ANSI escape codes
+# break exact-substring asserts on help/error text. Strip them so assertions are
+# render-independent. Combined with COLUMNS=200 above (no line wrapping), help
+# tokens like "--fetch" and "ADR-0001" are always contiguous, plain substrings.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class _StrippedResult:
+    """Click Result wrapper whose .output has ANSI escape codes removed.
+
+    All other attributes (exit_code, exception, stdout, ...) delegate to the
+    wrapped Result unchanged.
+    """
+
+    def __init__(self, result: object) -> None:
+        self._result = result
+
+    @property
+    def output(self) -> str:
+        return _ANSI_RE.sub("", self._result.output)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._result, name)
+
 
 def _invoke(args: list[str]):
-    return RUNNER.invoke(app, args)
+    return _StrippedResult(RUNNER.invoke(app, args))
 
 
 # ---------------------------------------------------------------------------
