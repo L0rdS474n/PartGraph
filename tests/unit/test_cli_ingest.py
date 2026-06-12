@@ -25,14 +25,27 @@ partgraph.cli. That is the expected red state before implementation.
 
 from __future__ import annotations
 
-import subprocess
-import sys
-from unittest.mock import MagicMock, patch
+import os
 
-import pytest
-from typer.testing import CliRunner
+# Force deterministic, color-free, wide help/error rendering regardless of the
+# host terminal. This MUST run before importing partgraph.cli / typer: Rich
+# Console instances cache their color+width decision at construction, and cli.py
+# builds its Console objects at import time. CI's 80-column no-TTY terminal
+# otherwise wraps long tokens (e.g. "--fetch", "ADR-0001") across lines and
+# injects ANSI codes, breaking exact-substring assertions. CliRunner's env=
+# param does not reach Rich's width/color detection, so it is set here.
+os.environ["COLUMNS"] = "200"
+os.environ["NO_COLOR"] = "1"
+os.environ.pop("FORCE_COLOR", None)
 
-from partgraph.cli import app  # noqa: F401 — already imported; re-import for clarity
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
+
+import pytest  # noqa: E402
+from typer.testing import CliRunner  # noqa: E402
+
+from partgraph.cli import app  # noqa: E402, F401 — env set above must precede this import
 
 RUNNER = CliRunner()
 
