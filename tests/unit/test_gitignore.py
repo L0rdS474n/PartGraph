@@ -51,6 +51,9 @@ def _git_check_ignore(repo_root: pathlib.Path, rel_path: str) -> bool:
         "models/anything",
         "__pycache__/anything",
         "app.log",
+        # R4 additions: staged and state directories must not be tracked.
+        "data/staged/anything",
+        "data/state/anything",
     ],
 )
 def test_path_is_ignored_by_git(repo_root: pathlib.Path, rel_path: str) -> None:
