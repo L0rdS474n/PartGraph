@@ -191,7 +191,7 @@ class _BatchCtx:
 class Loader:
     """Loads StagedPart records into Dgraph in idempotent, upserting batches."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — cohesive injectable wiring (client + tunables).
         self,
         client: Any,
         batch_size: int = 1000,
@@ -199,6 +199,7 @@ class Loader:
         progress: ProgressCallback | None = None,
         sleep: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
+        controller: Any | None = None,
     ) -> None:
         """Create a loader.
 
@@ -214,12 +215,20 @@ class Loader:
                 asserted. The retry loop NEVER calls ``time.sleep`` directly.
             rng: Source of full-jitter randomness for backoff (default a fresh
                 ``random.Random()``). Injectable/seedable for reproducibility.
+            controller: Optional adaptive resource controller (duck-typed:
+                exposes ``regulate(prev_batch_size, snapshot)`` returning a
+                directive with ``pause_seconds``). When provided, the loader
+                paces inter-batch work by sleeping for the directive's pause via
+                the injected ``sleep``. ``None`` (the default) means no pacing —
+                behaviour is byte-for-byte identical to the original loader so
+                every existing call site and test is unaffected.
         """
         self.client = client
         self.batch_size = batch_size
         self._progress = progress
         self._sleep = sleep
         self._rng = rng if rng is not None else random.Random()
+        self._controller = controller
 
     # -- public API ---------------------------------------------------------
 
@@ -283,6 +292,11 @@ class Loader:
                 )
             if self._progress is not None:
                 self._progress(loaded, total)
+            # Adaptive pacing (opt-in): never resize the deterministic batch
+            # slices (that would break resume), only pause between batches per
+            # the controller's directive, via the injected sleep.
+            if self._controller is not None and loaded < total:
+                self._pace_after_batch()
 
         wall_seconds = time.perf_counter() - start
         metrics = {
@@ -292,6 +306,31 @@ class Loader:
         }
         self._write_metrics(metrics)
         return metrics
+
+    def _pace_after_batch(self) -> None:
+        """Sleep for the controller's directed pause between batches.
+
+        Reads a current system snapshot, asks the controller to ``regulate`` at
+        the current batch size, and — when a positive pause is directed — sleeps
+        for it via the injected ``sleep`` callable (never ``time.sleep``
+        directly). Batch sizing itself is left unchanged so the deterministic
+        batch boundaries that the resume/checkpoint logic relies on are
+        preserved. Any failure reading the snapshot degrades to no pause so
+        pacing can never abort a load.
+        """
+        controller = self._controller
+        if controller is None:  # pragma: no cover — guarded by the caller.
+            return
+        try:
+            from partgraph.util.resources import get_system_reader  # noqa: PLC0415
+
+            snapshot = get_system_reader()()
+        except Exception:  # noqa: BLE001 — pacing is best-effort, never fatal.
+            return
+        directive = controller.regulate(self.batch_size, snapshot)
+        pause = float(getattr(directive, "pause_seconds", 0.0) or 0.0)
+        if pause > 0.0:
+            self._sleep(pause)
 
     # -- resume / checkpoint helpers ----------------------------------------
 

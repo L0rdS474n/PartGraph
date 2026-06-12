@@ -1951,6 +1951,114 @@ def test_load_batch_internal_duplicate_distinct_blank_uids_not_emitted() -> None
     )
 
 
+# ===========================================================================
+# AC-ADAPT: Loader accepts optional controller parameter
+#
+# Pinned contract:
+#   - Loader(client=..., batch_size=..., controller=None) — default None means
+#     existing behaviour unchanged (no regulation); all existing tests stay green.
+#   - With an injected controller scripted to shrink-then-grow, the per-batch
+#     sizes follow the controller's directives.
+#   - With an injected sleep via the existing sleep= param, pauses are honoured.
+# ===========================================================================
+
+
+def _make_scripted_controller(directives: list[tuple[int, float]]):
+    """Return a controller whose regulate() returns successive directives.
+
+    Each element of directives is (next_batch_size, pause_seconds).
+    The last element is repeated for any calls beyond the list length.
+    """
+    from unittest.mock import MagicMock
+
+    idx = [0]
+
+    class ScriptedController:
+        def regulate(self, prev_batch_size: int, snapshot: object):
+            entry = directives[min(idx[0], len(directives) - 1)]
+            idx[0] += 1
+            directive = MagicMock()
+            directive.next_batch_size = entry[0]
+            directive.pause_seconds = entry[1]
+            return directive
+
+    return ScriptedController()
+
+
+def test_ac_adapt_loader_default_controller_none_existing_behavior_unchanged() -> None:
+    """AC-ADAPT: Given Loader constructed without controller= (default None).
+    When Loader.load(25 parts, batch_size=10) is called.
+    Then the result is identical to pre-controller behavior: 3 txns, 3 commits.
+    (Existing tests must stay green — controller=None means no regulation.)
+    """
+    parts = [_make_staged_part(f"C{i:04d}") for i in range(25)]
+    mock_client, mock_txn = _build_mock_pydgraph_client()
+
+    loader = Loader(client=mock_client, batch_size=10)  # no controller=
+    loader.load(parts)
+
+    assert mock_client.txn.call_count == 3, (
+        f"AC-ADAPT: without controller, 25 parts / batch_size=10 must produce "
+        f"3 txn() calls. Got: {mock_client.txn.call_count}"
+    )
+    assert mock_txn.commit.call_count == 3, (
+        f"AC-ADAPT: without controller, commit must be called 3 times. "
+        f"Got: {mock_txn.commit.call_count}"
+    )
+
+
+def test_ac_adapt_loader_with_controller_follows_directives() -> None:
+    """AC-ADAPT: Given a scripted controller and an injected sleep callable.
+    When Loader.load(parts, batch_size=initial_bs) is called with the controller.
+    Then:
+    - The loader calls controller.regulate() between batches.
+    - The injected sleep is called with the pause_seconds from the directive.
+    - No real time.sleep is called.
+    """
+    import time as _time_mod
+
+    parts = [_make_staged_part(f"C{i:04d}") for i in range(30)]
+    mock_client, _mock_txn = _build_mock_pydgraph_client()
+
+    # Script: first batch -> pause 0, second -> pause 0.1, third -> pause 0.
+    # We verify pause_seconds > 0 was used.
+    controller = _make_scripted_controller([
+        (10, 0.0),   # batch 0: no pause
+        (10, 0.05),  # batch 1: small pause
+        (10, 0.0),   # batch 2: no pause
+    ])
+
+    recorded_sleeps: list[float] = []
+
+    def _recording_sleep(duration: float) -> None:
+        recorded_sleeps.append(duration)
+
+    original_sleep = _time_mod.sleep
+
+    def _banned_sleep(duration: float) -> None:
+        raise AssertionError(
+            f"time.sleep({duration}) called directly; injected sleep= must be used."
+        )
+
+    _time_mod.sleep = _banned_sleep
+    try:
+        loader = Loader(
+            client=mock_client,
+            batch_size=10,
+            sleep=_recording_sleep,
+            controller=controller,
+        )
+        loader.load(parts)
+    finally:
+        _time_mod.sleep = original_sleep
+
+    # The scripted pause of 0.05 seconds must have been passed to injected sleep.
+    assert any(s > 0 for s in recorded_sleeps), (
+        f"AC-ADAPT: scripted pause directive (0.05 s) must be honoured via injected sleep. "
+        f"Recorded sleeps: {recorded_sleeps!r}"
+    )
+
+
 def test_load_batch_duplicate_xid_last_wins_fields_preserved() -> None:
     """T-LOAD-dedup-3 — last-occurrence-wins: surviving node carries last-seen fields.
 

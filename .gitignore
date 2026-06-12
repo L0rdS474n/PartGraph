@@ -17,6 +17,11 @@ dgraph-export/
 # --- Models and embedding caches ---
 models/
 model_cache/
+# HuggingFace / sentence-transformers download cache. The [embed] extra pulls
+# models on first use; the cache must never be committed (it is large and is
+# rebuilt locally on demand).
+.cache/
+huggingface/
 *.gguf
 *.bin
 *.safetensors

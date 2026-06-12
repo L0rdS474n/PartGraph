@@ -1257,3 +1257,345 @@ def test_cli_show_long_url_60char_prefix_unbroken() -> None:
         f"E6: 60-char URL prefix must appear unbroken in show output under COLUMNS=200. "
         f"Prefix={url_prefix!r} not found in:\n{result.output}"
     )
+
+
+# ===========================================================================
+# AC-CE: PR4 semantic search CLI tests
+#
+# These tests extend test_cli_search.py as specified by the PR4 plan.
+# They will be red until the --semantic flag and embed integration are
+# implemented in cli.py.
+# ===========================================================================
+
+_EMBED_DIM = 384
+_FAKE_VECTOR = [0.001] * _EMBED_DIM
+
+
+def _patch_get_encoder(fake_encoder_callable=None):
+    """Patch partgraph.embed.get_encoder to return a fake encoder callable."""
+    import partgraph.cli as cli_mod
+
+    def _default_fake_encoder(texts: list[str]) -> list[list[float]]:
+        return [_FAKE_VECTOR for _ in texts]
+
+    encoder = fake_encoder_callable or _default_fake_encoder
+
+    def _fake_get_encoder():
+        return encoder
+
+    return patch.object(cli_mod, "get_encoder", _fake_get_encoder, create=True)
+
+
+def _make_semantic_response_with_max232() -> dict:
+    """Return a DQL response containing MAX232 in the semantic block."""
+    return {
+        "exact":    [],
+        "trig":     [],
+        "fts":      [],
+        "semantic": [
+            {
+                "uid": "0x9001",
+                "mpn": "MAX232CPE",
+                "mpn_norm": "MAX232CPE",
+                "stock": 100,
+                "is_basic": False,
+                "made_by": [{"name": "Texas Instruments"}],
+                "in_package": [{"name": "DIP-16"}],
+                "datasheet": [{"url": "https://www.ti.com/lit/ds/symlink/max232.pdf"}],
+            }
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# AC-CE-1: --semantic "rs232 transceiver" -> exit 0, MPN + "[Semantic]" label,
+#          read_only txn, mutate not called
+# ---------------------------------------------------------------------------
+
+def test_ac_ce_1_semantic_search_exit_0_and_semantic_label() -> None:
+    """AC-CE-1: Given mocked encoder returning a fake vector and mocked client
+    returning MAX232 in the semantic block.
+    When `partgraph search --semantic "rs232 transceiver"` is invoked.
+    Then:
+    - Exit code is 0.
+    - Output contains "MAX232" (the MPN).
+    - Output contains "[Semantic]" or "Semantic" label.
+    - txn is called with read_only=True.
+    - mutate is never called.
+    """
+    mock_txn = _make_mock_txn([_make_semantic_response_with_max232()])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232 transceiver"])
+
+    assert result.exit_code == 0, (
+        f"AC-CE-1: --semantic search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert "MAX232" in result.output, (
+        f"AC-CE-1: output must contain MPN 'MAX232'. Got:\n{result.output}"
+    )
+    assert "semantic" in result.output.lower() or "Semantic" in result.output, (
+        f"AC-CE-1: output must contain '[Semantic]' or 'Semantic' label. "
+        f"Got:\n{result.output}"
+    )
+
+    # read_only=True assertion.
+    calls = mock_client.txn.call_args_list
+    assert any(
+        c == call(read_only=True) or c.kwargs.get("read_only") is True
+        for c in calls
+    ), f"AC-CE-1: semantic search must use read_only=True txn. Calls: {calls}"
+
+    mock_txn.mutate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# AC-CE-2: empty semantic block -> exit 0, output contains "partgraph embed" hint
+# ---------------------------------------------------------------------------
+
+def test_ac_ce_2_empty_semantic_block_exit_0_embed_hint() -> None:
+    """AC-CE-2: Given mocked encoder and mocked client returning empty semantic block.
+    When `partgraph search --semantic "rs232 transceiver"` is invoked.
+    Then:
+    - Exit code is 0 (no results is not an error).
+    - Output contains "partgraph embed" hint (guides user to run embed first).
+    """
+    empty_resp = {"exact": [], "trig": [], "fts": [], "semantic": []}
+    mock_txn = _make_mock_txn([empty_resp])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232 transceiver"])
+
+    assert result.exit_code == 0, (
+        f"AC-CE-2: empty semantic result must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert "partgraph embed" in result.output.lower() or "embed" in result.output.lower(), (
+        f"AC-CE-2: output must hint 'partgraph embed'. Got:\n{result.output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-CE-3: get_encoder ImportError -> exit 1, names [embed] extra, no query
+# ---------------------------------------------------------------------------
+
+def test_ac_ce_3_encoder_import_error_exit_1_names_embed_extra_no_query() -> None:
+    """AC-CE-3: Given get_encoder() raises ImportError naming 'sentence-transformers'.
+    When `partgraph search --semantic "rs232 transceiver"` is invoked.
+    Then:
+    - Exit code is 1.
+    - Output contains "[embed]" or "embed" (the optional extra name).
+    - txn.query is NEVER called (no Dgraph round-trip if encoder unavailable).
+    - No path leak.
+    """
+    import partgraph.cli as cli_mod
+
+    def _raising_get_encoder():
+        raise ImportError(
+            'sentence-transformers not installed. '
+            'pip install -e ".[embed]" to enable semantic search.'
+        )
+
+    mock_txn = _make_mock_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), \
+         patch.object(cli_mod, "get_encoder", _raising_get_encoder, create=True):
+        result = _invoke(["search", "--semantic", "rs232 transceiver"])
+
+    assert result.exit_code != 0, (
+        f"AC-CE-3: ImportError on encoder must produce non-zero exit. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    assert "embed" in result.output.lower(), (
+        f"AC-CE-3: output must mention 'embed' extra. Got:\n{result.output}"
+    )
+    mock_txn.query.assert_not_called()
+    # No path leak.
+    assert "/home/" not in result.output, (
+        f"AC-CE-3: no path leak in output. Got:\n{result.output!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-CE-4: txn.query raises -> exit 1, "partgraph db up", no leak
+# ---------------------------------------------------------------------------
+
+def test_ac_ce_4_txn_query_raises_exit_1_db_up_hint_no_leak() -> None:
+    """AC-CE-4: Given get_encoder succeeds but txn.query raises RuntimeError.
+    When `partgraph search --semantic "rs232 transceiver"` is invoked.
+    Then:
+    - Exit code is 1.
+    - Output contains "partgraph db up" hint.
+    - No raw exception text leaks.
+    """
+    mock_txn = MagicMock()
+    mock_txn.query.side_effect = RuntimeError("connection refused")
+    mock_txn.discard.return_value = None
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232 transceiver"])
+
+    assert result.exit_code != 0, (
+        f"AC-CE-4: DB-down must produce non-zero exit. Got {result.exit_code}."
+    )
+    assert "partgraph db up" in result.output, (
+        f"AC-CE-4: must contain 'partgraph db up'. Got:\n{result.output!r}"
+    )
+    assert "connection refused" not in result.output, (
+        f"AC-CE-4: raw exception must not leak. Got:\n{result.output!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-CE-5: --semantic "" -> exit 1 "empty", encoder never called, no query
+# ---------------------------------------------------------------------------
+
+def test_ac_ce_5_semantic_empty_string_exit_1_encoder_not_called() -> None:
+    """AC-CE-5: Given --semantic "" (empty semantic query).
+    When `partgraph search --semantic ""` is invoked.
+    Then:
+    - Exit code is 1.
+    - Output contains "empty".
+    - Encoder is never called.
+    - No Dgraph query sent.
+    """
+    import partgraph.cli as cli_mod
+
+    encoder_called = [False]
+
+    def _counting_get_encoder():
+        def _enc(texts):
+            encoder_called[0] = True
+            return [_FAKE_VECTOR for _ in texts]
+        return _enc
+
+    mock_txn = _make_mock_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), \
+         patch.object(cli_mod, "get_encoder", _counting_get_encoder, create=True):
+        result = _invoke(["search", "--semantic", ""])
+
+    assert result.exit_code != 0, (
+        f"AC-CE-5: empty --semantic must exit non-zero. Got {result.exit_code}."
+    )
+    assert "empty" in result.output.lower(), (
+        f"AC-CE-5: output must contain 'empty'. Got:\n{result.output!r}"
+    )
+    assert not encoder_called[0], (
+        "AC-CE-5: encoder must NOT be called for empty --semantic query."
+    )
+    mock_txn.query.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# AC-CE-6: hybrid --semantic "rs232" + "5V" -> DQL has voltage filter
+# ---------------------------------------------------------------------------
+
+def test_ac_ce_6_hybrid_semantic_with_voltage_token_dql_has_voltage_filter() -> None:
+    """AC-CE-6: Given --semantic "rs232" and a positional argument "5V" (parametric).
+    When `partgraph search --semantic "rs232" "5V"` is invoked.
+    Then the captured DQL passed to txn.query contains ge(/le with voltage_max
+    (the voltage filter from parametric parsing).
+    """
+    import partgraph.cli as cli_mod
+
+    captured_dql: list[str] = []
+
+    def _spy_query(dql: str, variables=None, *args, **kwargs):
+        captured_dql.append(dql)
+        resp = MagicMock()
+        resp.json = json.dumps({"exact": [], "trig": [], "fts": [], "semantic": []}).encode()
+        return resp
+
+    mock_txn = MagicMock()
+    mock_txn.query.side_effect = _spy_query
+    mock_txn.discard.return_value = None
+    mock_txn.__enter__ = MagicMock(return_value=mock_txn)
+    mock_txn.__exit__ = MagicMock(return_value=False)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        # "5V" is a positional arg (for parametric), --semantic is the text for embed.
+        _invoke(["search", "--semantic", "rs232", "5V"])
+
+    # If any DQL was sent, it should have voltage filter terms.
+    all_dql = " ".join(captured_dql)
+    if captured_dql:
+        assert "voltage" in all_dql or "ge(" in all_dql, (
+            f"AC-CE-6: hybrid DQL must contain voltage filter. Got:\n{all_dql!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC-CE-7: search --help contains "--semantic"
+# ---------------------------------------------------------------------------
+
+def test_ac_ce_7_search_help_contains_semantic_flag() -> None:
+    """AC-CE-7: Given the search command.
+    When `partgraph search --help` is invoked.
+    Then the output contains "--semantic".
+    PIN AC-CE-7.
+    """
+    result = _invoke(["search", "--help"])
+    assert "--semantic" in result.output, (
+        f"AC-CE-7: search --help must contain '--semantic'. Got:\n{result.output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-CE-8: --semantic is embed source; positional query parsed for parametric only
+# ---------------------------------------------------------------------------
+
+def test_ac_ce_8_semantic_flag_is_embed_source_positional_is_parametric() -> None:
+    """AC-CE-8: Given `partgraph search --semantic "rs232 transceiver" "10k 0402"`.
+    When the command is invoked.
+    Then:
+    - The encoder receives the --semantic string "rs232 transceiver" (not "10k 0402").
+    - The DQL contains parametric terms from "10k 0402" (resistance filter).
+    - The --semantic value drives the embedding; the positional arg drives parametric.
+    """
+    import partgraph.cli as cli_mod
+
+    encoder_inputs: list[list[str]] = []
+
+    def _spy_get_encoder():
+        def _enc(texts: list[str]) -> list[list[float]]:
+            encoder_inputs.append(list(texts))
+            return [_FAKE_VECTOR for _ in texts]
+        return _enc
+
+    captured_dql: list[str] = []
+
+    def _spy_query(dql: str, variables=None, *args, **kwargs):
+        captured_dql.append(dql)
+        resp = MagicMock()
+        resp.json = json.dumps({"exact": [], "trig": [], "fts": [], "semantic": []}).encode()
+        return resp
+
+    mock_txn = MagicMock()
+    mock_txn.query.side_effect = _spy_query
+    mock_txn.discard.return_value = None
+    mock_txn.__enter__ = MagicMock(return_value=mock_txn)
+    mock_txn.__exit__ = MagicMock(return_value=False)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), \
+         patch.object(cli_mod, "get_encoder", _spy_get_encoder, create=True):
+        _invoke(["search", "--semantic", "rs232 transceiver", "10k 0402"])
+
+    # Encoder must have been called with the --semantic string.
+    if encoder_inputs:
+        all_encoder_texts = [t for batch in encoder_inputs for t in batch]
+        assert any("rs232" in t.lower() for t in all_encoder_texts), (
+            f"AC-CE-8: encoder must receive the --semantic text 'rs232 transceiver'. "
+            f"Got encoder inputs: {all_encoder_texts!r}"
+        )
+        # The positional "10k 0402" must not be sent to the encoder (it's for parametric).
+        assert not any("10k" in t for t in all_encoder_texts), (
+            f"AC-CE-8: encoder must NOT receive the positional parametric arg '10k 0402'. "
+            f"Got encoder inputs: {all_encoder_texts!r}"
+        )

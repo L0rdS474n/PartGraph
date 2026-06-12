@@ -26,12 +26,19 @@ dependencies = [
     "httpx",
     "pyyaml",
     "requests",
+    "psutil",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "ruff",
+]
+# Heavy semantic-search extra (pulls torch). Kept OUT of [dev] so a plain
+# `pip install -e ".[dev]"` and CI never download the model stack; only an
+# explicit `pip install -e ".[embed]"` enables `partgraph embed` / `--semantic`.
+embed = [
+    "sentence-transformers>=2.2",
 ]
 
 [project.urls]

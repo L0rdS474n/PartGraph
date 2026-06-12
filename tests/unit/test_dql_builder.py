@@ -489,3 +489,246 @@ def test_dql_builder_float_format_locale_safe() -> None:
             f"Numeric token {token!r} in query text contains non-locale-safe chars "
             f"(expected only [0-9.eE+-]). Full query:\n{query_text}"
         )
+
+
+# ===========================================================================
+# AC-SD: build_semantic_dql — PR4 semantic search DQL builder
+# ===========================================================================
+#
+# Imports the new function from dql_builder (will be red until implemented).
+# The function signature is:
+#   build_semantic_dql(vector: list[float], k: int, *, parsed: ParsedQuery | None = None)
+#       -> (query_text: str, variables: dict[str, str])
+#
+# Pinned contracts:
+#   - vector is embedded INLINE as a literal string (NOT as a $var).
+#   - The literal is built via repr(float) validated by _FLOAT_LITERAL_RE.
+#   - k is clamped to MAX_RESULT_LIMIT=200 and min 1.
+#   - vector must be length 384; otherwise ValueError naming 384.
+#   - hostile non-float elements -> ValueError (literal can't break out).
+#   - variables dict has NO "vector" key (inline literal, not $var).
+#   - selects: uid mpn mpn_norm stock is_basic promoted made_by{name}
+#     in_package{name} datasheet{url}.
+#   - hybrid: parsed with quantities/package -> filter carried into similar_to block.
+# ===========================================================================
+
+try:
+    from partgraph.query.dql_builder import build_semantic_dql  # noqa: F401
+except ImportError:
+    build_semantic_dql = None  # type: ignore[assignment] — expected red
+
+
+_EMBED_DIM = 384
+
+
+def _unit_vector(dim: int = _EMBED_DIM) -> list[float]:
+    """Return a length-dim unit vector (deterministic)."""
+    return [1.0 / dim] * dim
+
+
+# ---------------------------------------------------------------------------
+# AC-SD-1: inline literal + no $vector in variables
+# ---------------------------------------------------------------------------
+
+def test_ac_sd_1_similar_to_inline_literal_no_vector_var() -> None:
+    """AC-SD-1: Given a 384-dim vector and k=10.
+    When build_semantic_dql(vector, k=10) is called.
+    Then:
+    - The query text contains similar_to(embedding, 10, "[...]") as an inline literal.
+    - The variables dict has NO "vector" key (vectors must NOT be $vars).
+    """
+    if build_semantic_dql is None:
+        pytest.skip("build_semantic_dql not yet implemented (expected red)")
+
+    vector = _unit_vector()
+    query_text, variables = build_semantic_dql(vector, 10)
+
+    assert "similar_to" in query_text, (
+        f"AC-SD-1: query must contain 'similar_to'. Got:\n{query_text}"
+    )
+    assert "embedding" in query_text, (
+        f"AC-SD-1: similar_to must reference 'embedding' predicate. Got:\n{query_text}"
+    )
+    # The inline vector literal must appear between quotes in the query.
+    assert '"[' in query_text or '"[' in query_text, (
+        f"AC-SD-1: vector must appear as inline quoted literal. Got:\n{query_text}"
+    )
+
+    # No $vector variable in the variables dict.
+    vector_vars = [k for k in variables if "vector" in k.lower()]
+    assert not vector_vars, (
+        f"AC-SD-1: variables dict must NOT contain a vector key. "
+        f"Found: {vector_vars!r} in variables: {variables}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SD-2: hostile non-float element -> ValueError
+# ---------------------------------------------------------------------------
+
+def test_ac_sd_2_hostile_non_float_raises_value_error() -> None:
+    """AC-SD-2: Given a vector containing a non-float hostile element.
+    When build_semantic_dql is called.
+    Then a ValueError is raised (literal validation prevents injection).
+    """
+    if build_semantic_dql is None:
+        pytest.skip("build_semantic_dql not yet implemented (expected red)")
+
+    hostile_vector: list = [0.1] * (_EMBED_DIM - 1) + ['0.5", 1, "evil']
+    with pytest.raises((ValueError, TypeError)):
+        build_semantic_dql(hostile_vector, 10)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# AC-SD-3: k clamping
+# ---------------------------------------------------------------------------
+
+def test_ac_sd_3_k_clamped_to_max_result_limit() -> None:
+    """AC-SD-3: Given k=99999 (above MAX_RESULT_LIMIT=200).
+    When build_semantic_dql(vector, 99999) is called.
+    Then the effective k in the query text is <= 200 (not 99999).
+    """
+    if build_semantic_dql is None:
+        pytest.skip("build_semantic_dql not yet implemented (expected red)")
+
+    from partgraph.query.dql_builder import MAX_RESULT_LIMIT
+    vector = _unit_vector()
+    query_text, _ = build_semantic_dql(vector, 99999)
+
+    assert "99999" not in query_text, (
+        "AC-SD-3: k=99999 must be clamped. '99999' must not appear in query."
+    )
+    # Extract k from similar_to(embedding, <k>, ...)
+    k_matches = re.findall(r"similar_to\([^,]+,\s*(\d+)", query_text)
+    for k_val_str in k_matches:
+        k_val = int(k_val_str)
+        assert k_val <= MAX_RESULT_LIMIT, (
+            f"AC-SD-3: k in query ({k_val}) must be <= MAX_RESULT_LIMIT={MAX_RESULT_LIMIT}."
+        )
+
+
+def test_ac_sd_3_k_zero_clamped_to_1() -> None:
+    """AC-SD-3: Given k=0 (below minimum).
+    When build_semantic_dql(vector, 0) is called.
+    Then the effective k in the query text is >= 1 (never 0).
+    """
+    if build_semantic_dql is None:
+        pytest.skip("build_semantic_dql not yet implemented (expected red)")
+
+    vector = _unit_vector()
+    query_text, _ = build_semantic_dql(vector, 0)
+
+    k_matches = re.findall(r"similar_to\([^,]+,\s*(\d+)", query_text)
+    for k_val_str in k_matches:
+        k_val = int(k_val_str)
+        assert k_val >= 1, (
+            f"AC-SD-3: k in query ({k_val}) must be >= 1 (never 0 or negative)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC-SD-4: wrong vector length -> ValueError naming 384
+# ---------------------------------------------------------------------------
+
+def test_ac_sd_4_wrong_vector_length_raises_value_error_naming_384() -> None:
+    """AC-SD-4: Given a vector of length 10 (not 384).
+    When build_semantic_dql(vector, 10) is called.
+    Then a ValueError is raised whose message names 384.
+    """
+    if build_semantic_dql is None:
+        pytest.skip("build_semantic_dql not yet implemented (expected red)")
+
+    short_vector = [0.1] * 10
+    with pytest.raises(ValueError, match="384"):
+        build_semantic_dql(short_vector, 10)
+
+
+# ---------------------------------------------------------------------------
+# AC-SD-5: selects same render fields as PR3
+# ---------------------------------------------------------------------------
+
+def test_ac_sd_5_selects_required_render_fields() -> None:
+    """AC-SD-5: Given a 384-dim vector and k=5.
+    When build_semantic_dql(vector, k=5) is called.
+    Then the query text contains the same set of render fields as PR3 search:
+    uid, mpn, mpn_norm, stock, is_basic, promoted predicates (at minimum
+    voltage_max/resistance), made_by{name}, in_package{name}, datasheet{url}.
+    """
+    if build_semantic_dql is None:
+        pytest.skip("build_semantic_dql not yet implemented (expected red)")
+
+    vector = _unit_vector()
+    query_text, _ = build_semantic_dql(vector, 5)
+
+    required_fields = [
+        "uid", "mpn", "mpn_norm", "stock", "is_basic",
+        "made_by", "name",
+        "in_package",
+        "datasheet", "url",
+    ]
+    for field_name in required_fields:
+        assert field_name in query_text, (
+            f"AC-SD-5: semantic query must select '{field_name}'. Got:\n{query_text}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC-SD-6: hybrid — parsed with quantities/package -> filter terms in query
+# ---------------------------------------------------------------------------
+
+def test_ac_sd_6_hybrid_parsed_with_package_carries_filter() -> None:
+    """AC-SD-6: Given a 384-dim vector, k=5, and a parsed query with a package.
+    When build_semantic_dql(vector, k=5, parsed=parsed_with_package) is called.
+    Then the query text contains an in_package filter term.
+    """
+    if build_semantic_dql is None:
+        pytest.skip("build_semantic_dql not yet implemented (expected red)")
+
+    vector = _unit_vector()
+    parsed = _make_parsed(package="DIP16")
+    query_text, _ = build_semantic_dql(vector, 5, parsed=parsed)
+
+    assert "in_package" in query_text, (
+        f"AC-SD-6: hybrid query with package must carry in_package filter. "
+        f"Got:\n{query_text}"
+    )
+
+
+def test_ac_sd_6_hybrid_parsed_with_resistance_carries_parametric_filter() -> None:
+    """AC-SD-6: Given a 384-dim vector, k=5, and a parsed query with resistance=10000.
+    When build_semantic_dql(vector, k=5, parsed=parsed_with_resistance) is called.
+    Then the query text contains ge/le filter terms for resistance.
+    """
+    if build_semantic_dql is None:
+        pytest.skip("build_semantic_dql not yet implemented (expected red)")
+
+    vector = _unit_vector()
+    parsed = _make_parsed(quantities=[_q("resistance", 10000.0, "10k")])
+    query_text, _ = build_semantic_dql(vector, 5, parsed=parsed)
+
+    assert "ge(" in query_text or "ge (" in query_text, (
+        f"AC-SD-6: hybrid query with resistance must carry ge() filter. "
+        f"Got:\n{query_text}"
+    )
+    assert "le(" in query_text or "le (" in query_text, (
+        f"AC-SD-6: hybrid query with resistance must carry le() filter. "
+        f"Got:\n{query_text}"
+    )
+
+
+def test_ac_sd_6_hybrid_has_datasheet_filter_present() -> None:
+    """AC-SD-6: Given a hybrid query with any parsed input.
+    When build_semantic_dql is called.
+    Then the query text contains has(datasheet) (same as PR3 search block contract).
+    """
+    if build_semantic_dql is None:
+        pytest.skip("build_semantic_dql not yet implemented (expected red)")
+
+    vector = _unit_vector()
+    parsed = _make_parsed(text_tokens=["rs232"])
+    query_text, _ = build_semantic_dql(vector, 5, parsed=parsed)
+
+    assert "has(datasheet)" in query_text, (
+        f"AC-SD-6: semantic query must contain has(datasheet) filter. "
+        f"Got:\n{query_text}"
+    )
