@@ -388,13 +388,27 @@ class Loader:
         ) from last_exc
 
     def _load_batch_once(self, batch: Sequence[StagedPart]) -> None:
-        """Resolve UIDs then upsert one batch within a single fresh transaction."""
+        """Resolve UIDs then upsert one batch within a single fresh transaction.
+
+        The batch is first collapsed on ``xid`` keeping the **last** occurrence
+        (``fix/loader-batch-internal-duplicates``). The same xid appearing twice
+        in one batch must map to a single Part node: ``@upsert`` deduplicates
+        across transactions, not within one mutation, so two same-xid objects in
+        a single ``set_obj`` would create two Part nodes. Collapsing here means
+        each xid is interned, queried, blank-noded and emitted exactly once, and
+        the surviving fields are the last occurrence's (deterministic merge).
+        """
+        batch = self._dedupe_batch_last_wins(batch)
+
         registry = _UidRegistry()
 
-        # Assign a query/blank index to every entity the batch references.
+        # Assign a query/blank index to every entity the batch references. The
+        # Part key is value-based (``part::<xid>``, no batch position), so each
+        # distinct xid gets exactly one blank-node index — matching the
+        # value-based keying already used for every nested entity.
         part_indices: list[int] = []
-        for i, part in enumerate(batch):
-            part_indices.append(registry.intern(f"part::{part.xid}::{i}", part.xid))
+        for part in batch:
+            part_indices.append(registry.intern(f"part::{part.xid}", part.xid))
             self._register_entities(part, registry)
 
         query, variables = self._build_lookup_query(batch, registry)
@@ -411,6 +425,21 @@ class Loader:
             txn.commit()
         finally:
             txn.discard()
+
+    @staticmethod
+    def _dedupe_batch_last_wins(batch: Sequence[StagedPart]) -> list[StagedPart]:
+        """Collapse same-``xid`` parts within a batch, keeping the last occurrence.
+
+        Insertion-ordered ``dict`` semantics give a stable, last-occurrence-wins
+        result: re-assigning an existing key overwrites the value but preserves
+        the key's original position, so output order matches first appearance
+        while the retained record is the latest one seen. Parts with distinct
+        xids are unaffected.
+        """
+        deduped: dict[str, StagedPart] = {}
+        for part in batch:
+            deduped[part.xid] = part
+        return list(deduped.values())
 
     def _register_entities(self, part: StagedPart, registry: _UidRegistry) -> None:
         """Intern every entity referenced by *part* so it gets a stable index."""
