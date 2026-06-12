@@ -545,6 +545,176 @@ def stats() -> None:
     _console.print(table)
 
 
+# ---------------------------------------------------------------------------
+# search / show commands (read-only)
+# ---------------------------------------------------------------------------
+
+#: Fixed, path-free error shown when a read-only Dgraph query fails. The raw
+#: exception is never interpolated so internal paths cannot leak (B1).
+_DB_QUERY_ERROR = (
+    "[red]Error:[/red] could not query Dgraph. Is the database running? "
+    "Start it with `partgraph db up`."
+)
+
+
+def _run_block_query(client, query_text: str, variables: dict[str, str]) -> dict:
+    """Run a single read-only DQL query and return the parsed JSON response.
+
+    The transaction is always read-only and always discarded; this function
+    never mutates, commits, or alters the database.
+    """
+    import json as _json  # noqa: PLC0415
+
+    txn = client.txn(read_only=True)
+    try:
+        resp = txn.query(query_text, variables=variables)
+        return _json.loads(resp.json)
+    finally:
+        txn.discard()
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(
+        ...,
+        help="Free-text component query, e.g. 'MAX232' or '10k 0402 1%'.",
+    ),
+    limit: int = typer.Option(
+        20,
+        "--limit",
+        help="Maximum number of results to show (capped server-side at 200).",
+    ),
+    no_truncate: bool = typer.Option(
+        False,
+        "--no-truncate",
+        help="Show full datasheet URLs and fields without cropping wide columns.",
+    ),
+) -> None:
+    """Search the component graph by MPN, parameters and package.
+
+    The query is parsed into numeric parameters (e.g. 10k -> resistance),
+    a package code (e.g. 0402) and free-text MPN tokens, then matched with an
+    exact / trigram / full-text cascade. When no exact parametric match exists,
+    a relaxed pass returns the nearest parts by parameter distance.
+
+    Examples:
+      partgraph search "MAX232"
+      partgraph search "10k 0402 1%"
+      partgraph search "100nF 0603"
+      partgraph search "1.2V MAX232"
+
+    All reads are read-only; this command never modifies the database. Use
+    --limit to bound the result count and --no-truncate to print full URLs.
+    The command searches related parts by MPN similarity.
+    """
+    from partgraph.query.dql_builder import build_search_dql  # noqa: PLC0415
+    from partgraph.query.parser import ParsedQuery, parse_query  # noqa: PLC0415
+    from partgraph.query.ranker import rank_results  # noqa: PLC0415
+    from partgraph.query.renderer import render_search_results  # noqa: PLC0415
+
+    if not query.strip():
+        _err_console.print("[red]Error:[/red] search query cannot be empty.")
+        raise typer.Exit(code=1)
+
+    parsed = parse_query(query)
+
+    stub = None
+    try:
+        client, stub = _build_dgraph_client()
+
+        # Pass 1 (hard): full parametric + text filter.
+        query_text, variables = build_search_dql(parsed, limit=limit)
+        data = _run_block_query(client, query_text, variables)
+        result = rank_results(data, parsed)
+
+        if not result.rows and parsed.quantities:
+            # Pass 2 (relaxed): drop parametric filters, keep text + package, and
+            # merge the relaxed rows under the "nearest" key for the ranker.
+            relaxed = ParsedQuery(
+                quantities=[],
+                package=parsed.package,
+                text_tokens=parsed.text_tokens,
+                raw_query=parsed.raw_query,
+            )
+            relaxed_text, relaxed_vars = build_search_dql(relaxed, limit=limit)
+            relaxed_data = _run_block_query(client, relaxed_text, relaxed_vars)
+
+            hard_uids = {
+                r.get("uid")
+                for key in ("exact", "trig", "fts")
+                for r in data.get(key, []) or []
+                if isinstance(r, dict)
+            }
+            nearest_rows = [
+                r
+                for block in relaxed_data.values()
+                if isinstance(block, list)
+                for r in block
+                if isinstance(r, dict) and r.get("uid") not in hard_uids
+            ]
+            merged = {
+                "exact": data.get("exact", []) or [],
+                "trig": data.get("trig", []) or [],
+                "fts": data.get("fts", []) or [],
+                "nearest": nearest_rows,
+            }
+            result = rank_results(merged, parsed)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _err_console.print(_DB_QUERY_ERROR)
+        raise typer.Exit(code=1) from exc
+    finally:
+        if stub is not None:
+            stub.close()
+
+    render_search_results(result, parsed, _console, no_truncate=no_truncate)
+
+
+@app.command()
+def show(
+    mpn: str = typer.Argument(
+        ...,
+        help="Manufacturer part number to look up, e.g. 'MAX232'.",
+    ),
+) -> None:
+    """Show full detail for a single part and its related parts (by MPN).
+
+    Looks the part up by its normalised MPN and prints manufacturer, package,
+    category, stock, promoted key parameters, the long-tail attributes, all
+    datasheet URLs and related parts found by MPN similarity. This is a
+    read-only operation; it never modifies the database.
+    """
+    from partgraph.normalize.model import normalize_mpn  # noqa: PLC0415
+    from partgraph.query.dql_builder import build_show_dql  # noqa: PLC0415
+    from partgraph.query.renderer import render_show_result  # noqa: PLC0415
+
+    mpn_norm = normalize_mpn(mpn)
+
+    stub = None
+    try:
+        client, stub = _build_dgraph_client()
+        query_text, variables = build_show_dql(mpn_norm)
+        data = _run_block_query(client, query_text, variables)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _err_console.print(_DB_QUERY_ERROR)
+        raise typer.Exit(code=1) from exc
+    finally:
+        if stub is not None:
+            stub.close()
+
+    part_block = data.get("part", []) or []
+    if not part_block:
+        _console.print(f"Part '{mpn}' not found.")
+        raise typer.Exit(code=0)
+
+    part = part_block[0]
+    part["_related"] = data.get("related", []) or []
+    render_show_result(part, _console)
+
+
 def main() -> None:
     """Console-script entry point that invokes the Typer application."""
     app()
