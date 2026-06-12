@@ -571,6 +571,66 @@ def test_ac_ew_4_empty_embed_text_skipped_no_mutation_for_it() -> None:
     )
 
 
+def test_ac_ew_5_embedding_value_is_dgraph_vector_string_literal() -> None:
+    """AC-EW-5 (regression): the ``embedding`` value written to Dgraph must be the
+    ``float32vector`` STRING literal ``"[...]"`` — not a native JSON list.
+
+    Dgraph rejects a raw JSON array on a ``float32vector`` predicate ("Input ...
+    of type vector is not vector. Did you forget to add quotes before []?"); the
+    value must be the bracketed string form, matching the read-side
+    ``similar_to`` literal. The unit suite mocks the client, so without this guard
+    a list-valued payload (which real Dgraph refuses) would pass unnoticed — this
+    test pins the contract a mocked client cannot otherwise enforce.
+    """
+    parts = _make_parts_with_uids(2)
+    uid_resp = _build_uid_lookup_response(parts)
+    mock_txn = _build_mock_txn(uid_response=uid_resp)
+    mock_client = _build_mock_client(mock_txn)
+
+    embed_write(
+        iter(parts),
+        mock_client,
+        encoder=_fake_encoder,
+        sleep=MagicMock(),
+    )
+
+    seen_embeddings = 0
+    for call_obj in mock_txn.mutate.call_args_list:
+        _, kwargs = call_obj
+        set_obj = kwargs.get("set_obj")
+        if set_obj is None:
+            set_json = kwargs.get("set_json")
+            if set_json:
+                set_obj = json.loads(
+                    set_json.decode("utf-8") if isinstance(set_json, bytes) else set_json
+                )
+        items = set_obj if isinstance(set_obj, list) else [set_obj]
+        for item in items:
+            if not isinstance(item, dict) or "embedding" not in item:
+                continue
+            value = item["embedding"]
+            assert isinstance(value, str), (
+                f"AC-EW-5: embedding must be a Dgraph vector STRING literal, not "
+                f"{type(value).__name__} — a raw list is rejected by Dgraph. Got: {value!r}"
+            )
+            assert value.startswith("[") and value.endswith("]"), (
+                f"AC-EW-5: embedding literal must be bracketed '[...]'. Got: {value!r}"
+            )
+            parsed = json.loads(value)
+            assert isinstance(parsed, list) and len(parsed) == _EMBED_DIM, (
+                f"AC-EW-5: embedding literal must parse to a {_EMBED_DIM}-float list; "
+                f"got length {len(parsed) if isinstance(parsed, list) else 'n/a'}."
+            )
+            assert all(isinstance(component, (int, float)) for component in parsed), (
+                "AC-EW-5: every element of the embedding literal must be numeric."
+            )
+            seen_embeddings += 1
+
+    assert seen_embeddings == 2, (
+        f"AC-EW-5: expected 2 embedding payload entries; saw {seen_embeddings}."
+    )
+
+
 # ===========================================================================
 # AC-IM: lazy import
 # ===========================================================================
