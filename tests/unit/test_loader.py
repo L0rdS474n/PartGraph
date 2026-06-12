@@ -19,6 +19,16 @@ Tests:
 
 - T-LOAD-ingest-wiring (test 9): CLI _stage_load wires checkpoint_path+fingerprint.
 
+- T-LOAD-dedup-intra-batch (fix/loader-batch-internal-duplicates):
+  Tests for the intra-batch duplicate-xid bug where the same xid appearing
+  at two positions in one batch produces two Part objects with different
+  blank-node uids instead of collapsing to a single node.
+  Root cause: registry.intern(f"part::{xid}::{i}", xid) uses the batch
+  position i as part of the key, so two occurrences of the same xid get
+  different keys -> different indices -> different blank nodes -> Dgraph
+  creates two Part nodes in a single mutation despite @upsert.
+  Tests in this block are EXPECTED RED against the current loader.
+
 NOTE: Collection will ERROR if partgraph.load.loader does not yet exist.
 That is the expected red state before implementation.
 
@@ -1736,4 +1746,290 @@ def test_ingest_stage_load_passes_checkpoint_path_and_fingerprint(
     )
     assert received_kwargs["fingerprint"] is not None, (
         "fingerprint passed to Loader.load() must be non-None."
+    )
+
+
+# ===========================================================================
+# T-LOAD-dedup-intra-batch — fix/loader-batch-internal-duplicates
+#
+# These three tests are EXPECTED RED against the current loader.
+#
+# Root cause (confirmed by reading src/partgraph/load/loader.py line 397):
+#   registry.intern(f"part::{part.xid}::{i}", part.xid)
+# The in-batch position `i` is embedded in the registry key, so two occurrences
+# of the same xid at positions i=0 and i=1 get distinct keys
+# ("part::X::0" vs "part::X::1") -> distinct blank-node indices ->
+# distinct blank-node labels (_:n0 vs _:n1) -> two Part objects with the
+# same xid but different uids in a single mutation payload -> Dgraph creates
+# two Part nodes in one mutation.  @upsert does NOT prevent this because it
+# guards across transactions, not within a single mutation.
+#
+# Fix contract:
+#   All occurrences of the same xid within one batch MUST collapse to one Part
+#   object in the mutation payload, sharing a single uid (blank or resolved).
+#   "Last occurrence wins" is the pinned deterministic merge strategy.
+# ===========================================================================
+
+
+def _make_staged_part_with_lcsc(
+    xid: str,
+    lcsc_id: str,
+    description: str | None = None,
+) -> StagedPart:
+    """Build a StagedPart with a fixed xid and a caller-supplied lcsc_id.
+
+    Used to construct two parts that share the same xid but differ in lcsc_id
+    and/or description, exercising the intra-batch duplicate-xid code path.
+    """
+    mpn_part, mfr_part = xid.split("|", 1)
+    return StagedPart(
+        mpn=mpn_part,
+        mpn_norm=mpn_part,
+        mfr_name=mfr_part,
+        mfr_norm=mfr_part,
+        xid=xid,
+        description=description or f"Part {lcsc_id}",
+        package="0402",
+        category="Passive",
+        subcategory="Resistors",
+        datasheet_url=None,
+        lcsc_id=lcsc_id,
+        stock=10,
+        price_usd=0.01,
+        is_basic=False,
+        promoted={},
+        attributes=[],
+        tags=[],
+        source_ref="jlcparts@2026-06-11",
+    )
+
+
+def _collect_all_part_objs(set_obj_payload: list | dict) -> list[dict]:
+    """Collect every Part-typed object at the top level of a set_obj payload.
+
+    The loader passes a list of per-part dicts to txn.mutate(set_obj=...).
+    This helper flattens that list and returns all entries whose dgraph.type
+    field is "Part".
+    """
+    top: list[dict] = (
+        set_obj_payload
+        if isinstance(set_obj_payload, list)
+        else [set_obj_payload]
+    )
+    return [obj for obj in top if isinstance(obj, dict) and obj.get("dgraph.type") == "Part"]
+
+
+def test_load_batch_internal_duplicate_xid_single_node() -> None:
+    """T-LOAD-dedup-1 — intra-batch duplicate xid must produce exactly one Part node.
+
+    Given:
+      A batch containing TWO StagedPart objects with the SAME xid
+      (mpn_norm|mfr_norm identical), differing only in lcsc_id.
+      The mock lookup query returns no existing uid for that xid (fresh DB).
+
+    When:
+      Loader.load([part_a, part_b]) is called (both in the same batch because
+      batch_size is larger than 2).
+
+    Then:
+      The decoded set_obj payload contains EXACTLY ONE Part object (dgraph.type
+      == "Part") carrying that xid.  The two occurrences must collapse to a
+      single node.  The current code FAILS this because it emits two Part objects
+      with distinct blank-node uids (_:n0 and _:n1) for the same xid.
+
+    Invariant pinned: count(Part objects with xid X in one mutation) == 1.
+    """
+    shared_xid = "DUPMPN|DUPMFR"
+    part_a = _make_staged_part_with_lcsc(shared_xid, "C0001", description="First occurrence")
+    part_b = _make_staged_part_with_lcsc(shared_xid, "C0002", description="Second occurrence")
+
+    mock_client, mock_txn = _build_mock_pydgraph_client()
+    # Lookup returns no existing uid -> blank nodes will be used.
+    mock_resp = MagicMock()
+    mock_resp.json = json.dumps({"q": []}).encode()
+    mock_txn.query.return_value = mock_resp
+
+    loader = Loader(client=mock_client, batch_size=10)
+    loader.load([part_a, part_b])
+
+    mutate_calls = mock_txn.mutate.call_args_list
+    assert mutate_calls, "mutate() was never called."
+
+    # There should be exactly one mutate call for this single-batch load.
+    _, kwargs = mutate_calls[0]
+    raw_payload = kwargs.get("set_obj")
+    assert raw_payload is not None, (
+        "Loader must call txn.mutate(set_obj=...) but set_obj was not found. "
+        f"mutate kwargs: {kwargs!r}"
+    )
+
+    part_objs = _collect_all_part_objs(raw_payload)
+    parts_with_xid = [obj for obj in part_objs if obj.get("xid") == shared_xid]
+
+    assert len(parts_with_xid) == 1, (
+        f"Expected exactly 1 Part object with xid={shared_xid!r} in the mutation "
+        f"payload, but found {len(parts_with_xid)}. The intra-batch duplicate-xid "
+        f"bug produces {len(parts_with_xid)} distinct Part objects because each "
+        f"batch position gets a different blank-node label. "
+        f"Part objects found: {parts_with_xid!r}"
+    )
+
+
+def test_load_batch_internal_duplicate_distinct_blank_uids_not_emitted() -> None:
+    """T-LOAD-dedup-2 — all Part objects sharing the same xid must share the same uid.
+
+    Given:
+      A batch of FOUR StagedParts where two pairs share the same xid:
+        pair A: xid "XIDA|MFRA"  at positions 0 and 2
+        pair B: xid "XIDB|MFRB"  at positions 1 and 3
+      Fresh DB (lookup returns no existing uids).
+
+    When:
+      Loader.load([a0, b0, a1, b1], batch_size=10) is called.
+
+    Then:
+      Within the decoded set_obj payload, for every distinct xid value, all
+      Part objects carrying that xid must share an identical uid value.
+      Specifically: no two Part objects in the payload may have the same xid
+      but different uid values.
+
+    Invariant pinned:
+      for all pairs (p, q) in Part objects:
+        p["xid"] == q["xid"] => p["uid"] == q["uid"]
+
+    The current code violates this because position-keyed blank nodes (_:n0,
+    _:n2) are distinct strings even though they represent the same entity.
+    """
+    xid_a = "XIDA|MFRA"
+    xid_b = "XIDB|MFRB"
+    a0 = _make_staged_part_with_lcsc(xid_a, "C1001")
+    b0 = _make_staged_part_with_lcsc(xid_b, "C2001")
+    a1 = _make_staged_part_with_lcsc(xid_a, "C1002")
+    b1 = _make_staged_part_with_lcsc(xid_b, "C2002")
+
+    mock_client, mock_txn = _build_mock_pydgraph_client()
+    mock_resp = MagicMock()
+    mock_resp.json = json.dumps({"q": []}).encode()
+    mock_txn.query.return_value = mock_resp
+
+    loader = Loader(client=mock_client, batch_size=10)
+    loader.load([a0, b0, a1, b1])
+
+    mutate_calls = mock_txn.mutate.call_args_list
+    assert mutate_calls, "mutate() was never called."
+
+    _, kwargs = mutate_calls[0]
+    raw_payload = kwargs.get("set_obj")
+    assert raw_payload is not None, (
+        f"Loader must call txn.mutate(set_obj=...). kwargs: {kwargs!r}"
+    )
+
+    part_objs = _collect_all_part_objs(raw_payload)
+
+    # Build a mapping: xid -> set of all uid values seen for that xid.
+    xid_to_uids: dict[str, set] = {}
+    for obj in part_objs:
+        xid = obj.get("xid")
+        uid = obj.get("uid")
+        if xid is not None:
+            xid_to_uids.setdefault(xid, set()).add(uid)
+
+    violations: list[str] = []
+    for xid, uids in xid_to_uids.items():
+        if len(uids) > 1:
+            violations.append(
+                f"xid={xid!r} appears with {len(uids)} different uid values: {uids!r}"
+            )
+
+    assert not violations, (
+        "Invariant violated: Part objects with the same xid must share one uid. "
+        "Violations found (each line is one xid with multiple uids):\n"
+        + "\n".join(violations)
+        + "\nThis is the intra-batch duplicate-xid bug: position-keyed blank nodes "
+        "(_:n<i>) are distinct strings that Dgraph treats as distinct nodes even "
+        "though they represent the same entity."
+    )
+
+
+def test_load_batch_duplicate_xid_last_wins_fields_preserved() -> None:
+    """T-LOAD-dedup-3 — last-occurrence-wins: surviving node carries last-seen fields.
+
+    Given:
+      A batch with two StagedParts that share xid "DUPWIN|MFRW":
+        first  (position 0): lcsc_id="C0001", description="First"
+        second (position 1): lcsc_id="C0002", description="Second"
+      Fresh DB (no existing uid).
+
+    When:
+      Loader.load([first, second], batch_size=10) is called.
+
+    Then:
+      The single surviving Part object in the payload:
+        1. has dgraph.type == "Part"
+        2. has xid == "DUPWIN|MFRW"
+        3. has lcsc_id == "C0002"  (last occurrence wins)
+        4. has description == "Second"  (last occurrence wins)
+        5. has a uid value that is non-empty (either a blank node or a resolved uid)
+
+    Contract: "last occurrence wins" is the pinned deterministic merge strategy.
+    The implementation must deduplicate same-xid parts within one batch before
+    building the payload, keeping only the last entry in the iteration order.
+
+    The current code FAILS this test because it emits TWO Part objects for the
+    same xid and neither is guaranteed to be selected as the survivor.
+    """
+    shared_xid = "DUPWIN|MFRW"
+    first = _make_staged_part_with_lcsc(shared_xid, "C0001", description="First")
+    last  = _make_staged_part_with_lcsc(shared_xid, "C0002", description="Second")
+
+    mock_client, mock_txn = _build_mock_pydgraph_client()
+    mock_resp = MagicMock()
+    mock_resp.json = json.dumps({"q": []}).encode()
+    mock_txn.query.return_value = mock_resp
+
+    loader = Loader(client=mock_client, batch_size=10)
+    loader.load([first, last])
+
+    mutate_calls = mock_txn.mutate.call_args_list
+    assert mutate_calls, "mutate() was never called."
+
+    _, kwargs = mutate_calls[0]
+    raw_payload = kwargs.get("set_obj")
+    assert raw_payload is not None, (
+        f"Loader must call txn.mutate(set_obj=...). kwargs: {kwargs!r}"
+    )
+
+    part_objs = _collect_all_part_objs(raw_payload)
+    parts_with_xid = [obj for obj in part_objs if obj.get("xid") == shared_xid]
+
+    # Must be exactly one surviving Part node.
+    assert len(parts_with_xid) == 1, (
+        f"Expected exactly 1 Part for xid={shared_xid!r} after last-wins collapse; "
+        f"got {len(parts_with_xid)}: {parts_with_xid!r}"
+    )
+
+    survivor = parts_with_xid[0]
+
+    assert survivor.get("dgraph.type") == "Part", (
+        f"Surviving Part object must have dgraph.type='Part'; got {survivor!r}"
+    )
+    assert survivor.get("xid") == shared_xid, (
+        f"Surviving Part must carry xid={shared_xid!r}; got {survivor.get('xid')!r}"
+    )
+
+    # Last-occurrence-wins: the second StagedPart (lcsc_id="C0002") must win.
+    assert survivor.get("lcsc_id") == "C0002", (
+        f"Last-occurrence-wins contract: surviving Part must have lcsc_id='C0002' "
+        f"(from the second/last occurrence); got {survivor.get('lcsc_id')!r}. "
+        f"Full survivor: {survivor!r}"
+    )
+    assert survivor.get("description") == "Second", (
+        f"Last-occurrence-wins contract: surviving Part must have description='Second' "
+        f"(from the second/last occurrence); got {survivor.get('description')!r}."
+    )
+
+    uid = survivor.get("uid")
+    assert uid, (
+        f"Surviving Part must have a non-empty uid (blank node or resolved); "
+        f"got {uid!r}."
     )
