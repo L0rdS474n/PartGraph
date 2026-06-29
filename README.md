@@ -8,7 +8,8 @@ description. A semantic (vector) search layer is planned so you can find parts
 by what they *do*, not just by their part number.
 
 PartGraph stores **links to datasheets, never the PDFs themselves**, and is
-built on a local [Dgraph](https://dgraph.io/) instance running in Docker.
+built on a local [Dgraph](https://dgraph.io/) instance running in Docker or
+Podman.
 
 > Status: early alpha. PR1 delivers the fundament (repository skeleton, CI,
 > Docker Compose, the DQL schema, and the `partgraph db` lifecycle commands).
@@ -35,9 +36,9 @@ redistributed**. KiCad-derived data is CC-BY-SA 4.0 and is attributed below.
 
 ## Quickstart
 
-Requirements: Python 3.12, Docker with the Compose plugin, and (for the full
-ingestion in later PRs) ~10 GB of free disk for raw data plus a few GB for the
-Dgraph volume and embedding models.
+Requirements: Python 3.12, Docker or Podman with the Compose plugin (Podman
+4.1+), and (for the full ingestion in later PRs) ~10 GB of free disk for raw
+data plus a few GB for the Dgraph volume and embedding models.
 
 ```bash
 # 1. Create and activate a Python 3.12 environment (conda shown; venv works too)
@@ -60,6 +61,11 @@ pytest -m integration              # integration tests (requires `db up`)
 # Stop the database when finished (data is preserved)
 partgraph db down
 ```
+
+PartGraph auto-detects the container engine **podman-first**: it uses Podman
+when present and otherwise Docker. To force a specific engine, set
+`PARTGRAPH_CONTAINER_ENGINE` (for example `PARTGRAPH_CONTAINER_ENGINE=docker` on
+a host that has both installed).
 
 ## Ports
 

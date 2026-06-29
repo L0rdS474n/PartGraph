@@ -4,7 +4,7 @@ Tests: G1, G3
 G1 — `partgraph db up` brings Dgraph to a healthy state reachable at
      http://127.0.0.1:8081/health within bounded retry/backoff;
      container has named volume ending in partgraph_dgraph_data at /dgraph;
-     `docker port` shows ONLY 127.0.0.1 bindings;
+     the container engine's `port` output shows ONLY 127.0.0.1 bindings;
      ports 8081/9081/8001 exposed (never 8080/9080 on the host).
 
 G3 — `docker compose restart` (or down-without-v + up) preserves:
@@ -25,6 +25,8 @@ import time
 
 import pytest
 import requests
+
+from partgraph.util import compose_command, engine_command
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -175,14 +177,14 @@ def test_dgraph_health_response_is_json(dgraph_available: bool) -> None:
 @pytest.mark.integration
 def test_docker_container_ports_are_localhost_only(dgraph_available: bool) -> None:
     """Given the PartGraph Dgraph container is running.
-    When we inspect its port bindings via `docker port <container_name>`.
+    When we inspect its port bindings via engine `port <container_name>`.
     Then ALL published ports must bind to 127.0.0.1 (never 0.0.0.0 or *).
 
-    We use `docker port PARTGRAPH_CONTAINER_NAME` (filtered by explicit name
+    We use engine `port PARTGRAPH_CONTAINER_NAME` (filtered by explicit name
     from docker-compose.yml) so we never accidentally inspect a foreign
     container (e.g. a cve-graph stack) that happens to use the same image.
     """
-    port_result = _run(["docker", "port", PARTGRAPH_CONTAINER_NAME])
+    port_result = _run([*engine_command(), "port", PARTGRAPH_CONTAINER_NAME])
     raw_ports = port_result.stdout
 
     # Verify no 0.0.0.0 binding appears.
@@ -196,14 +198,14 @@ def test_docker_container_ports_are_localhost_only(dgraph_available: bool) -> No
 @pytest.mark.integration
 def test_docker_container_exposes_port_8081_not_8080(dgraph_available: bool) -> None:
     """Given the PartGraph container is running.
-    When we query its port mappings via `docker port <container_name>`.
+    When we query its port mappings via engine `port <container_name>`.
     Then host port 8081 must be mapped to container port 8080, bound on
     127.0.0.1 only (never 0.0.0.0).
 
     We filter by PARTGRAPH_CONTAINER_NAME so this assertion is not
     accidentally satisfied by a foreign container on the same machine.
     """
-    port_result = _run(["docker", "port", PARTGRAPH_CONTAINER_NAME])
+    port_result = _run([*engine_command(), "port", PARTGRAPH_CONTAINER_NAME])
     ports_text = port_result.stdout
     assert re.search(r"127\.0\.0\.1:8081", ports_text), (
         f"Expected 127.0.0.1:8081->8080 mapping not found for container "
@@ -217,14 +219,14 @@ def test_docker_container_exposes_port_8081_not_8080(dgraph_available: bool) -> 
 @pytest.mark.integration
 def test_docker_container_exposes_port_9081_not_9080(dgraph_available: bool) -> None:
     """Given the PartGraph container is running.
-    When we query its port mappings via `docker port <container_name>`.
+    When we query its port mappings via engine `port <container_name>`.
     Then host port 9081 must be mapped to container port 9080, bound on
     127.0.0.1 only.
 
     Filtered by PARTGRAPH_CONTAINER_NAME to prevent false positives from
     other stacks on this machine.
     """
-    port_result = _run(["docker", "port", PARTGRAPH_CONTAINER_NAME])
+    port_result = _run([*engine_command(), "port", PARTGRAPH_CONTAINER_NAME])
     ports_text = port_result.stdout
     assert re.search(r"127\.0\.0\.1:9081", ports_text), (
         f"Expected 127.0.0.1:9081->9080 mapping not found for container "
@@ -235,13 +237,13 @@ def test_docker_container_exposes_port_9081_not_9080(dgraph_available: bool) -> 
 @pytest.mark.integration
 def test_docker_container_exposes_port_8001(dgraph_available: bool) -> None:
     """Given the PartGraph container is running.
-    When we query its port mappings via `docker port <container_name>`.
+    When we query its port mappings via engine `port <container_name>`.
     Then host port 8001 must be mapped to container port 8000 (Ratel/admin UI),
     bound on 127.0.0.1 only.
 
     Filtered by PARTGRAPH_CONTAINER_NAME to prevent false positives.
     """
-    port_result = _run(["docker", "port", PARTGRAPH_CONTAINER_NAME])
+    port_result = _run([*engine_command(), "port", PARTGRAPH_CONTAINER_NAME])
     ports_text = port_result.stdout
     assert re.search(r"127\.0\.0\.1:8001", ports_text), (
         f"Expected 127.0.0.1:8001->8000 mapping not found for container "
@@ -263,7 +265,7 @@ def test_dgraph_container_has_named_volume_partgraph_dgraph_data(
     mounted at /dgraph.
     """
     ps_result = _run([
-        "docker", "ps",
+        *engine_command(), "ps",
         "--filter", "status=running",
         "--format", "{{.ID}}",
     ])
@@ -272,7 +274,7 @@ def test_dgraph_container_has_named_volume_partgraph_dgraph_data(
 
     found = False
     for cid in container_ids:
-        inspect = _run(["docker", "inspect", "--format",
+        inspect = _run([*engine_command(), "inspect", "--format",
                         "{{json .Mounts}}", cid])
         try:
             mounts = json.loads(inspect.stdout.strip())
@@ -333,7 +335,7 @@ def test_data_persists_across_compose_restart(
     # Perform restart.
     compose_path = str(repo_root / "docker" / "docker-compose.yml")
     result = _run([
-        "docker", "compose", "-f", compose_path, "restart",
+        *compose_command(), "-f", compose_path, "restart",
     ])
     assert result.returncode == 0, (
         f"`docker compose restart` failed:\n{result.stderr}"
@@ -372,7 +374,7 @@ def test_schema_persists_across_compose_restart(
     """
     compose_path = str(repo_root / "docker" / "docker-compose.yml")
     result = _run([
-        "docker", "compose", "-f", compose_path, "restart",
+        *compose_command(), "-f", compose_path, "restart",
     ])
     assert result.returncode == 0, (
         f"`docker compose restart` failed:\n{result.stderr}"

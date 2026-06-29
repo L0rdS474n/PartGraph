@@ -6,7 +6,7 @@ setup, the testing policy, and the rules for pull requests.
 ## Development setup
 
 PartGraph targets **Python 3.12** and a local **Dgraph** instance running in
-Docker.
+Docker or Podman.
 
 ```bash
 # Create the environment (conda recommended; a venv works too)
@@ -25,6 +25,10 @@ partgraph db apply-schema
 # ... work ...
 partgraph db down            # data is preserved (no -v)
 ```
+
+The container engine is auto-detected **podman-first** (Podman when present,
+otherwise Docker); set `PARTGRAPH_CONTAINER_ENGINE` (e.g.
+`PARTGRAPH_CONTAINER_ENGINE=docker`) to force a specific engine.
 
 ## Test-first policy
 
@@ -47,7 +51,8 @@ pytest -m integration           # integration tests — requires `partgraph db u
 
 - **Unit tests** are pure and run anywhere (this is what CI runs).
 - **Integration tests** are marked `@pytest.mark.integration` and require a
-  **local Docker setup** with a running Dgraph instance (`partgraph db up`).
+  **local Docker or Podman setup** with a running Dgraph instance
+  (`partgraph db up`).
   They are executed locally only and are never run in CI.
 
 ## Pull-request rules
