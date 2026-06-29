@@ -291,6 +291,17 @@ def _load_avg_1m() -> float:
         return 0.0
 
 
+# INVARIANT (do not "optimize" by hoisting): ``import psutil`` MUST stay lazy
+# inside get_system_reader() and never move to module level. ``partgraph.util``'s
+# package __init__ imports this module eagerly (``from partgraph.util.resources
+# import ...``), and that __init__ now also sits on the ``import partgraph.cli``
+# path — cli.py imports ``partgraph.util.container``, which executes
+# ``partgraph/util/__init__.py`` and therefore this module. psutil is an OPTIONAL
+# dependency, so a module-level import here would make merely importing the CLI
+# (or ``partgraph.util``) require psutil and hard-fail when it is absent, breaking
+# the load-time guarantee documented in util/__init__.py. Keeping the import in
+# the function body preserves graceful degradation (ram_available_fraction=None)
+# on hosts without psutil. (ARCH-1)
 def get_system_reader() -> Callable[[], SystemSnapshot]:
     """Return a callable that reads the current :class:`SystemSnapshot`.
 

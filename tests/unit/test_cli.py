@@ -8,7 +8,9 @@ Verifies the typer-based CLI behaviour:
 - Help text is in English (no non-ASCII characters that would indicate other
   languages; at minimum the word "Usage" appears).
 - db up/down/status invoke subprocess.run with a LIST argv (no shell=True)
-  containing `docker compose -f <repo>/docker/docker-compose.yml`.
+  whose prefix is the detected container engine + `compose` (from
+  partgraph.util.compose_command, so docker OR podman works), followed by
+  `-f <repo>/docker/docker-compose.yml`.
 - db down argv must NOT include "-v".
 - apply-schema targets gRPC 127.0.0.1:9081 (verified via monkeypatched client
   or the GRPC_ADDR constant in partgraph.cli).
@@ -32,6 +34,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 from partgraph.cli import app  # noqa: E402 — intentional module-level import
+from partgraph.util.container import ContainerEngineError  # noqa: E402
 
 # typer.testing is only available when typer is installed.
 from typer.testing import CliRunner  # noqa: E402
@@ -47,6 +50,28 @@ RUNNER = CliRunner()
 def _invoke(args: list[str]):
     """Invoke the CLI app with the given args and return the result."""
     return RUNNER.invoke(app, args)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def stub_compose_command() -> list[str]:
+    """Stub partgraph.cli.compose_command to return a fixed deterministic argv prefix.
+
+    Given: partgraph.cli imports compose_command from partgraph.util.container.
+    When: any test requests this fixture.
+    Then: compose_command() returns ["docker", "compose"] so argv-level assertions
+          are engine-agnostic and hermetic on CI runners without a container engine
+          installed.
+
+    Yields the stubbed prefix list so tests can assert on it directly, and raises
+    AttributeError at fixture-setup time if partgraph.cli has not yet imported
+    compose_command — the correct test-first red state.
+    """
+    with patch("partgraph.cli.compose_command", return_value=["docker", "compose"]):
+        yield ["docker", "compose"]
 
 
 # ---------------------------------------------------------------------------
@@ -138,14 +163,21 @@ def _repo_docker_compose_path(repo_root: pathlib.Path | None = None) -> str:
 def test_db_command_calls_subprocess_run_with_list_argv_no_shell(
     sub_cmd: str,
     repo_root: pathlib.Path,
+    stub_compose_command: list[str],
 ) -> None:
     """Given the db sub-command delegates to Docker Compose.
-    When we invoke `partgraph db <sub_cmd>` with subprocess.run monkeypatched.
+    When we invoke `partgraph db <sub_cmd>` with subprocess.run monkeypatched
+    and compose_command() stubbed to return ["docker", "compose"].
     Then subprocess.run must be called with:
       - A list as the first argument (not a string).
       - shell=False (or shell keyword absent / False).
-      - The list must contain 'docker', 'compose', '-f',
-        and the absolute path to docker/docker-compose.yml.
+      - The first two elements must equal compose_command()'s return value,
+        i.e. the stub_compose_command fixture value (an engine-agnostic prefix).
+      - The list must contain '-f' and the absolute path to docker/docker-compose.yml.
+
+    The stub_compose_command fixture ensures this test is hermetic: it passes on
+    a CI runner that has no container engine installed, because compose_command()
+    is never called for real — the stub returns the fixed prefix instead.
     """
     compose_path = _repo_docker_compose_path(repo_root)
     mock_completed = MagicMock(returncode=0, stdout="", stderr="")
@@ -166,21 +198,27 @@ def test_db_command_calls_subprocess_run_with_list_argv_no_shell(
     assert keyword_args.get("shell", False) is False, (
         f"`db {sub_cmd}` called subprocess.run with shell=True. Forbidden."
     )
-    assert "docker" in argv, f"'docker' not in argv for `db {sub_cmd}`: {argv}"
-    assert "compose" in argv, f"'compose' not in argv: {argv}"
+    assert argv[:2] == stub_compose_command, (
+        f"`db {sub_cmd}` argv prefix must equal compose_command()'s return value "
+        f"{stub_compose_command!r}, got: {argv[:2]!r}. "
+        "The CLI must build argv from compose_command(), not a hard-coded engine name."
+    )
     assert "-f" in argv, f"'-f' flag not in argv: {argv}"
     assert compose_path in argv, (
         f"docker-compose.yml path '{compose_path}' not in argv: {argv}"
     )
 
 
-def test_db_down_argv_does_not_contain_v_flag(repo_root: pathlib.Path) -> None:
+def test_db_down_argv_does_not_contain_v_flag(
+    repo_root: pathlib.Path,
+    stub_compose_command: list[str],
+) -> None:
     """Given `db down` must preserve the named volume.
-    When we invoke `partgraph db down`.
+    When we invoke `partgraph db down` with compose_command() stubbed.
     Then the subprocess.run argv must NOT contain '-v'.
 
     Including '-v' would delete the named volume and violate the G3 persistence
-    contract.
+    contract.  The stub_compose_command fixture makes this hermetic on CI.
     """
     mock_completed = MagicMock(returncode=0, stdout="", stderr="")
 
@@ -208,11 +246,14 @@ def test_db_down_argv_does_not_contain_v_flag(repo_root: pathlib.Path) -> None:
 def test_db_command_compose_path_is_absolute(
     sub_cmd: str,
     repo_root: pathlib.Path,
+    stub_compose_command: list[str],
 ) -> None:
-    """Given the db sub-command invokes docker compose.
+    """Given the db sub-command invokes docker compose with compose_command() stubbed.
     When we capture the subprocess.run argv for db up/down/status.
     Then the path element immediately following the '-f' flag must be an
     absolute path (starts with '/'), preventing CWD-relative file injection.
+
+    The stub_compose_command fixture makes this hermetic on engine-less CI.
     """
     mock_completed = MagicMock(returncode=0, stdout="", stderr="")
 
@@ -237,6 +278,51 @@ def test_db_command_compose_path_is_absolute(
         f"`db {sub_cmd}` passes a non-absolute path after '-f': {compose_path_arg!r}. "
         "The compose file path must be absolute to prevent CWD-relative injection."
     )
+
+
+# ---------------------------------------------------------------------------
+# AC-5 — db up exits cleanly when no container engine is available
+# ---------------------------------------------------------------------------
+
+def test_db_up_exits_cleanly_when_no_engine_available() -> None:
+    """Given partgraph.cli.compose_command raises ContainerEngineError (no engine on PATH).
+    When we invoke `partgraph db up`.
+    Then:
+    - exit_code is 1 (non-zero, standard CLI error code).
+    - output contains the word "Error" — a human-readable message, not a raw
+      Python traceback (which would expose internal module paths).
+    - result.exception is NOT a ContainerEngineError: the CLI must catch the
+      engine-detection failure and convert it to a typer.Exit(code=1) so no
+      unhandled exception propagates to the user's terminal.
+
+    This test is deliberately engine-agnostic: it patches compose_command() at the
+    partgraph.cli namespace level and therefore requires that cli.py imports
+    compose_command — the correct test-first red state before implementation.
+    """
+    with patch(
+        "partgraph.cli.compose_command",
+        side_effect=ContainerEngineError("no engine"),
+    ):
+        result = _invoke(["db", "up"])
+
+    assert result.exit_code == 1, (
+        f"`db up` with no engine available should exit 1, got {result.exit_code}.\n"
+        f"Output:\n{result.output!r}"
+    )
+    assert "Error" in result.output, (
+        "`db up` with no engine should print a human-readable 'Error' message "
+        "(not a raw traceback). "
+        f"Got output:\n{result.output!r}"
+    )
+    # ContainerEngineError must NOT leak as an unhandled exception.
+    # When properly handled: result.exception is None or SystemExit (from typer.Exit).
+    # When leaked (bug): result.exception is a ContainerEngineError instance.
+    if result.exception is not None:
+        assert not isinstance(result.exception, ContainerEngineError), (
+            "ContainerEngineError leaked as an unhandled exception. "
+            "It must be caught in _run_compose (or db up) and re-raised as "
+            "typer.Exit(code=1) so no traceback is printed to the user."
+        )
 
 
 def test_apply_schema_targets_localhost_9081(repo_root: pathlib.Path) -> None:

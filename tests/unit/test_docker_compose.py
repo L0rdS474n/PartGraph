@@ -20,6 +20,8 @@ import subprocess
 import pytest
 import yaml
 
+from partgraph.util.container import ContainerEngineError, compose_command
+
 
 # ---------------------------------------------------------------------------
 # Fixture: parsed compose config
@@ -52,17 +54,20 @@ def _load_compose_yaml(repo_root: pathlib.Path) -> dict:
         f"{COMPOSE_REL} does not exist. Create it before running tests."
     )
 
-    # Attempt docker compose config for canonical validation.
+    # Attempt docker/podman compose config for canonical validation.
+    # compose_command() is called INSIDE the try so that ContainerEngineError
+    # (raised when no engine is on PATH) is caught by the except clause and the
+    # raw-YAML fallback fires — keeping the structural tests hermetic on CI.
     try:
         result = subprocess.run(
-            ["docker", "compose", "-f", str(compose_path), "config"],
+            [*compose_command(), "-f", str(compose_path), "config"],
             capture_output=True,
             text=True,
             timeout=15,
         )
         if result.returncode == 0:
             return yaml.safe_load(result.stdout)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, subprocess.TimeoutExpired, ContainerEngineError):
         pass
 
     # Fallback: parse raw YAML deterministically.
