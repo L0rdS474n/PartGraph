@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import typer
@@ -29,6 +30,11 @@ from rich.console import Console
 from partgraph import __version__
 from partgraph import schema as schema_module
 from partgraph.embed import get_encoder
+from partgraph.refresh.links import (
+    HostRateLimiter,
+    format_verified_at,
+    refresh_links_write,
+)
 from partgraph.util.container import ContainerEngineError, compose_command
 
 # ``get_encoder`` is imported at module level (not lazily) ON PURPOSE: the test
@@ -36,6 +42,13 @@ from partgraph.util.container import ContainerEngineError, compose_command
 # embed and the semantic-search paths. Importing partgraph.embed is cheap — it
 # does NOT import sentence_transformers (that happens lazily inside get_encoder),
 # so module import stays light and torch is never pulled in here.
+#
+# ``HostRateLimiter``/``refresh_links_write``/``format_verified_at`` are imported
+# eagerly here for the same reason: the refresh-links tests patch them at
+# ``partgraph.cli`` (as well as ``partgraph.refresh.links``) to spy on the
+# rate-limiter construction and the leaf write call. partgraph.refresh.links is a
+# thin leaf (stdlib only; httpx is imported lazily by _build_http_client), so the
+# import stays light and opens no socket at import time.
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1164,6 +1177,370 @@ def embed(
     elapsed = _time.monotonic() - start
     _console.print(
         f"[green]Embedded {embedded_total} parts in {elapsed:.1f}s.[/green]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# refresh-links command (HTTP-check datasheet URLs, stamp freshness, auto-purge)
+# ---------------------------------------------------------------------------
+
+#: Fixed, path-free error shown when the refresh-links run fails (DB down /
+#: mutation error). The raw exception is never interpolated so no internal path
+#: leaks; deliberately distinct from :data:`_EMBED_DB_ERROR` so the text names
+#: the right operation while still hinting `partgraph db up`.
+_REFRESH_DB_ERROR = (
+    "[red]Error:[/red] could not refresh datasheet links. Is the database "
+    "running? Start it with `partgraph db up`."
+)
+
+#: Maximum Datasheet nodes selected for a link check when no --limit is given.
+#: Bounds a single run; the full catalogue is covered across repeated/cron runs.
+_REFRESH_SELECT_DEFAULT = 200_000
+
+#: Maximum Datasheet nodes fetched from Dgraph in a single selection page. Kept
+#: comfortably below the gRPC message ceiling; the run loops over pages.
+_REFRESH_SELECT_PAGE_SIZE = 10_000
+
+#: Shape of a real Dgraph uid (``0x`` + hex). COPIED from the embed section on
+#: purpose (never imported/aliased from it) so the refresh selection path stays
+#: fully decoupled from the embed pipeline the design forbids modifying. The
+#: keyset cursor is validated against this before it can reach a DQL ``after:``
+#: clause (validate-before-interpolate; ADR-0010 / dql_builder's ADR-INJECT).
+_REFRESH_UID_RE = re.compile(r"^0x[0-9a-fA-F]+$")
+
+#: Informational (NOT error) notice printed when the keyset cursor fails to
+#: advance between pages — the defensive guard against re-fetching the same rows
+#: forever. Path-free and distinct from :data:`_REFRESH_DB_ERROR` (this is not a
+#: failure; the run keeps whatever it checked so far; mirrors
+#: :data:`_EMBED_CURSOR_STALL`).
+_REFRESH_CURSOR_STALL = (
+    "pagination cursor did not advance; stopping early to avoid re-fetching."
+)
+
+#: Per-host politeness interval (seconds) between two datasheet checks against
+#: the SAME host — most datasheet URLs share a handful of hosts (lcsc.com), so a
+#: bounded delay keeps the checker a good citizen without adding a config knob.
+_REFRESH_HOST_MIN_INTERVAL = 0.5
+
+#: The summary keys the refresh run aggregates across pages.
+_REFRESH_SUMMARY_KEYS = ("checked", "alive", "dead", "purged")
+
+
+def _utcnow() -> datetime:
+    """Return the current UTC time (patchable "now" seam).
+
+    Mirrors the reason ``get_encoder`` is imported at module level "ON PURPOSE
+    ... the test suite patches it": the refresh-links tests replace this with a
+    fixed instant so the staleness cutoff ``T = now - stale_days`` is
+    deterministic and never reads the real wall clock.
+    """
+    return datetime.now(UTC)
+
+
+def _build_http_client():
+    """Create an ``httpx.Client`` for datasheet link checking (lazy import).
+
+    httpx is imported lazily (mirroring :mod:`partgraph.ingest.fetch`) so CLI
+    commands that never check links never construct an HTTP stack. Redirects are
+    deliberately NOT followed: a 3xx is observed and classified as-is (the link
+    is served), matching the leaf's 2xx/3xx = alive policy. The unit suite
+    patches this factory so no real socket is ever opened.
+    """
+    import httpx  # noqa: PLC0415 — lazy import keeps the HTTP stack optional.
+
+    return httpx.Client(follow_redirects=False)
+
+
+def _close_http_client(http_client) -> None:
+    """Close *http_client* if it exposes a ``close`` method (best effort)."""
+    close = getattr(http_client, "close", None)
+    if callable(close):
+        close()
+
+
+def _refresh_page_max_uid(rows: list) -> str | None:
+    """Return the numerically-largest valid uid among *rows*, or ``None``.
+
+    Only uids matching :data:`_REFRESH_UID_RE` are considered; a missing or
+    malformed uid is excluded (validate-before-interpolate — it must never become
+    a raw ``after:`` cursor). The maximum is taken NUMERICALLY via
+    ``int(uid, 16)``, never lexicographically (``max("0x9", "0x10")`` as strings
+    wrongly yields ``"0x9"``). The winning uid's ORIGINAL string is returned so
+    its exact ``0x...`` form is preserved for the next query's cursor.
+
+    A dedicated copy of the embed cursor-max logic — the embed ``_page_max_uid``
+    is deliberately NOT called, keeping the refresh path decoupled from the embed
+    pipeline the design forbids modifying.
+    """
+    valid = [
+        row.uid
+        for row in rows
+        if isinstance(getattr(row, "uid", None), str) and _REFRESH_UID_RE.match(row.uid)
+    ]
+    if not valid:
+        return None
+    return max(valid, key=lambda uid: int(uid, 16))
+
+
+def _select_datasheets_for_refresh(
+    client,
+    limit: int | None,
+    *,
+    stale_days: int = 30,
+    after: str | None = None,
+) -> list:
+    """Select one page of stale Datasheet nodes via a READ-ONLY query.
+
+    Roots at ``type(Datasheet)`` and carries the staleness filter
+    ``@filter(NOT has(verified_at) OR lt(verified_at, "<T>"))`` where
+    ``T = _utcnow() - stale_days`` — a datasheet is (re)checked only when it was
+    never verified or was verified before the cutoff (cross-run idempotency).
+    This is an INDEPENDENT selection: it never roots at ``type(Part)``, never
+    carries ``NOT has(embedding)``, and never calls the embed selection helper.
+
+    When *after* is a valid uid it is emitted as a keyset cursor (``after:
+    <uid>``) so the next page starts strictly past the previous page's max uid
+    (intra-run forward progress); the first page OMITS the clause. An *after*
+    value that fails :data:`_REFRESH_UID_RE` is dropped rather than interpolated
+    raw. The transaction is ``read_only=True`` and always discarded.
+    """
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    first = limit if limit is not None else _REFRESH_SELECT_PAGE_SIZE
+    first = max(1, min(int(first), _REFRESH_SELECT_PAGE_SIZE))
+    cutoff = format_verified_at(_utcnow() - timedelta(days=stale_days))
+    # Validate-before-interpolate: only a well-formed uid may reach query text.
+    after_clause = (
+        f", after: {after}"
+        if after is not None and _REFRESH_UID_RE.match(after)
+        else ""
+    )
+    query = (
+        f"{{ q(func: type(Datasheet), first: {first}{after_clause}) "
+        f'@filter(NOT has(verified_at) OR lt(verified_at, "{cutoff}")) {{ '
+        "uid url http_status fail_count "
+        "} }"
+    )
+    data = _run_block_query(client, query, {})
+    rows = []
+    for raw in data.get("q", []) or []:
+        if not isinstance(raw, dict):
+            continue
+        rows.append(
+            SimpleNamespace(
+                uid=raw.get("uid"),
+                url=raw.get("url"),
+                http_status=raw.get("http_status"),
+                fail_count=raw.get("fail_count"),
+            )
+        )
+    return rows
+
+
+def _refresh_all_pages(  # noqa: PLR0913 — one keyword-only seam per orchestration knob.
+    client,
+    *,
+    http_client,
+    max_failures: int,
+    timeout: float,
+    stale_days: int,
+    remaining: int,
+    progress_bar,
+) -> dict:
+    """Check every stale datasheet link across cursor-paged selection queries.
+
+    Loops selection pages under a uid keyset cursor (``after:``), mirroring the
+    embed loop's termination conditions — (a) a zero-row page, (b) a short page,
+    (c) a cursor that fails to strictly advance (emits a path-free stall notice),
+    or (d) ``remaining`` reaching 0 — but never calls the embed helpers, keeping
+    the two paths decoupled. A single
+    :class:`~partgraph.refresh.links.HostRateLimiter` is constructed once and
+    threaded into every page's write so per-host politeness state persists across
+    pages; a :class:`~partgraph.util.resources.ResourceController` paces local
+    load between pages (as embed). Returns the aggregated
+    ``{"checked","alive","dead","purged"}`` summary.
+    """
+    import time  # noqa: PLC0415 — monotonic clock/sleep for the rate limiter.
+
+    from partgraph.util.resources import (  # noqa: PLC0415
+        ResourceController,
+        get_system_reader,
+    )
+
+    totals = dict.fromkeys(_REFRESH_SUMMARY_KEYS, 0)
+    task = progress_bar.add_task("Checking datasheet links", total=remaining)
+
+    controller = ResourceController()
+    # Attach a live reader so the controller paces the run off real system load.
+    controller.reader = get_system_reader()  # type: ignore[attr-defined]
+
+    # One limiter per run: per-host timing must persist across pages.
+    rate_limiter = HostRateLimiter(
+        _REFRESH_HOST_MIN_INTERVAL, clock=time.monotonic, sleep=time.sleep
+    )
+
+    def _on_purge(datasheet_uid: str, fail_count: int, parts_unlinked: int) -> None:
+        # Path-free destructive notice: plain uid + ints only, no exception/path.
+        _console.print(
+            f"[yellow]Purged dead datasheet[/yellow] {datasheet_uid} after "
+            f"{fail_count} consecutive failures; unlinked from "
+            f"{parts_unlinked} part(s)."
+        )
+
+    selected_total = 0
+    last_uid: str | None = None  # uid keyset cursor; None on page 1.
+    while remaining > 0:
+        page_limit = min(remaining, _REFRESH_SELECT_PAGE_SIZE)
+        rows = _select_datasheets_for_refresh(
+            client, page_limit, stale_days=stale_days, after=last_uid
+        )
+        if not rows:
+            break  # (a) no more stale datasheets.
+
+        page_size = len(rows)
+        page_max_uid = _refresh_page_max_uid(rows)
+
+        # (c) Defensive guard: the cursor MUST strictly advance after page 1. A
+        # max uid that does not exceed the previous cursor means the server
+        # re-served processed rows — stop rather than re-fetch them forever.
+        if last_uid is not None and (
+            page_max_uid is None or int(page_max_uid, 16) <= int(last_uid, 16)
+        ):
+            _console.print(_REFRESH_CURSOR_STALL)
+            break
+
+        summary = refresh_links_write(
+            iter(rows),
+            client,
+            http_client=http_client,
+            clock=_utcnow,
+            max_failures=max_failures,
+            timeout=timeout,
+            rate_limiter=rate_limiter,
+            on_purge=_on_purge,
+        )
+        for key, value in summary.items():
+            if key in totals:
+                totals[key] += int(value or 0)
+
+        selected_total += page_size
+        progress_bar.update(task, completed=selected_total)
+        remaining -= page_size  # (d) count each returned row exactly once.
+        if page_size < page_limit:
+            break  # (b) short page: fewer rows than asked means no more.
+        if page_max_uid is None:
+            break
+
+        last_uid = page_max_uid
+        # Pace local resources before the next page (healthy box -> no-op).
+        controller.wait_until_healthy(reader=controller.reader, sleep=time.sleep)
+
+    return totals
+
+
+@app.command("refresh-links")
+def refresh_links(
+    stale_days: int = typer.Option(
+        30,
+        "--stale-days",
+        help=(
+            "Only (re)check datasheet links whose verified_at is missing or "
+            "older than N days."
+        ),
+    ),
+    limit: str | None = typer.Option(
+        None,
+        "--limit",
+        help=(
+            "Limit to the first N datasheets (development/testing; the full run "
+            "covers the whole catalogue across runs). Must be a positive integer."
+        ),
+    ),
+    max_failures: int = typer.Option(
+        3,
+        "--max-failures",
+        help=(
+            "Auto-purge a datasheet link after N consecutive failed checks "
+            "(drops the datasheet edge from every referencing part and the "
+            "Datasheet node). Must be a positive integer."
+        ),
+    ),
+    timeout: float = typer.Option(
+        10.0,
+        "--timeout",
+        help="Per-request HTTP timeout (seconds) for each datasheet link check.",
+    ),
+) -> None:
+    """HTTP-check datasheet links, stamp freshness, and auto-purge dead links.
+
+    Pages stale Datasheet nodes (uid keyset cursor + a ``verified_at`` staleness
+    filter), HTTP-checks each URL (HEAD, GET fallback on 405/501) and writes a
+    narrow ``verified_at``/``http_status``/``fail_count`` update back by uid —
+    ``fail_count`` reset to 0 when alive, else incremented. A link that reaches
+    ``--max-failures`` consecutive failures is auto-purged in a separate
+    transaction, with a path-free destructive notice.
+
+    This is a one-shot command bounded per run (schedule it via cron/systemd; see
+    PR 3). Errors are path-free: a stopped database exits 1 with a clear hint.
+    """
+    from rich.progress import (  # noqa: PLC0415
+        BarColumn,
+        Progress,
+        TaskProgressColumn,
+        TextColumn,
+    )
+
+    parsed_limit = _validate_limit(limit)
+    if max_failures <= 0:
+        _err_console.print(
+            "[red]Error:[/red] --max-failures must be a positive integer."
+        )
+        raise typer.Exit(code=1)
+    if timeout <= 0:
+        _err_console.print(
+            "[red]Error:[/red] --timeout must be a positive number."
+        )
+        raise typer.Exit(code=1)
+
+    http_client = _build_http_client()
+    stub = None
+    totals = dict.fromkeys(_REFRESH_SUMMARY_KEYS, 0)
+    try:
+        client, stub = _build_dgraph_client()
+        remaining = parsed_limit if parsed_limit is not None else _REFRESH_SELECT_DEFAULT
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=_console,
+            transient=True,
+        ) as progress_bar:
+            totals = _refresh_all_pages(
+                client,
+                http_client=http_client,
+                max_failures=max_failures,
+                timeout=timeout,
+                stale_days=stale_days,
+                remaining=remaining,
+                progress_bar=progress_bar,
+            )
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        # Any DB/runtime failure (selection read, write-back or purge mutation):
+        # never interpolate the exception, so no internal path can leak. Re-raised
+        # as a clean CLI exit.
+        _err_console.print(_REFRESH_DB_ERROR)
+        raise typer.Exit(code=1) from exc
+    finally:
+        if stub is not None:
+            stub.close()
+        _close_http_client(http_client)
+
+    _console.print(
+        f"[green]Checked {totals['checked']} datasheet links:[/green] "
+        f"{totals['alive']} alive, {totals['dead']} dead, "
+        f"{totals['purged']} purged."
     )
 
 

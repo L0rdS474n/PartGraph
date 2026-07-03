@@ -61,6 +61,19 @@ def _type_declared(text: str, type_name: str) -> bool:
     return bool(pattern.search(text))
 
 
+def _type_block_text(text: str, type_name: str) -> str:
+    """Return the raw field-list text between `type <type_name> {` and its
+    closing `}` (exclusive of the braces themselves), or "" if not found.
+
+    DQL type blocks in this schema are flat (one predicate name per line, no
+    nested `{`/`}`), so a non-greedy match to the first `}` is exact — there is
+    no brace-nesting ambiguity to resolve.
+    """
+    pattern = re.compile(rf"\btype\s+{re.escape(type_name)}\s*\{{(.*?)\}}", re.DOTALL)
+    match = pattern.search(text)
+    return match.group(1) if match else ""
+
+
 # ---------------------------------------------------------------------------
 # R6 — predicate declarations
 # ---------------------------------------------------------------------------
@@ -379,3 +392,57 @@ def test_type_declaration_exists(schema_text: str, type_name: str) -> None:
         f"Type '{type_name}' not declared in schema/partgraph.dql. "
         f"Expected: type {type_name} {{ ... }}"
     )
+
+
+# ---------------------------------------------------------------------------
+# AC-RL-1 — Datasheet.fail_count (issue #11, PR 1: refresh-links freshness
+# foundation). Consecutive-HTTP-check-failure counter used by
+# `partgraph refresh-links` to decide when a datasheet link is auto-purged
+# (0 == healthy). This is the ONLY schema change PR 1 makes — no new index on
+# verified_at is required (a dispatcher-verified read-only probe against
+# Dgraph v25.3.4 showed `lt(verified_at, T)` inside an `@filter` with
+# `func: type(Datasheet)` as root already works without one).
+# ---------------------------------------------------------------------------
+
+class TestDatasheetFailCount:
+    def test_fail_count_declared_as_int(self, schema_text: str) -> None:
+        """Given partgraph.dql defines the fail_count predicate.
+        When we scan for its declaration.
+        Then it must be declared with type int.
+        """
+        assert _has_predicate_with_attrs(schema_text, "fail_count", "int"), (
+            "Predicate 'fail_count' must be declared as int in "
+            f"{SCHEMA_REL} (consecutive datasheet-link-check failures; "
+            "issue #11 PR 1)."
+        )
+
+    def test_datasheet_type_includes_fail_count(self, schema_text: str) -> None:
+        """Given the Datasheet type declaration.
+        When we inspect its field list.
+        Then it must include 'fail_count'.
+        """
+        block = _type_block_text(schema_text, "Datasheet")
+        assert block, f"type Datasheet {{ ... }} not found in {SCHEMA_REL}."
+        assert re.search(r"\bfail_count\b", block), (
+            f"type Datasheet must include 'fail_count'. Found block:\n{block}"
+        )
+
+    @pytest.mark.parametrize(
+        "existing_field",
+        ["url", "source", "verified_at", "http_status", "source_refs"],
+    )
+    def test_datasheet_type_still_includes_existing_fields(
+        self, schema_text: str, existing_field: str
+    ) -> None:
+        """Given the Datasheet type declaration is extended with fail_count.
+        When we inspect its field list.
+        Then every pre-existing field (url/source/verified_at/http_status/
+        source_refs) must still be present — adding fail_count must not
+        displace any existing field.
+        """
+        block = _type_block_text(schema_text, "Datasheet")
+        assert block, f"type Datasheet {{ ... }} not found in {SCHEMA_REL}."
+        assert re.search(rf"\b{re.escape(existing_field)}\b", block), (
+            f"type Datasheet must still include {existing_field!r} after "
+            f"adding fail_count. Found block:\n{block}"
+        )
