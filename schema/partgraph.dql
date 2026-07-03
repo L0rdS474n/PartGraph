@@ -38,6 +38,10 @@ url:            string @index(exact) .
 source:         string .
 verified_at:    datetime .
 http_status:    int .
+# Consecutive datasheet-link-check failures (0 = healthy). `partgraph
+# refresh-links` increments this on each dead check and auto-purges the link
+# once it reaches --max-failures; a live check resets it to 0 (issue #11 PR 1).
+fail_count:     int .
 
 # ---------------------------------------------------------------------------
 # Promoted numeric parameters (SI-normalised floats)
@@ -158,6 +162,7 @@ type Datasheet {
     source
     verified_at
     http_status
+    fail_count
     source_refs
 }
 
