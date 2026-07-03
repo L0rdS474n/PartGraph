@@ -19,6 +19,7 @@ Design notes:
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -42,6 +43,14 @@ from partgraph.util.container import ContainerEngineError, compose_command
 
 #: Dgraph Alpha gRPC address used for schema application and mutations.
 DGRAPH_GRPC_ADDR = "127.0.0.1:9081"
+
+#: Finite, named ceiling (256 MiB) for a single gRPC message on the shared
+#: pydgraph client stub, applied symmetrically to send and receive. Raises
+#: pydgraph's 4 MiB gRPC default so large read pages and vector-literal writes do
+#: not trip RESOURCE_EXHAUSTED. Deliberately a bounded constant, NOT the grpc
+#: ``-1`` "unlimited" sentinel — this extends ADR-0007's bounded-constant
+#: precedent to the transport layer (ADR-0010).
+_GRPC_MAX_MESSAGE_BYTES = 256 * 1024 * 1024
 
 #: Absolute path to the Compose file. Resolved three levels up from this file
 #: (src/partgraph/cli.py -> src/partgraph -> src -> <repo root>) so the value
@@ -277,16 +286,27 @@ def _validate_limit(limit: str | None) -> int | None:
     return value
 
 
-def _build_dgraph_client():  # pragma: no cover — thin pydgraph wiring
+def _build_dgraph_client():
     """Create a pydgraph client connected to the local Dgraph Alpha.
 
     pydgraph is imported lazily so commands that do not touch Dgraph never
-    require the gRPC stack. Returns ``(client, stub)``; the caller closes the
-    stub.
+    require the gRPC stack. The stub is built with a raised per-message gRPC
+    ceiling (:data:`_GRPC_MAX_MESSAGE_BYTES`, send and receive symmetrically) so
+    large read pages and vector-literal writes do not hit pydgraph's 4 MiB
+    default (ADR-0010). Returns ``(client, stub)``; the caller closes the stub.
     """
     import pydgraph  # noqa: PLC0415 — lazy import keeps the CLI import-light
 
-    stub = pydgraph.DgraphClientStub(DGRAPH_GRPC_ADDR)
+    # grpc requires ``options`` as a LIST of (key, value) 2-tuples: a dict is
+    # rejected at real-channel construction with "ValueError: too many values to
+    # unpack (expected 2)". Send and receive share the one finite ceiling.
+    stub = pydgraph.DgraphClientStub(
+        DGRAPH_GRPC_ADDR,
+        options=[
+            ("grpc.max_receive_message_length", _GRPC_MAX_MESSAGE_BYTES),
+            ("grpc.max_send_message_length", _GRPC_MAX_MESSAGE_BYTES),
+        ],
+    )
     client = pydgraph.DgraphClient(stub)
     return client, stub
 
@@ -862,21 +882,75 @@ def show(
 #: single run; the full catalogue is embedded across repeated/paged runs.
 _EMBED_SELECT_DEFAULT = 200_000
 
+#: Maximum Part nodes fetched from Dgraph in a single embedding selection query.
+#: The default pydgraph/gRPC receive limit is 4 MiB; fetching tens of thousands
+#: of parts in one response easily exceeds it. Keep read pages comfortably below
+#: that limit and let the embed command loop over pages.
+_EMBED_SELECT_PAGE_SIZE = 10_000
 
-def _select_parts_for_embed(client, limit: int | None) -> list:
-    """Select Part nodes to embed via a READ-ONLY query, newest-uid first.
+#: Shape of a real Dgraph uid (``0x`` + hex digits). The embed pagination cursor
+#: is validated against this before it is interpolated into a DQL ``after:``
+#: clause: a missing or malformed uid is excluded from cursor computation and
+#: never reaches query text (validate-before-interpolate; mirrors
+#: partgraph.query.dql_builder's ADR-INJECT convention; ADR-0010).
+_UID_RE = re.compile(r"^0x[0-9a-fA-F]+$")
+
+#: Informational (NOT error) notice printed when the keyset cursor fails to
+#: advance between pages — the defensive guard against re-fetching the same rows
+#: forever. Path-free and deliberately distinct from :data:`_EMBED_DB_ERROR`
+#: (this is not a failure; the run keeps whatever it embedded so far; ADR-0010).
+_EMBED_CURSOR_STALL = (
+    "pagination cursor did not advance; stopping early to avoid re-fetching."
+)
+
+
+def _page_max_uid(parts: list) -> str | None:
+    """Return the numerically-largest valid uid among *parts*, or ``None``.
+
+    Only uids matching :data:`_UID_RE` are considered; a missing or malformed uid
+    is excluded (validate-before-interpolate — it must never become a raw
+    ``after:`` cursor). The maximum is taken NUMERICALLY via ``int(uid, 16)``,
+    never lexicographically: ``max("0x9", "0x10")`` as strings wrongly yields
+    ``"0x9"`` (the character ``'9'`` sorts after ``'1'``). The winning uid's
+    ORIGINAL string is returned so its exact ``0x...`` form is preserved for the
+    next query's cursor.
+    """
+    valid = [
+        part.uid
+        for part in parts
+        if isinstance(getattr(part, "uid", None), str) and _UID_RE.match(part.uid)
+    ]
+    if not valid:
+        return None
+    return max(valid, key=lambda uid: int(uid, 16))
+
+
+def _select_parts_for_embed(client, limit: int | None, *, after: str | None = None) -> list:
+    """Select one page of Part nodes without embeddings via a READ-ONLY query.
 
     Returns a list of namespace objects exposing the fields
     :func:`partgraph.embed.build_embed_text` needs (``uid``/``xid``/
     ``description``/``category``/``package``/``tags``). The transaction is
     ``read_only=True`` and always discarded — selection never mutates.
+
+    When *after* is a valid uid it is emitted as a keyset cursor
+    (``after: <uid>``) so the next page starts strictly past the previous page's
+    max uid. That cursor — not ``@filter(NOT has(embedding))`` — is what
+    guarantees forward progress: permanently skip-only parts (no xid / no embed
+    text) never gain an embedding, so the filter alone would re-select them
+    forever (ADR-0010). The first page (*after* is ``None``) OMITS the clause
+    entirely, staying byte-identical to the pre-cursor query. An *after* value
+    that fails :data:`_UID_RE` is dropped rather than interpolated raw
+    (validate-before-interpolate; mirrors dql_builder's ADR-INJECT convention).
     """
     from types import SimpleNamespace  # noqa: PLC0415
 
-    first = limit if limit is not None else _EMBED_SELECT_DEFAULT
-    first = max(1, min(int(first), _EMBED_SELECT_DEFAULT))
+    first = limit if limit is not None else _EMBED_SELECT_PAGE_SIZE
+    first = max(1, min(int(first), _EMBED_SELECT_PAGE_SIZE))
+    # Validate-before-interpolate: only a well-formed uid may reach query text.
+    after_clause = f", after: {after}" if after is not None and _UID_RE.match(after) else ""
     query = (
-        f"{{ q(func: type(Part), first: {first}) {{ "
+        f"{{ q(func: type(Part), first: {first}{after_clause}) @filter(NOT has(embedding)) {{ "
         "uid xid description stock "
         "in_category { name } in_package { name } tagged { name } "
         "} }"
@@ -904,6 +978,90 @@ def _select_parts_for_embed(client, limit: int | None) -> list:
             )
         )
     return parts
+
+
+def _embed_all_pages(
+    client,
+    *,
+    encoder,
+    controller,
+    remaining: int,
+    progress_bar,
+) -> int:
+    """Embed every eligible part across cursor-paged selection queries.
+
+    Loops selection pages under a uid keyset cursor (``after:``) so each page
+    starts strictly past the previous page's max uid — this is what guarantees
+    forward progress past permanently skip-only parts that
+    ``@filter(NOT has(embedding))`` would otherwise re-select forever (ADR-0010).
+
+    The loop terminates on ANY of: (a) a zero-row page, (b) a short page
+    (fewer rows than requested), (c) a cursor that fails to strictly advance
+    (defensive guard — emits a path-free stall notice), or (d) ``remaining``
+    reaching 0. The cursor tracks the max uid *selected*, never the count
+    *embedded*, so a full page of skip-only parts still advances past its block.
+
+    Returns the total number of parts embedded (written) across all pages.
+    """
+    from partgraph.embed import embed_write  # noqa: PLC0415
+
+    embedded_total = 0
+    selected_total = 0
+    target_total = remaining
+    task = progress_bar.add_task("Embedding parts", total=target_total)
+
+    def _on_progress(done: int, total_count: int) -> None:
+        progress_bar.update(
+            task,
+            completed=selected_total + done,
+            total=target_total or total_count or None,
+        )
+
+    last_uid: str | None = None  # uid keyset cursor; None on page 1.
+    while remaining > 0:
+        page_limit = min(remaining, _EMBED_SELECT_PAGE_SIZE)
+        parts = _select_parts_for_embed(client, page_limit, after=last_uid)
+        if not parts:
+            break  # (a) no more rows match the filter.
+
+        page_size = len(parts)
+        # Cursor = the max uid SELECTED this page, never the count embedded: a
+        # full page of permanently skip-only parts must still advance past its
+        # block, or it would sticky-loop forever.
+        page_max_uid = _page_max_uid(parts)
+
+        # (c) Defensive guard: on any page after the first, the cursor MUST
+        # strictly advance numerically. A max uid that does not exceed the
+        # previous cursor means the server re-served rows we already processed —
+        # stop rather than re-fetch them forever.
+        if last_uid is not None and (
+            page_max_uid is None or int(page_max_uid, 16) <= int(last_uid, 16)
+        ):
+            _console.print(_EMBED_CURSOR_STALL)
+            break
+
+        summary = embed_write(
+            iter(parts),
+            client,
+            encoder=encoder,
+            controller=controller,
+            progress=_on_progress,
+        )
+        embedded_total += int(summary.get("embedded", 0) or 0)
+        selected_total += page_size
+        progress_bar.update(task, completed=selected_total)
+
+        remaining -= page_size  # (d) count each returned row exactly once.
+        if page_size < page_limit:
+            break  # (b) short page: fewer rows than asked means no more.
+
+        # Advance the cursor past this page. A page with no valid uid yields no
+        # cursor, so stop rather than re-fetch page 1 forever.
+        if page_max_uid is None:
+            break
+        last_uid = page_max_uid
+
+    return embedded_total
 
 
 @app.command()
@@ -937,7 +1095,6 @@ def embed(
         TextColumn,
     )
 
-    from partgraph.embed import embed_write  # noqa: PLC0415
     from partgraph.util.resources import (  # noqa: PLC0415
         ResourceController,
         get_system_reader,
@@ -959,11 +1116,10 @@ def embed(
 
     start = _time.monotonic()
     stub = None
-    summary: dict = {"embedded": 0, "skipped": 0}
+    embedded_total = 0
     try:
         client, stub = _build_dgraph_client()
-        parts = _select_parts_for_embed(client, parsed_limit)
-        total = len(parts)
+        remaining = parsed_limit if parsed_limit is not None else _EMBED_SELECT_DEFAULT
         with Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -971,17 +1127,12 @@ def embed(
             console=_console,
             transient=True,
         ) as progress_bar:
-            task = progress_bar.add_task("Embedding parts", total=total or None)
-
-            def _on_progress(done: int, total_count: int) -> None:
-                progress_bar.update(task, completed=done, total=total_count or None)
-
-            summary = embed_write(
-                iter(parts),
+            embedded_total = _embed_all_pages(
                 client,
                 encoder=encoder,
                 controller=controller,
-                progress=_on_progress,
+                remaining=remaining,
+                progress_bar=progress_bar,
             )
     except typer.Exit:
         raise
@@ -995,9 +1146,8 @@ def embed(
             stub.close()
 
     elapsed = _time.monotonic() - start
-    embedded = summary.get("embedded", 0)
     _console.print(
-        f"[green]Embedded {embedded} parts in {elapsed:.1f}s.[/green]"
+        f"[green]Embedded {embedded_total} parts in {elapsed:.1f}s.[/green]"
     )
 
 
