@@ -1,5 +1,5 @@
 """
-Tests: AC-EC-1..8 — partgraph embed command
+Tests: AC-EC-1..12 — partgraph embed command
 
 Specifies the behaviour of `partgraph embed` CLI command added in PR4, plus
 two resource-hardening fixes so a full run completes without crashing (gRPC
@@ -48,6 +48,30 @@ Gate 3 (security + architecture) hardening pass — closed gaps:
     partgraph.query.dql_builder's ADR-INJECT convention).
   - F4: the non-advancing-cursor defensive guard must emit an explicit,
     path-free notice in CLI output, not just a plausible success line.
+
+AC-EC-9 (--limit boundary contract: unbounded vs bounded, never re-capped):
+  - embed() drives _embed_all_pages(..., remaining=parsed_limit) directly:
+    no --limit means remaining=None (unbounded — loops to exhaustion,
+    never re-capped at any finite default); an explicit --limit N means
+    remaining == N exactly, proven up to N=500_000 (well past the OLD
+    200_000 default), so a large explicit --limit was never silently
+    downgraded.
+
+AC-EC-10 (direct unit: _embed_all_pages(remaining=None) exhausts pages):
+  - remaining is now int | None; None is a first-class accepted value.
+    With remaining=None the pagination loop drives to exhaustion across
+    every eligible page purely via the PRE-EXISTING termination
+    conditions (empty page, short page, non-advancing cursor) — never via
+    a remaining countdown, because there is none to exhaust.
+
+AC-EC-11 (CLI, no --limit, end-to-end exhaustion via a finite mock):
+  - the full `partgraph embed` command (no --limit) pages every eligible
+    part in a finite mocked catalogue to exhaustion, writing every uid
+    exactly once, while driving _embed_all_pages with remaining=None.
+
+AC-EC-12 (_EMBED_SELECT_DEFAULT removed):
+  - the old 200_000 default-selection-cap constant no longer exists on
+    the cli module at all; --limit is the only way to bound a run.
 
 NOTE: COLUMNS=200 set before partgraph.cli import (matches existing CLI test pattern).
 Collection will ERROR until `embed` command exists in cli.py. That is the
@@ -439,7 +463,7 @@ def test_embed_selection_default_is_paged_below_grpc_receive_limit() -> None:
     query_text = read_txn.query.call_args.args[0]
     assert f"first: {cli_mod._EMBED_SELECT_PAGE_SIZE}" in query_text
     assert "NOT has(embedding)" in query_text
-    assert str(cli_mod._EMBED_SELECT_DEFAULT) not in query_text
+    assert "200000" not in query_text
 
 
 # ---------------------------------------------------------------------------
@@ -1199,4 +1223,429 @@ def test_ac_ec_8_defensive_guard_output_contains_path_free_stall_notice() -> Non
     assert not re.search(r"/(?:home|root|Users)/", result.output), (
         "AC-EC-8 (F4): the stall notice must be path-free "
         "(no operator absolute path)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-EC-9/10/11/12 mock helpers (direct-call encoder/controller construction)
+# ---------------------------------------------------------------------------
+
+def _fake_direct_encoder(texts: list[str]) -> list[list[float]]:
+    """Fixed-vector fake encoder for tests that call `_embed_all_pages`
+    directly (bypassing the CLI's `get_encoder()` / `_patch_get_encoder()`
+    indirection entirely). Mirrors `_patch_get_encoder`'s default behaviour
+    exactly: one `_FAKE_VECTOR` per input text, no model loaded.
+    """
+    return [_FAKE_VECTOR for _ in texts]
+
+
+def _make_direct_call_controller():
+    """Construct the same encoder/controller pairing `embed()` itself builds
+    (cli.py's real ``ResourceController()`` + ``get_system_reader()``) for
+    tests that call `_embed_all_pages` directly.
+
+    Every page used by the AC-EC-10 tests below has at most
+    `_EMBED_SELECT_PAGE_SIZE` (patched to 2) eligible parts — far below
+    `ResourceController`'s default `max_batch` (256) and
+    `partgraph.embed._DEFAULT_BATCH_SIZE` (64) — so `embed_write`'s
+    single-batch-per-page path never calls `controller.regulate()`: no real
+    pacing, no sleep, no wall-clock dependency, even though this reuses the
+    real controller class (matching what AC-EC-8's CLI-level tests already
+    exercise implicitly through `embed()`).
+    """
+    from partgraph.util.resources import ResourceController, get_system_reader
+
+    controller = ResourceController()
+    controller.reader = get_system_reader()
+    return controller
+
+
+# ===========================================================================
+# AC-EC-9: --limit boundary contract — no-limit is unbounded (remaining=None);
+# --limit N stays bounded and uncapped, even past the old 200_000 default.
+# ===========================================================================
+
+def test_ac_ec_9a_no_limit_drives_embed_all_pages_with_remaining_none() -> None:
+    """AC-EC-9 (9a): Given NO --limit is passed, and `_embed_all_pages`
+    replaced by a spy (`MagicMock(return_value=0)`) so real pagination never
+    runs.
+    When `partgraph embed` is invoked.
+    Then `_embed_all_pages` is called with `remaining=None` (passed as a
+    keyword argument at embed()'s call site) — the no-limit path is
+    unbounded (drives to exhaustion), never capped at any finite default.
+    """
+    import partgraph.cli as cli_mod
+
+    spy = MagicMock(return_value=0)
+
+    with _patch_dgraph(MagicMock()), \
+         _patch_get_encoder(), \
+         patch.object(cli_mod, "_embed_all_pages", spy):
+        result = _invoke(["embed"])
+
+    assert result.exit_code == 0, (
+        f"AC-EC-9a: a spied _embed_all_pages (return_value=0) must not "
+        f"affect exit code. Got {result.exit_code}.\n{result.output}"
+    )
+    spy.assert_called_once()
+    assert "remaining" in spy.call_args.kwargs, (
+        f"AC-EC-9a: embed() must pass 'remaining' as a KEYWORD argument to "
+        f"_embed_all_pages. Got call: {spy.call_args!r}"
+    )
+    assert spy.call_args.kwargs["remaining"] is None, (
+        f"AC-EC-9a: no --limit must drive _embed_all_pages with "
+        f"remaining=None (unbounded exhaustion), never a finite default. "
+        f"Got: {spy.call_args.kwargs['remaining']!r}"
+    )
+
+
+def test_ac_ec_9b_limit_7_drives_embed_all_pages_with_remaining_7() -> None:
+    """AC-EC-9 (9b): Given --limit 7, and `_embed_all_pages` replaced by a
+    spy.
+    When `partgraph embed --limit 7` is invoked.
+    Then `_embed_all_pages` is called with `remaining == 7` exactly — the
+    bounded path is unchanged by the no-limit fix.
+    """
+    import partgraph.cli as cli_mod
+
+    spy = MagicMock(return_value=0)
+
+    with _patch_dgraph(MagicMock()), \
+         _patch_get_encoder(), \
+         patch.object(cli_mod, "_embed_all_pages", spy):
+        result = _invoke(["embed", "--limit", "7"])
+
+    assert result.exit_code == 0, (
+        f"AC-EC-9b: --limit 7 with a spied _embed_all_pages must exit 0. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    spy.assert_called_once()
+    assert spy.call_args.kwargs.get("remaining") == 7, (
+        f"AC-EC-9b: --limit 7 must drive _embed_all_pages with "
+        f"remaining == 7 exactly. Got: {spy.call_args.kwargs.get('remaining')!r}"
+    )
+
+
+def test_ac_ec_9c_limit_500000_drives_embed_all_pages_with_remaining_500000_uncapped() -> None:
+    """AC-EC-9 (9c): Given --limit 500000 — larger than the OLD (removed)
+    200_000 default selection cap — and `_embed_all_pages` replaced by a spy.
+    When `partgraph embed --limit 500000` is invoked.
+    Then `_embed_all_pages` is called with `remaining == 500000` EXACTLY,
+    never silently downgraded to 200000 — proving an explicit large --limit
+    was never (and still is not) capped by the removed default.
+    """
+    import partgraph.cli as cli_mod
+
+    spy = MagicMock(return_value=0)
+
+    with _patch_dgraph(MagicMock()), \
+         _patch_get_encoder(), \
+         patch.object(cli_mod, "_embed_all_pages", spy):
+        result = _invoke(["embed", "--limit", "500000"])
+
+    assert result.exit_code == 0, (
+        f"AC-EC-9c: --limit 500000 with a spied _embed_all_pages must exit "
+        f"0. Got {result.exit_code}.\n{result.output}"
+    )
+    spy.assert_called_once()
+    assert spy.call_args.kwargs.get("remaining") == 500000, (
+        f"AC-EC-9c: --limit 500000 must drive _embed_all_pages with "
+        f"remaining == 500000 EXACTLY (not capped at 200000). "
+        f"Got: {spy.call_args.kwargs.get('remaining')!r}"
+    )
+
+
+# ===========================================================================
+# AC-EC-10: direct unit on _embed_all_pages(remaining=None) — an unbounded
+# run exhausts every eligible page purely via the existing termination
+# conditions (empty page / short page / non-advancing cursor), never via a
+# remaining countdown (there is none).
+# ===========================================================================
+
+def test_ac_ec_10_embed_all_pages_remaining_none_exhausts_k_pages() -> None:
+    """AC-EC-10: Given `_embed_all_pages` called DIRECTLY with
+    `remaining=None`, against K=5 full selection pages (page_size=2 each,
+    all eligible) followed by one terminating empty page.
+    When `_embed_all_pages(mock_client, encoder=..., controller=...,
+    remaining=None, progress_bar=...)` runs to completion.
+    Then:
+    - exactly K+1 selection queries occur (K full pages + 1 empty page that
+      ends it) — exhaustion by "ran out of data", never by any
+      200k-derived countdown (there is no countdown at all: remaining stays
+      None throughout).
+    - the returned `embedded_total == K * page_size` (every eligible part
+      across every page was embedded).
+    - page 1 has NO 'after:' cursor.
+    - each later page's query carries the immediately-prior page's numeric
+      max uid (monotonically increasing across all K pages).
+    """
+    import partgraph.cli as cli_mod
+
+    page_size = 2
+    k_pages = 5
+    pages = []
+    uid_counter = 1
+    for _ in range(k_pages):
+        page = {"q": []}
+        for _ in range(page_size):
+            uid = f"0x{uid_counter:04X}"
+            page["q"].append({
+                "uid": uid,
+                "xid": f"ELIGIBLE-{uid_counter}|VEND",
+                "description": f"Widget {uid_counter}",
+            })
+            uid_counter += 1
+        pages.append(page)
+    pages.append({"q": []})  # terminating empty page
+
+    read_txn = _make_cursor_aware_read_txn(pages)
+    write_txn = _make_write_txn()
+    mock_client = _make_paged_mock_client(read_txn, write_txn)
+    controller = _make_direct_call_controller()
+
+    with patch.object(cli_mod, "_EMBED_SELECT_PAGE_SIZE", page_size):
+        embedded_total = cli_mod._embed_all_pages(
+            mock_client,
+            encoder=_fake_direct_encoder,
+            controller=controller,
+            remaining=None,
+            progress_bar=MagicMock(),
+        )
+
+    selection_queries = _selection_query_calls(read_txn)
+    assert len(selection_queries) == k_pages + 1, (
+        f"AC-EC-10: remaining=None must page through all {k_pages} full "
+        f"pages plus the terminating empty page (exactly {k_pages + 1} "
+        f"selection queries) — exhaustion, never a 200k-derived early stop. "
+        f"Got {len(selection_queries)}: {selection_queries!r}"
+    )
+    assert embedded_total == k_pages * page_size, (
+        f"AC-EC-10: embedded_total must equal every eligible part across "
+        f"all {k_pages} pages ({k_pages * page_size}). "
+        f"Got {embedded_total!r}"
+    )
+    assert "after:" not in selection_queries[0], (
+        f"AC-EC-10: page 1 must have NO 'after:' clause. "
+        f"Got: {selection_queries[0]!r}"
+    )
+    for idx in range(1, k_pages + 1):
+        expected_cursor = f"0x{idx * page_size:04X}"
+        assert f"after: {expected_cursor}" in selection_queries[idx], (
+            f"AC-EC-10: selection query {idx} must carry 'after: "
+            f"{expected_cursor}' (the immediately-prior page's numeric max "
+            f"uid) — monotonically advancing across all pages. "
+            f"Got: {selection_queries[idx]!r}"
+        )
+
+
+def test_ac_ec_10_short_first_page_terminates_without_extra_fetch_when_unbounded() -> None:
+    """AC-EC-10 (10-short edge): Given `remaining=None` (unbounded) and a
+    single first page SHORTER than the patched page limit (1 row where
+    `_EMBED_SELECT_PAGE_SIZE` is patched to 2).
+    When `_embed_all_pages` is called directly with `remaining=None`.
+    Then exactly 1 selection query occurs — condition (b) (short page) alone
+    terminates the run; there is no `remaining` countdown to hit zero, and no
+    second fetch.
+    """
+    import partgraph.cli as cli_mod
+
+    short_page = {"q": [
+        {"uid": "0xF001", "xid": "ELIGIBLE-F|VEND", "description": "Widget F"},
+    ]}  # 1 row, but the patched page limit is 2 -> short page.
+
+    read_txn = _make_cursor_aware_read_txn([short_page])
+    write_txn = _make_write_txn()
+    mock_client = _make_paged_mock_client(read_txn, write_txn)
+    controller = _make_direct_call_controller()
+
+    with patch.object(cli_mod, "_EMBED_SELECT_PAGE_SIZE", 2):
+        embedded_total = cli_mod._embed_all_pages(
+            mock_client,
+            encoder=_fake_direct_encoder,
+            controller=controller,
+            remaining=None,
+            progress_bar=MagicMock(),
+        )
+
+    selection_queries = _selection_query_calls(read_txn)
+    assert len(selection_queries) == 1, (
+        f"AC-EC-10 (10-short): a page shorter than the page limit must "
+        f"terminate an unbounded (remaining=None) run WITHOUT a further "
+        f"fetch. Got {len(selection_queries)}: {selection_queries!r}"
+    )
+    assert embedded_total == 1, (
+        f"AC-EC-10 (10-short): the single eligible part must be embedded "
+        f"exactly once. Got {embedded_total!r}"
+    )
+
+
+def test_ac_ec_10_stall_notice_printed_and_loop_stops_even_when_unbounded(capsys) -> None:
+    """AC-EC-10 (10-stall edge): Given `remaining=None` (unbounded) and a
+    server that re-serves the SAME full page's max uid on page 2 (a stalled
+    cursor — same rows served again).
+    When `_embed_all_pages` is called directly with `remaining=None`.
+    Then the defensive non-advancing-cursor guard fires: an explicit stall
+    notice is printed to stdout (captured directly via `capsys`, since this
+    call bypasses the CLI's CliRunner entirely) and the loop stops after
+    exactly 2 selection queries — proving an unbounded (remaining=None) run
+    still cannot sticky-loop forever.
+    """
+    import partgraph.cli as cli_mod
+
+    same_full_page = {"q": [{"uid": "0xE001"}, {"uid": "0xE002"}]}
+
+    read_txn = _make_cursor_aware_read_txn(
+        [same_full_page, same_full_page, same_full_page]
+    )
+    write_txn = _make_write_txn()
+    mock_client = _make_paged_mock_client(read_txn, write_txn)
+    controller = _make_direct_call_controller()
+
+    with patch.object(cli_mod, "_EMBED_SELECT_PAGE_SIZE", 2):
+        cli_mod._embed_all_pages(
+            mock_client,
+            encoder=_fake_direct_encoder,
+            controller=controller,
+            remaining=None,
+            progress_bar=MagicMock(),
+        )
+
+    captured_out = _ANSI_RE.sub("", capsys.readouterr().out)
+    stall_phrases = (
+        "did not advance", "not advance", "stopping early", "stopped early",
+        "no further progress", "cursor did not move", "cursor stalled",
+    )
+    assert any(phrase in captured_out.lower() for phrase in stall_phrases), (
+        f"AC-EC-10 (10-stall): when the non-advancing-cursor guard fires "
+        f"during an unbounded (remaining=None) run, stdout must contain an "
+        f"explicit stall notice (e.g. 'cursor did not advance' / 'stopping "
+        f"early'). Got:\n{captured_out!r}"
+    )
+
+    selection_queries = _selection_query_calls(read_txn)
+    assert len(selection_queries) == 2, (
+        f"AC-EC-10 (10-stall): the stall guard must stop after exactly 2 "
+        f"selection queries (page 1 sets the cursor; page 2 sees it hasn't "
+        f"advanced and breaks) — an unbounded run still cannot sticky-loop. "
+        f"Got {len(selection_queries)}: {selection_queries!r}"
+    )
+
+
+# ===========================================================================
+# AC-EC-11: CLI, no --limit, end-to-end exhaustion via a finite mocked server
+# ===========================================================================
+
+def test_ac_ec_11_cli_no_limit_end_to_end_exhausts_all_pages_via_mock() -> None:
+    """AC-EC-11: Given NO --limit passed at the CLI, K=5 full selection pages
+    (page_size=2, via patched `_EMBED_SELECT_PAGE_SIZE`) followed by one
+    terminating empty page, mocked client + encoder. `_embed_all_pages` is
+    wrapped by a spy that DELEGATES to the real implementation (`side_effect`
+    = the real function captured before patching) so genuine pagination
+    behaviour executes end-to-end while the exact `remaining` value handed to
+    it is still observable.
+    When `partgraph embed` (no --limit) is invoked.
+    Then:
+    - the CLI drives `_embed_all_pages` with `remaining=None` (the unbounded
+      contract) — NOT a 200_000-derived value.
+    - exit code is 0.
+    - exactly K+1 selection queries occur (K full pages + 1 empty page).
+    - page 1 omits 'after:'; every later page's query carries the
+      immediately-prior page's numeric max uid (monotonically increasing).
+    - every eligible uid across all K pages is written exactly once; none
+      twice.
+    """
+    import partgraph.cli as cli_mod
+
+    page_size = 2
+    k_pages = 5
+    pages = []
+    expected_uids: list[str] = []
+    uid_counter = 1
+    for _ in range(k_pages):
+        page = {"q": []}
+        for _ in range(page_size):
+            uid = f"0x{uid_counter:04X}"
+            page["q"].append({
+                "uid": uid,
+                "xid": f"ELIGIBLE-{uid_counter}|VEND",
+                "description": f"Widget {uid_counter}",
+            })
+            expected_uids.append(uid)
+            uid_counter += 1
+        pages.append(page)
+    pages.append({"q": []})  # terminating empty page
+
+    read_txn = _make_cursor_aware_read_txn(pages)
+    write_txn = _make_write_txn()
+    mock_client = _make_paged_mock_client(read_txn, write_txn)
+
+    real_embed_all_pages = cli_mod._embed_all_pages
+    spy = MagicMock(side_effect=real_embed_all_pages)
+
+    with _patch_dgraph(mock_client), \
+         _patch_get_encoder(), \
+         patch.object(cli_mod, "_EMBED_SELECT_PAGE_SIZE", page_size), \
+         patch.object(cli_mod, "_embed_all_pages", spy):
+        result = _invoke(["embed"])
+
+    assert result.exit_code == 0, (
+        f"AC-EC-11: a fully-paginated no-limit run must exit 0. Got "
+        f"{result.exit_code}.\n{result.output}"
+    )
+
+    spy.assert_called_once()
+    assert spy.call_args.kwargs.get("remaining") is None, (
+        f"AC-EC-11: no --limit must drive _embed_all_pages with "
+        f"remaining=None (unbounded) — never a 200_000-derived value. "
+        f"Got: {spy.call_args.kwargs.get('remaining')!r}"
+    )
+
+    selection_queries = _selection_query_calls(read_txn)
+    assert len(selection_queries) == k_pages + 1, (
+        f"AC-EC-11: expected exactly {k_pages + 1} selection queries "
+        f"({k_pages} full pages + 1 terminating empty page). "
+        f"Got {len(selection_queries)}: {selection_queries!r}"
+    )
+    assert "after:" not in selection_queries[0], (
+        f"AC-EC-11: page 1 must have NO 'after:' clause. "
+        f"Got: {selection_queries[0]!r}"
+    )
+    for idx in range(1, k_pages + 1):
+        expected_cursor = f"0x{idx * page_size:04X}"
+        assert f"after: {expected_cursor}" in selection_queries[idx], (
+            f"AC-EC-11: selection query {idx} must carry 'after: "
+            f"{expected_cursor}' (the immediately-prior page's numeric max "
+            f"uid) — monotonically advancing. "
+            f"Got: {selection_queries[idx]!r}"
+        )
+
+    written_uids = _all_written_uids(write_txn)
+    assert sorted(written_uids) == sorted(expected_uids), (
+        f"AC-EC-11: every eligible uid across all {k_pages} pages must be "
+        f"written exactly once. Expected {sorted(expected_uids)!r}, got "
+        f"{sorted(written_uids)!r}"
+    )
+    assert len(written_uids) == len(set(written_uids)), (
+        f"AC-EC-11: no uid may be written more than once. "
+        f"Got: {written_uids!r}"
+    )
+
+
+# ===========================================================================
+# AC-EC-12: the 200_000 default-selection-cap constant no longer exists
+# ===========================================================================
+
+def test_ac_ec_12_embed_select_default_constant_removed() -> None:
+    """AC-EC-12: Given the no-limit path no longer needs a finite default
+    (it drives `_embed_all_pages` with `remaining=None` instead).
+    Then the module constant `_EMBED_SELECT_DEFAULT` (the old 200_000
+    selection cap) no longer exists on `partgraph.cli` at all — a stale
+    re-introduction of the constant, or any lingering reference to it, is
+    caught immediately by this attribute check.
+    """
+    import partgraph.cli as cli_mod
+
+    assert not hasattr(cli_mod, "_EMBED_SELECT_DEFAULT"), (
+        "AC-EC-12: _EMBED_SELECT_DEFAULT must be REMOVED from partgraph.cli "
+        "— the no-limit path no longer uses a finite default cap at all."
     )
