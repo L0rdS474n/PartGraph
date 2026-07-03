@@ -878,10 +878,6 @@ def show(
 # embed command (read parts, generate embeddings, write back by uid)
 # ---------------------------------------------------------------------------
 
-#: Maximum Part nodes selected for embedding when no --limit is given. Bounds a
-#: single run; the full catalogue is embedded across repeated/paged runs.
-_EMBED_SELECT_DEFAULT = 200_000
-
 #: Maximum Part nodes fetched from Dgraph in a single embedding selection query.
 #: The default pydgraph/gRPC receive limit is 4 MiB; fetching tens of thousands
 #: of parts in one response easily exceeds it. Keep read pages comfortably below
@@ -985,7 +981,7 @@ def _embed_all_pages(
     *,
     encoder,
     controller,
-    remaining: int,
+    remaining: int | None,
     progress_bar,
 ) -> int:
     """Embed every eligible part across cursor-paged selection queries.
@@ -995,11 +991,23 @@ def _embed_all_pages(
     forward progress past permanently skip-only parts that
     ``@filter(NOT has(embedding))`` would otherwise re-select forever (ADR-0010).
 
+    ``remaining`` bounds the run. A finite ``int`` caps it at that many rows; a
+    ``remaining`` of ``None`` means *unbounded* — drive to exhaustion over the
+    whole eligible catalogue (a no-``--limit`` run; ADR-0011, superseding
+    ADR-0010's repeated-runs model).
+
     The loop terminates on ANY of: (a) a zero-row page, (b) a short page
     (fewer rows than requested), (c) a cursor that fails to strictly advance
     (defensive guard — emits a path-free stall notice), or (d) ``remaining``
-    reaching 0. The cursor tracks the max uid *selected*, never the count
+    reaching 0. Condition (d) applies to BOUNDED runs only: when ``remaining``
+    is ``None`` there is no countdown, so termination rests entirely on
+    (a)/(b)/(c). The cursor tracks the max uid *selected*, never the count
     *embedded*, so a full page of skip-only parts still advances past its block.
+
+    Memory profile is per-page regardless of ``remaining``: each page is
+    selected, embedded and released before the next is fetched — nothing
+    accumulates across pages, so an unbounded run costs no more resident memory
+    than a bounded one.
 
     Returns the total number of parts embedded (written) across all pages.
     """
@@ -1018,8 +1026,12 @@ def _embed_all_pages(
         )
 
     last_uid: str | None = None  # uid keyset cursor; None on page 1.
-    while remaining > 0:
-        page_limit = min(remaining, _EMBED_SELECT_PAGE_SIZE)
+    while remaining is None or remaining > 0:
+        page_limit = (
+            _EMBED_SELECT_PAGE_SIZE
+            if remaining is None
+            else min(remaining, _EMBED_SELECT_PAGE_SIZE)
+        )
         parts = _select_parts_for_embed(client, page_limit, after=last_uid)
         if not parts:
             break  # (a) no more rows match the filter.
@@ -1051,7 +1063,8 @@ def _embed_all_pages(
         selected_total += page_size
         progress_bar.update(task, completed=selected_total)
 
-        remaining -= page_size  # (d) count each returned row exactly once.
+        if remaining is not None:
+            remaining -= page_size  # (d) bounded run: count each row exactly once.
         if page_size < page_limit:
             break  # (b) short page: fewer rows than asked means no more.
 
@@ -1119,7 +1132,10 @@ def embed(
     embedded_total = 0
     try:
         client, stub = _build_dgraph_client()
-        remaining = parsed_limit if parsed_limit is not None else _EMBED_SELECT_DEFAULT
+        # None (no --limit) drives _embed_all_pages unbounded — to exhaustion
+        # over the whole eligible catalogue; a finite --limit N bounds it to N
+        # rows exactly, never re-capped at any default (ADR-0011).
+        remaining = parsed_limit
         with Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
