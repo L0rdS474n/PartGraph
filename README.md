@@ -67,6 +67,10 @@ when present and otherwise Docker. To force a specific engine, set
 `PARTGRAPH_CONTAINER_ENGINE` (for example `PARTGRAPH_CONTAINER_ENGINE=docker` on
 a host that has both installed).
 
+Once the database is up and populated, see **[Connecting to PartGraph](docs/connecting.md)**
+for a full guide to querying the graph from the Dgraph MCP plugin, plain Dgraph
+clients (gRPC / HTTP), AI/LLM query recipes, and the bundled `partgraph` CLI.
+
 ## Ports
 
 PartGraph binds every port to `127.0.0.1` and offsets the host ports by +1
