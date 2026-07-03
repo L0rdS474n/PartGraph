@@ -129,6 +129,16 @@ a single invocation bounded and
 interruptible rather than an unbounded march over the whole ~800k-part
 catalogue.
 
+> **Superseded in part by ADR-0011 (2026-07-03).** A no-`--limit` run now drives
+> to exhaustion over the whole eligible catalogue in a single invocation
+> (`_embed_all_pages` is called with `remaining=None`), rather than stopping at a
+> finite default and relying on repeated runs. The `_EMBED_SELECT_DEFAULT =
+> 200_000` figure named in this section is **historical**: that constant has been
+> removed from `partgraph.cli`, and `--limit N` is now the only bound on a run.
+> The gRPC message ceiling (Fix A) and the keyset-cursor design (Fix B) in this
+> ADR are unchanged and remain current; only this "Repeated-runs model" is
+> superseded. See ADR-0011 for the resource-envelope and trust-boundary analysis.
+
 ### Out of scope (documented follow-ups)
 
 Two other pydgraph stubs still use the 4 MiB default and should adopt
