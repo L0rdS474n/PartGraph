@@ -71,6 +71,10 @@ Once the database is up and populated, see **[Connecting to PartGraph](docs/conn
 for a full guide to querying the graph from the Dgraph MCP plugin, plain Dgraph
 clients (gRPC / HTTP), AI/LLM query recipes, and the bundled `partgraph` CLI.
 
+To keep a built graph fresh, see **[Scheduling refreshes](docs/scheduling.md)**
+for running `partgraph refresh` and `partgraph refresh-links` periodically from
+systemd or cron.
+
 ## Ports
 
 PartGraph binds every port to `127.0.0.1` and offsets the host ports by +1

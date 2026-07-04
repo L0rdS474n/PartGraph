@@ -1,0 +1,24 @@
+# partgraph-refresh-all.timer — weekly trigger for partgraph-refresh-all.service.
+#
+# Enable per-user:
+#   systemctl --user enable --now partgraph-refresh-all.timer
+#
+# See docs/scheduling.md.
+
+[Unit]
+Description=Weekly PartGraph refresh (stock/price + datasheet links)
+
+[Timer]
+# Sunday 04:42 (local time). The weekly cadence matches `partgraph refresh`'s
+# default --stale-days 7: each run re-checks parts stale for a week or more.
+OnCalendar=Sun *-*-* 04:42:00
+
+# If the machine was off at the scheduled time, run once at the next boot.
+Persistent=true
+
+# Jitter up to 10 minutes so scheduled hosts do not stampede the source and
+# datasheet hosts at the same instant.
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target
