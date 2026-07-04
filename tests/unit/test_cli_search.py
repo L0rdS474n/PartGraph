@@ -1599,3 +1599,1386 @@ def test_ac_ce_8_semantic_flag_is_embed_source_positional_is_parametric() -> Non
             f"AC-CE-8: encoder must NOT receive the positional parametric arg '10k 0402'. "
             f"Got encoder inputs: {all_encoder_texts!r}"
         )
+
+
+# ===========================================================================
+# AC-SF: issue #15 PR1 — structured search filters (CLI flags)
+#
+# New `partgraph search` flags under test:
+#   --manufacturer TEXT   --package TEXT   --category TEXT
+#   --in-stock            --min-stock INT  --basic  --extended
+#   --max-price FLOAT
+#
+# These flags DO NOT EXIST YET on the search command. Until implemented,
+# Click/Typer rejects them as "No such option" (a usage error, exit code 2) —
+# that is the correct RED state for the help/flag-presence and DQL-spy tests
+# below (a per-test runtime failure, never a collection error, since
+# partgraph.cli itself imports fine today).
+#
+# PINNED fixed error strings (this test suite defines them as the acceptance
+# contract — AC-SF-28: every new validation error is a FIXED, path-free
+# string, exit 1, emitted BEFORE _build_dgraph_client is ever called):
+#   - bad --package charset:         "--package must be"
+#   - --package given twice:         "package given twice" ... "only one"
+#   - --in-stock + --min-stock:      "--in-stock and --min-stock"
+#   - bad --min-stock value:         "--min-stock must be"
+#   - --basic + --extended:          "--basic and --extended"
+#   - bad --max-price value:         "--max-price must be"
+# ===========================================================================
+
+def _make_capturing_txn(
+    responses: dict | list[dict] | None = None,
+) -> tuple[MagicMock, list[tuple[str, dict]]]:
+    """Return (mock_txn, captured) where captured accumulates (dql, variables)
+    for every txn.query call, in order.
+
+    Generalises the ad hoc spy pattern already used by
+    test_cli_search_injection_token_not_in_query_text and
+    test_ac_ce_6_hybrid_semantic_with_voltage_token_dql_has_voltage_filter so
+    the new AC-SF filter-flag tests can inspect the exact DQL/variables sent
+    to Dgraph without duplicating the boilerplate per test.
+    """
+    response_list = (
+        responses if isinstance(responses, list) else [responses or {"exact": [], "trig": [], "fts": []}]
+    )
+    captured: list[tuple[str, dict]] = []
+    call_counter = [0]
+
+    def _spy_query(dql: str, variables: dict | None = None, *args, **kwargs):
+        captured.append((dql, variables or {}))
+        idx = min(call_counter[0], len(response_list) - 1)
+        call_counter[0] += 1
+        resp = MagicMock()
+        resp.json = json.dumps(response_list[idx]).encode()
+        return resp
+
+    mock_txn = MagicMock()
+    mock_txn.query.side_effect = _spy_query
+    mock_txn.discard.return_value = None
+    mock_txn.__enter__ = MagicMock(return_value=mock_txn)
+    mock_txn.__exit__ = MagicMock(return_value=False)
+    return mock_txn, captured
+
+
+# ---------------------------------------------------------------------------
+# Help-copy pins: every new flag must be documented in --help (mirrors E1).
+# ---------------------------------------------------------------------------
+
+def test_cli_search_help_contains_manufacturer_flag() -> None:
+    """PIN: `partgraph search --help` must document --manufacturer."""
+    result = _invoke(["search", "--help"])
+    assert "--manufacturer" in result.output, (
+        f"AC-SF: search --help must contain '--manufacturer'. Got:\n{result.output}"
+    )
+
+
+def test_cli_search_help_contains_package_flag_option() -> None:
+    """PIN: `partgraph search --help` must document --package."""
+    result = _invoke(["search", "--help"])
+    assert "--package" in result.output, (
+        f"AC-SF: search --help must contain '--package'. Got:\n{result.output}"
+    )
+
+
+def test_cli_search_help_contains_category_flag() -> None:
+    """PIN: `partgraph search --help` must document --category."""
+    result = _invoke(["search", "--help"])
+    assert "--category" in result.output, (
+        f"AC-SF: search --help must contain '--category'. Got:\n{result.output}"
+    )
+
+
+def test_cli_search_help_contains_in_stock_flag() -> None:
+    """PIN: `partgraph search --help` must document --in-stock."""
+    result = _invoke(["search", "--help"])
+    assert "--in-stock" in result.output, (
+        f"AC-SF: search --help must contain '--in-stock'. Got:\n{result.output}"
+    )
+
+
+def test_cli_search_help_contains_min_stock_flag() -> None:
+    """PIN: `partgraph search --help` must document --min-stock."""
+    result = _invoke(["search", "--help"])
+    assert "--min-stock" in result.output, (
+        f"AC-SF: search --help must contain '--min-stock'. Got:\n{result.output}"
+    )
+
+
+def test_cli_search_help_contains_basic_flag() -> None:
+    """PIN: `partgraph search --help` must document --basic."""
+    result = _invoke(["search", "--help"])
+    assert "--basic" in result.output, (
+        f"AC-SF: search --help must contain '--basic'. Got:\n{result.output}"
+    )
+
+
+def test_cli_search_help_contains_extended_flag() -> None:
+    """PIN: `partgraph search --help` must document --extended."""
+    result = _invoke(["search", "--help"])
+    assert "--extended" in result.output, (
+        f"AC-SF: search --help must contain '--extended'. Got:\n{result.output}"
+    )
+
+
+def test_cli_search_help_contains_max_price_flag() -> None:
+    """PIN: `partgraph search --help` must document --max-price."""
+    result = _invoke(["search", "--help"])
+    assert "--max-price" in result.output, (
+        f"AC-SF: search --help must contain '--max-price'. Got:\n{result.output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-1: --manufacturer binds $var, omitted from query text, exit 0
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_1_manufacturer_flag_binds_value_and_omits_from_query_text() -> None:
+    """AC-SF-1: Given `partgraph search MAX232 --manufacturer "Texas Instruments"`.
+    When invoked against a mocked pydgraph client (DQL spy).
+    Then exit 0; the captured variables carry "Texas Instruments" as a value;
+    the captured DQL never contains the literal manufacturer string; the
+    made_by filter uses allofterms.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--manufacturer", "Texas Instruments"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-1: search with --manufacturer must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured, "AC-SF-1: expected at least one Dgraph query to be sent."
+    dql, variables = captured[0]
+    assert "Texas Instruments" in variables.values(), (
+        f"AC-SF-1: expected 'Texas Instruments' bound as a $var. Got: {variables}"
+    )
+    assert "Texas Instruments" not in dql, (
+        f"AC-SF-1: manufacturer string must never appear in the query text. Got:\n{dql}"
+    )
+    assert "made_by" in dql
+    mb_idx = dql.index("made_by")
+    assert "allofterms(" in dql[mb_idx : mb_idx + 120]
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-2: mixed-case manufacturer -> allofterms (case-insensitive recall)
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_2_manufacturer_mixed_case_uses_allofterms_case_insensitive() -> None:
+    """AC-SF-2: Given `--manufacturer "texas instruments"` (lowercase input).
+    When invoked.
+    Then the captured DQL uses allofterms(name, $var) for the made_by filter
+    (LIVE-CONFIRMED: a lowercase-bound $var matches "Texas Instruments" /
+    "TEXAS INSTRUMENTS" / "texas instruments" nodes via allofterms).
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        _invoke(["search", "MAX232", "--manufacturer", "texas instruments"])
+
+    assert captured, "Expected at least one Dgraph query to be sent."
+    dql, variables = captured[0]
+    mb_idx = dql.index("made_by")
+    nearby = dql[mb_idx : mb_idx + 120]
+    assert "allofterms(" in nearby, (
+        f"AC-SF-2: made_by filter must use allofterms for case-insensitive recall. "
+        f"Nearby: {nearby!r}"
+    )
+    assert "texas instruments" in variables.values()
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-3 / AC-SF-18: injection — hostile manufacturer/category value
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_3_manufacturer_injection_value_only_in_variables() -> None:
+    """AC-SF-3: Given a hostile --manufacturer value 'TI") OR eq(x,"'.
+    When invoked.
+    Then the command does not crash, and the hostile value appears only in
+    the captured variables, never in the DQL text.
+    """
+    hostile = 'TI") OR eq(x,"'
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--manufacturer", hostile])
+
+    assert result.exception is None, (
+        f"AC-SF-3: hostile --manufacturer must not raise. Got: {result.exception}"
+    )
+    assert captured, "Expected at least one Dgraph query to be sent."
+    dql, variables = captured[0]
+    assert hostile in variables.values(), (
+        f"AC-SF-3: expected hostile value bound as a $var. Got: {variables}"
+    )
+    assert hostile not in dql, (
+        f"AC-SF-3: hostile manufacturer value must never appear in query text. Got:\n{dql}"
+    )
+
+
+def test_ac_sf_18_category_injection_value_only_in_variables() -> None:
+    """AC-SF-18: Given a hostile --category value 'RS232 ICs") OR eq(x,"'.
+    When invoked.
+    Then the command does not crash, and the hostile value appears only in
+    the captured variables, never in the DQL text.
+    """
+    hostile = 'RS232 ICs") OR eq(x,"'
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--category", hostile])
+
+    assert result.exception is None, (
+        f"AC-SF-18: hostile --category must not raise. Got: {result.exception}"
+    )
+    assert captured, "Expected at least one Dgraph query to be sent."
+    dql, variables = captured[0]
+    assert hostile in variables.values(), (
+        f"AC-SF-18: expected hostile value bound as a $var. Got: {variables}"
+    )
+    assert hostile not in dql, (
+        f"AC-SF-18: hostile category value must never appear in query text. Got:\n{dql}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-4: --package "soic-16" -> uppercased, bound as $pkg
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_4_package_flag_lowercase_uppercased_and_bound() -> None:
+    """AC-SF-4: Given `--package "soic-16"` (lowercase input).
+    When invoked.
+    Then exit 0; the captured variables carry "SOIC-16" (uppercased) bound to
+    $pkg; the query text contains in_package and eq(.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--package", "soic-16"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-4: valid --package must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured, "Expected at least one Dgraph query to be sent."
+    dql, variables = captured[0]
+    assert "SOIC-16" in variables.values(), (
+        f"AC-SF-4: expected the uppercased 'SOIC-16' bound as a $var. Got: {variables}"
+    )
+    assert "in_package" in dql
+    assert "eq(" in dql
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-4b: bad --package charset -> exit 1, fixed error, no DB query
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_4b_package_with_spaces_exits_1_no_db_query() -> None:
+    """AC-SF-4b: Given `--package "RS232 ICs"` (contains spaces — fails the
+    ^[A-Z0-9][A-Z0-9-]{0,19}$ charset).
+    When invoked.
+    Then exit code 1 and NO Dgraph query is sent.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--package", "RS232 ICs"])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-4b: bad --package charset must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    assert not captured, "AC-SF-4b: no Dgraph query may be sent for an invalid --package."
+    assert "--package must be" in result.output, (
+        f"AC-SF-4b/28: expected fixed '--package must be' error text. Got:\n{result.output}"
+    )
+
+
+def test_ac_sf_4b_package_too_long_exits_1_no_db_query() -> None:
+    """AC-SF-4b: Given a --package value of 21 chars (over the 20-char limit).
+    When invoked.
+    Then exit code 1 and NO Dgraph query is sent.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--package", "A" * 21])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-4b: too-long --package must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    assert not captured, "AC-SF-4b: no Dgraph query may be sent for an invalid --package."
+
+
+def test_ac_sf_4b_package_charset_error_is_path_free() -> None:
+    """AC-SF-4b / AC-SF-28: Given an invalid --package value.
+    When invoked.
+    Then the output does not leak a filesystem path or a raw traceback.
+    """
+    mock_txn, _captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--package", "RS232 ICs"])
+
+    assert "/home/" not in result.output, (
+        f"AC-SF-28: no path leak. Got: {result.output!r}"
+    )
+    assert "Traceback" not in result.output, (
+        f"AC-SF-28: no raw traceback. Got: {result.output!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-5: --package given both positionally and via --package -> exit 1
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_5_package_given_twice_exits_1_no_db_query() -> None:
+    """AC-SF-5: Given a positional query that ALSO carries a package token
+    ("SOIC-16 MAX232" -> parsed.package="SOIC-16") PLUS --package "PDIP-16"
+    supplying a second, different package.
+    When invoked.
+    Then exit code 1 with a fixed, path-free "package given twice ... use only
+    one" error, and NO Dgraph query is sent.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "SOIC-16 MAX232", "--package", "PDIP-16"])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-5: package given twice must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    assert not captured, "AC-SF-5: no Dgraph query may be sent when package is given twice."
+    assert "package given twice" in result.output.lower(), (
+        f"AC-SF-5/28: expected fixed 'package given twice' error text. Got:\n{result.output}"
+    )
+    assert "only one" in result.output.lower(), (
+        f"AC-SF-5/28: expected fixed '... use only one' error text. Got:\n{result.output}"
+    )
+
+
+def test_ac_sf_5_package_given_twice_error_is_path_free() -> None:
+    """AC-SF-5 / AC-SF-28: Given the package-given-twice collision.
+    When invoked.
+    Then the output contains no filesystem path or raw traceback.
+    """
+    mock_txn, _captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "SOIC-16 MAX232", "--package", "PDIP-16"])
+
+    assert "/home/" not in result.output
+    assert "Traceback" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-6: --category binds $cat, filters in_category, exit 0
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_6_category_flag_binds_cat_and_filters_in_category() -> None:
+    """AC-SF-6: Given `--category "RS232 ICs"`.
+    When invoked.
+    Then exit 0; captured variables carry "RS232 ICs"; the query text contains
+    in_category and allofterms(; the category string is absent from the query
+    text.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--category", "RS232 ICs"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-6: search with --category must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured, "Expected at least one Dgraph query to be sent."
+    dql, variables = captured[0]
+    assert "RS232 ICs" in variables.values()
+    assert "RS232 ICs" not in dql
+    assert "in_category" in dql
+    cat_idx = dql.index("in_category")
+    assert "allofterms(" in dql[cat_idx : cat_idx + 120]
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-7: --in-stock -> ge(stock, 1) INT literal
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_7_in_stock_flag_emits_ge_stock_1_int_literal() -> None:
+    """AC-SF-7: Given `--in-stock`.
+    When invoked.
+    Then the captured DQL contains ge(stock, 1) — never ge(stock, 1.0).
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--in-stock"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-7: --in-stock must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured
+    dql, _variables = captured[0]
+    assert re.search(r"ge\(\s*stock\s*,\s*1\s*\)", dql), (
+        f"AC-SF-7: expected ge(stock, 1). Got:\n{dql}"
+    )
+    assert not re.search(r"ge\(\s*stock\s*,\s*1\.0\s*\)", dql), (
+        f"AC-SF-7: stock literal must be an INT, never '1.0'. Got:\n{dql}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-8: --min-stock 5 -> ge(stock, 5) INT literal
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_8_min_stock_flag_emits_ge_stock_n_int_literal() -> None:
+    """AC-SF-8: Given `--min-stock 5`.
+    When invoked.
+    Then the captured DQL contains ge(stock, 5) — never ge(stock, 5.0).
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--min-stock", "5"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-8: --min-stock 5 must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured
+    dql, _variables = captured[0]
+    assert re.search(r"ge\(\s*stock\s*,\s*5\s*\)", dql), (
+        f"AC-SF-8: expected ge(stock, 5). Got:\n{dql}"
+    )
+    assert not re.search(r"ge\(\s*stock\s*,\s*5\.0\s*\)", dql), (
+        f"AC-SF-8: stock literal must be an INT, never '5.0'. Got:\n{dql}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-9: --in-stock + --min-stock together -> exit 1, no DB query
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_9_in_stock_and_min_stock_together_exits_1_no_db_query() -> None:
+    """AC-SF-9: Given both `--in-stock` and `--min-stock 5`.
+    When invoked.
+    Then exit code 1 with a fixed error naming both flags, and NO Dgraph query
+    is sent.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--in-stock", "--min-stock", "5"])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-9: --in-stock + --min-stock together must exit 1. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    assert not captured, "AC-SF-9: no Dgraph query may be sent on this collision."
+    assert "--in-stock and --min-stock" in result.output, (
+        f"AC-SF-9/28: expected fixed '--in-stock and --min-stock' error text. "
+        f"Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output, (
+        f"AC-SF-9/Security-SHOULD-1: no path leak. Got: {result.output!r}"
+    )
+    assert "Traceback" not in result.output, (
+        f"AC-SF-9/Security-SHOULD-1: no raw traceback. Got: {result.output!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-10: bad --min-stock values -> exit 1, no DB query
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_10_min_stock_negative_exits_1_no_db_query() -> None:
+    """AC-SF-10: Given `--min-stock -1`.
+    When invoked.
+    Then exit code 1 and NO Dgraph query is sent.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--min-stock", "-1"])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-10: --min-stock -1 must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    assert not captured
+    assert "/home/" not in result.output, (
+        f"AC-SF-10/Security-SHOULD-1: no path leak. Got: {result.output!r}"
+    )
+    assert "Traceback" not in result.output, (
+        f"AC-SF-10/Security-SHOULD-1: no raw traceback. Got: {result.output!r}"
+    )
+
+
+def test_ac_sf_10_min_stock_fractional_exits_1_no_db_query() -> None:
+    """AC-SF-10: Given `--min-stock 1.5`.
+    When invoked.
+    Then exit code 1 and NO Dgraph query is sent.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--min-stock", "1.5"])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-10: --min-stock 1.5 must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    assert not captured
+    assert "/home/" not in result.output, (
+        f"AC-SF-10/Security-SHOULD-1: no path leak. Got: {result.output!r}"
+    )
+    assert "Traceback" not in result.output, (
+        f"AC-SF-10/Security-SHOULD-1: no raw traceback. Got: {result.output!r}"
+    )
+
+
+def test_ac_sf_10_min_stock_non_numeric_exits_1_no_db_query() -> None:
+    """AC-SF-10: Given `--min-stock foo`.
+    When invoked.
+    Then exit code 1 and NO Dgraph query is sent.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--min-stock", "foo"])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-10: --min-stock foo must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    assert not captured
+    assert "--min-stock must be" in result.output, (
+        f"AC-SF-10/28: expected fixed '--min-stock must be' error text. Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output, (
+        f"AC-SF-10/Security-SHOULD-1: no path leak. Got: {result.output!r}"
+    )
+    assert "Traceback" not in result.output, (
+        f"AC-SF-10/Security-SHOULD-1: no raw traceback. Got: {result.output!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-11 / AC-SF-12: --basic / --extended
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_11_basic_flag_emits_eq_is_basic_true() -> None:
+    """AC-SF-11: Given `--basic`.
+    When invoked.
+    Then the captured DQL contains eq(is_basic, true).
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--basic"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-11: --basic must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured
+    dql, _variables = captured[0]
+    assert re.search(r"eq\(\s*is_basic\s*,\s*true\s*\)", dql), (
+        f"AC-SF-11: expected eq(is_basic, true). Got:\n{dql}"
+    )
+
+
+def test_ac_sf_12_extended_flag_emits_eq_is_basic_false() -> None:
+    """AC-SF-12: Given `--extended`.
+    When invoked.
+    Then the captured DQL contains eq(is_basic, false).
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--extended"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-12: --extended must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured
+    dql, _variables = captured[0]
+    assert re.search(r"eq\(\s*is_basic\s*,\s*false\s*\)", dql), (
+        f"AC-SF-12: expected eq(is_basic, false). Got:\n{dql}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-13: --basic + --extended together -> exit 1, no DB query
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_13_basic_and_extended_together_exits_1_no_db_query() -> None:
+    """AC-SF-13: Given both `--basic` and `--extended`.
+    When invoked.
+    Then exit code 1 with a fixed error naming both flags, and NO Dgraph query
+    is sent.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--basic", "--extended"])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-13: --basic + --extended together must exit 1. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    assert not captured, "AC-SF-13: no Dgraph query may be sent on this collision."
+    assert "--basic and --extended" in result.output, (
+        f"AC-SF-13/28: expected fixed '--basic and --extended' error text. "
+        f"Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output, (
+        f"AC-SF-13/Security-SHOULD-1: no path leak. Got: {result.output!r}"
+    )
+    assert "Traceback" not in result.output, (
+        f"AC-SF-13/Security-SHOULD-1: no raw traceback. Got: {result.output!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-14: --max-price
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_14_max_price_valid_emits_le_price_usd_float() -> None:
+    """AC-SF-14: Given `--max-price 0.5`.
+    When invoked.
+    Then the captured DQL contains le(price_usd, 0.5).
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--max-price", "0.5"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-14: --max-price 0.5 must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured
+    dql, _variables = captured[0]
+    assert re.search(r"le\(\s*price_usd\s*,\s*0\.5\s*\)", dql), (
+        f"AC-SF-14: expected le(price_usd, 0.5). Got:\n{dql}"
+    )
+
+
+def test_ac_sf_14_max_price_negative_exits_1_no_db_query() -> None:
+    """AC-SF-14: Given `--max-price -1`.
+    When invoked.
+    Then exit code 1 and NO Dgraph query is sent.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--max-price", "-1"])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-14: --max-price -1 must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    assert not captured
+    assert "/home/" not in result.output, (
+        f"AC-SF-14/Security-SHOULD-1: no path leak. Got: {result.output!r}"
+    )
+    assert "Traceback" not in result.output, (
+        f"AC-SF-14/Security-SHOULD-1: no raw traceback. Got: {result.output!r}"
+    )
+
+
+def test_ac_sf_14_max_price_non_numeric_exits_1_no_db_query() -> None:
+    """AC-SF-14: Given `--max-price abc`.
+    When invoked.
+    Then exit code 1 and NO Dgraph query is sent.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--max-price", "abc"])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-14: --max-price abc must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    assert not captured
+    assert "--max-price must be" in result.output, (
+        f"AC-SF-14/28: expected fixed '--max-price must be' error text. Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output, (
+        f"AC-SF-14/Security-SHOULD-1: no path leak. Got: {result.output!r}"
+    )
+    assert "Traceback" not in result.output, (
+        f"AC-SF-14/Security-SHOULD-1: no raw traceback. Got: {result.output!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-15: composition — MPN + manufacturer + min_stock -> ONE query
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_15_cli_composition_mpn_manufacturer_min_stock_single_query() -> None:
+    """AC-SF-15: Given `search "MAX232 0402 1%" --manufacturer "Texas Instruments"
+    --min-stock 10`, with the mocked hard-pass response non-empty (so the
+    relaxed pass never triggers).
+    When invoked.
+    Then exactly ONE query is sent to Dgraph, and it carries the MPN text
+    terms, the tolerance_pct parametric term, the package eq() filter, the
+    manufacturer allofterms() filter, and ge(stock, 10) — all AND-composed.
+    """
+    non_empty = {
+        "exact": [
+            {
+                "uid": "0xF01",
+                "mpn": "MAX232",
+                "mpn_norm": "MAX232",
+                "stock": 50,
+                "is_basic": False,
+                "made_by": [{"name": "Texas Instruments"}],
+                "in_package": [{"name": "0402"}],
+                "datasheet": [{"url": "https://example.com/ds.pdf"}],
+            }
+        ],
+        "trig": [],
+        "fts": [],
+    }
+    mock_txn, captured = _make_capturing_txn(non_empty)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(
+            [
+                "search",
+                "MAX232 0402 1%",
+                "--manufacturer",
+                "Texas Instruments",
+                "--min-stock",
+                "10",
+            ]
+        )
+
+    assert result.exit_code == 0, (
+        f"AC-SF-15: composed search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert len(captured) == 1, (
+        f"AC-SF-15: expected exactly ONE Dgraph query (hard pass has rows; no "
+        f"relaxed pass needed). Got {len(captured)} calls: {[c[0] for c in captured]}"
+    )
+    dql, variables = captured[0]
+    assert "mpn_norm" in dql
+    assert "tolerance_pct" in dql
+    assert "in_package" in dql
+    assert "made_by" in dql
+    assert re.search(r"ge\(\s*stock\s*,\s*10\s*\)", dql), (
+        f"AC-SF-15: expected ge(stock, 10). Got:\n{dql}"
+    )
+    assert variables.get("$mfr") == "Texas Instruments" or "Texas Instruments" in variables.values()
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-16: --semantic + --manufacturer composition
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_16_semantic_search_with_manufacturer_flag_composes_in_dql() -> None:
+    """AC-SF-16: Given `--semantic "rs232 transceiver" --manufacturer "Texas
+    Instruments"`.
+    When invoked (mocked encoder + mocked client).
+    Then exit 0; the captured DQL carries the made_by allofterms filter
+    extending the SAME similar_to(...) block (not a Python post-filter); the
+    manufacturer string never appears in the query text.
+    """
+    captured: list[tuple[str, dict]] = []
+
+    def _spy_query(dql: str, variables: dict | None = None, *args, **kwargs):
+        captured.append((dql, variables or {}))
+        resp = MagicMock()
+        resp.json = json.dumps(_make_semantic_response_with_max232()).encode()
+        return resp
+
+    mock_txn = MagicMock()
+    mock_txn.query.side_effect = _spy_query
+    mock_txn.discard.return_value = None
+    mock_txn.__enter__ = MagicMock(return_value=mock_txn)
+    mock_txn.__exit__ = MagicMock(return_value=False)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(
+            ["search", "--semantic", "rs232 transceiver", "--manufacturer", "Texas Instruments"]
+        )
+
+    assert result.exit_code == 0, (
+        f"AC-SF-16: semantic + manufacturer must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured, "AC-SF-16: expected at least one Dgraph query to be sent."
+    dql, variables = captured[0]
+    assert "similar_to" in dql
+    assert "made_by" in dql
+    mb_idx = dql.index("made_by")
+    assert "allofterms(" in dql[mb_idx : mb_idx + 120]
+    assert "Texas Instruments" not in dql
+    assert "Texas Instruments" in variables.values()
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-16 (Gate 3 scope decision — ALL filters compose with --semantic, not
+# just --manufacturer): --semantic + --category / --min-stock / --basic /
+# --max-price composition.
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_16_semantic_search_with_category_flag_composes_in_dql() -> None:
+    """AC-SF-16: Given `--semantic "rs232 transceiver" --category "RS232 ICs"`.
+    When invoked (mocked encoder + mocked client).
+    Then the captured DQL carries the in_category allofterms filter extending
+    the SAME similar_to(...) block; the category string never appears in the
+    query text.
+    """
+    captured: list[tuple[str, dict]] = []
+
+    def _spy_query(dql: str, variables: dict | None = None, *args, **kwargs):
+        captured.append((dql, variables or {}))
+        resp = MagicMock()
+        resp.json = json.dumps(_make_semantic_response_with_max232()).encode()
+        return resp
+
+    mock_txn = MagicMock()
+    mock_txn.query.side_effect = _spy_query
+    mock_txn.discard.return_value = None
+    mock_txn.__enter__ = MagicMock(return_value=mock_txn)
+    mock_txn.__exit__ = MagicMock(return_value=False)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(
+            ["search", "--semantic", "rs232 transceiver", "--category", "RS232 ICs"]
+        )
+
+    assert result.exit_code == 0, (
+        f"AC-SF-16: semantic + category must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured, "AC-SF-16: expected at least one Dgraph query to be sent."
+    dql, variables = captured[0]
+    assert "similar_to" in dql
+    assert "in_category" in dql
+    cat_idx = dql.index("in_category")
+    assert "allofterms(" in dql[cat_idx : cat_idx + 120]
+    assert "RS232 ICs" not in dql
+    assert "RS232 ICs" in variables.values()
+
+
+def test_ac_sf_16_semantic_search_with_min_stock_flag_composes_in_dql() -> None:
+    """AC-SF-16: Given `--semantic "rs232" --min-stock 10`.
+    When invoked.
+    Then the captured DQL carries ge(stock, 10) inside the semantic query.
+    """
+    mock_txn, captured = _make_capturing_txn(_make_semantic_response_with_max232())
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232", "--min-stock", "10"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-16: semantic + min-stock must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured, "AC-SF-16: expected at least one Dgraph query to be sent."
+    dql, _variables = captured[0]
+    assert "similar_to" in dql
+    assert re.search(r"ge\(\s*stock\s*,\s*10\s*\)", dql), (
+        f"AC-SF-16: expected ge(stock, 10) inside the semantic query. Got:\n{dql}"
+    )
+
+
+def test_ac_sf_16_semantic_search_with_basic_flag_composes_in_dql() -> None:
+    """AC-SF-16: Given `--semantic "rs232" --basic`.
+    When invoked.
+    Then the captured DQL carries eq(is_basic, true) inside the semantic query.
+    """
+    mock_txn, captured = _make_capturing_txn(_make_semantic_response_with_max232())
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232", "--basic"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-16: semantic + basic must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured, "AC-SF-16: expected at least one Dgraph query to be sent."
+    dql, _variables = captured[0]
+    assert "similar_to" in dql
+    assert re.search(r"eq\(\s*is_basic\s*,\s*true\s*\)", dql), (
+        f"AC-SF-16: expected eq(is_basic, true) inside the semantic query. Got:\n{dql}"
+    )
+
+
+def test_ac_sf_16_semantic_search_with_max_price_flag_composes_in_dql() -> None:
+    """AC-SF-16: Given `--semantic "rs232" --max-price 0.5`.
+    When invoked.
+    Then the captured DQL carries le(price_usd, 0.5) inside the semantic query.
+    """
+    mock_txn, captured = _make_capturing_txn(_make_semantic_response_with_max232())
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232", "--max-price", "0.5"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-16: semantic + max-price must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured, "AC-SF-16: expected at least one Dgraph query to be sent."
+    dql, _variables = captured[0]
+    assert "similar_to" in dql
+    assert re.search(r"le\(\s*price_usd\s*,\s*0\.5\s*\)", dql), (
+        f"AC-SF-16: expected le(price_usd, 0.5) inside the semantic query. Got:\n{dql}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-17: relaxed (nearest-match) pass still applies hard filter kwargs
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_17_relaxed_pass_still_applies_min_stock_hard_constraint() -> None:
+    """AC-SF-17: Given a nearest-match scenario ("1.2V MAX232", hard pass
+    empty) PLUS `--min-stock 5`.
+    When invoked.
+    Then BOTH the hard-pass query and the relaxed-pass query carry
+    ge(stock, 5) — min_stock is a hard constraint that must NOT be dropped by
+    the relaxed pass (only the query-derived parametric quantities relax).
+    """
+    responses = [
+        {"exact": [], "trig": [], "fts": []},  # Pass 1 (hard): empty.
+        {
+            "nearest": [
+                {
+                    "uid": "0x900",
+                    "mpn": "MAX232CPE",
+                    "mpn_norm": "MAX232CPE",
+                    "stock": 50,
+                    "is_basic": False,
+                    "made_by": [{"name": "Texas Instruments"}],
+                    "in_package": [{"name": "PDIP-16"}],
+                    "datasheet": [{"url": "https://example.com/ds.pdf"}],
+                }
+            ]
+        },
+    ]
+    mock_txn, captured = _make_capturing_txn(responses)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "1.2V MAX232", "--min-stock", "5"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-17: relaxed-pass search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert len(captured) == 2, (
+        f"AC-SF-17: expected TWO Dgraph queries (hard pass empty -> relaxed "
+        f"pass). Got {len(captured)} calls."
+    )
+    for i, (dql, _variables) in enumerate(captured):
+        assert re.search(r"ge\(\s*stock\s*,\s*5\s*\)", dql), (
+            f"AC-SF-17: pass {i + 1} must still carry ge(stock, 5) — min_stock "
+            f"is a hard constraint, not relaxed. Got:\n{dql}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-17 (Gate 3 Architecture MUST-1): siblings for manufacturer / category /
+# basic / max_price — EVERY hard filter kwarg must survive the relaxed pass,
+# not just min_stock.
+# ---------------------------------------------------------------------------
+
+def _two_pass_nearest_responses(extra_row_fields: dict) -> list[dict]:
+    """Return the standard two-pass (hard-empty, relaxed-nearest) response
+    sequence used by every AC-SF-17 sibling test, with the given extra part
+    fields merged into the single relaxed-pass row.
+    """
+    row = {
+        "uid": "0x901",
+        "mpn": "MAX232CPE",
+        "mpn_norm": "MAX232CPE",
+        "stock": 50,
+        "is_basic": False,
+        "made_by": [{"name": "Texas Instruments"}],
+        "in_package": [{"name": "PDIP-16"}],
+        "datasheet": [{"url": "https://example.com/ds.pdf"}],
+    }
+    row.update(extra_row_fields)
+    return [
+        {"exact": [], "trig": [], "fts": []},  # Pass 1 (hard): empty.
+        {"nearest": [row]},
+    ]
+
+
+def test_ac_sf_17_relaxed_pass_still_applies_manufacturer_hard_constraint() -> None:
+    """AC-SF-17 (Gate 3 Architecture MUST-1): Given a nearest-match scenario
+    ("1.2V MAX232", hard pass empty) PLUS `--manufacturer "Texas Instruments"`.
+    When invoked.
+    Then BOTH the hard-pass query and the relaxed-pass query carry
+    made_by @filter(allofterms(name, $mfr)) — manufacturer is a hard
+    constraint, not relaxed.
+    """
+    responses = _two_pass_nearest_responses({})
+    mock_txn, captured = _make_capturing_txn(responses)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(
+            ["search", "1.2V MAX232", "--manufacturer", "Texas Instruments"]
+        )
+
+    assert result.exit_code == 0, (
+        f"AC-SF-17: relaxed-pass search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert len(captured) == 2, (
+        f"AC-SF-17: expected TWO Dgraph queries. Got {len(captured)} calls."
+    )
+    for i, (dql, _variables) in enumerate(captured):
+        assert "made_by" in dql, (
+            f"AC-SF-17: pass {i + 1} must still select made_by. Got:\n{dql}"
+        )
+        mb_idx = dql.index("made_by")
+        assert "allofterms(" in dql[mb_idx : mb_idx + 120], (
+            f"AC-SF-17: pass {i + 1} must still carry the made_by allofterms "
+            f"filter — manufacturer is a hard constraint, not relaxed. "
+            f"Got:\n{dql}"
+        )
+
+
+def test_ac_sf_17_relaxed_pass_still_applies_category_hard_constraint() -> None:
+    """AC-SF-17 (Gate 3 Architecture MUST-1): Given a nearest-match scenario
+    PLUS `--category "RS232 ICs"`.
+    When invoked.
+    Then BOTH passes carry in_category @filter(allofterms(name, $cat)).
+    """
+    responses = _two_pass_nearest_responses({})
+    mock_txn, captured = _make_capturing_txn(responses)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "1.2V MAX232", "--category", "RS232 ICs"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-17: relaxed-pass search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert len(captured) == 2, (
+        f"AC-SF-17: expected TWO Dgraph queries. Got {len(captured)} calls."
+    )
+    for i, (dql, _variables) in enumerate(captured):
+        assert "in_category" in dql, (
+            f"AC-SF-17: pass {i + 1} must still select in_category. Got:\n{dql}"
+        )
+        cat_idx = dql.index("in_category")
+        assert "allofterms(" in dql[cat_idx : cat_idx + 120], (
+            f"AC-SF-17: pass {i + 1} must still carry the in_category "
+            f"allofterms filter — category is a hard constraint, not "
+            f"relaxed. Got:\n{dql}"
+        )
+
+
+def test_ac_sf_17_relaxed_pass_still_applies_basic_hard_constraint() -> None:
+    """AC-SF-17 (Gate 3 Architecture MUST-1): Given a nearest-match scenario
+    PLUS `--basic`.
+    When invoked.
+    Then BOTH passes carry eq(is_basic, true).
+    """
+    responses = _two_pass_nearest_responses({})
+    mock_txn, captured = _make_capturing_txn(responses)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "1.2V MAX232", "--basic"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-17: relaxed-pass search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert len(captured) == 2, (
+        f"AC-SF-17: expected TWO Dgraph queries. Got {len(captured)} calls."
+    )
+    for i, (dql, _variables) in enumerate(captured):
+        assert re.search(r"eq\(\s*is_basic\s*,\s*true\s*\)", dql), (
+            f"AC-SF-17: pass {i + 1} must still carry eq(is_basic, true) — "
+            f"--basic is a hard constraint, not relaxed. Got:\n{dql}"
+        )
+
+
+def test_ac_sf_17_relaxed_pass_still_applies_max_price_hard_constraint() -> None:
+    """AC-SF-17 (Gate 3 Architecture MUST-1): Given a nearest-match scenario
+    PLUS `--max-price 0.5`.
+    When invoked.
+    Then BOTH passes carry le(price_usd, 0.5).
+    """
+    responses = _two_pass_nearest_responses({})
+    mock_txn, captured = _make_capturing_txn(responses)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "1.2V MAX232", "--max-price", "0.5"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-17: relaxed-pass search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert len(captured) == 2, (
+        f"AC-SF-17: expected TWO Dgraph queries. Got {len(captured)} calls."
+    )
+    for i, (dql, _variables) in enumerate(captured):
+        assert re.search(r"le\(\s*price_usd\s*,\s*0\.5\s*\)", dql), (
+            f"AC-SF-17: pass {i + 1} must still carry le(price_usd, 0.5) — "
+            f"--max-price is a hard constraint, not relaxed. Got:\n{dql}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-28: validation errors emitted BEFORE any Dgraph client is built
+# (stronger than "txn.query not called" — the client/stub must never even be
+# constructed, mirroring _validate_limit's cli.py ~L292-309 contract).
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_28_in_stock_min_stock_collision_never_builds_dgraph_client() -> None:
+    """AC-SF-28: Given the --in-stock + --min-stock collision.
+    When invoked.
+    Then _build_dgraph_client is NEVER called.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--in-stock", "--min-stock", "5"])
+
+    assert result.exit_code == 1
+    mock_build.assert_not_called()
+
+
+def test_ac_sf_28_basic_extended_collision_never_builds_dgraph_client() -> None:
+    """AC-SF-28: Given the --basic + --extended collision.
+    When invoked.
+    Then _build_dgraph_client is NEVER called.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--basic", "--extended"])
+
+    assert result.exit_code == 1
+    mock_build.assert_not_called()
+
+
+def test_ac_sf_28_package_given_twice_never_builds_dgraph_client() -> None:
+    """AC-SF-28: Given the package-given-twice collision.
+    When invoked.
+    Then _build_dgraph_client is NEVER called.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "SOIC-16 MAX232", "--package", "PDIP-16"])
+
+    assert result.exit_code == 1
+    mock_build.assert_not_called()
+
+
+def test_ac_sf_28_package_charset_error_never_builds_dgraph_client() -> None:
+    """AC-SF-28: Given an invalid --package charset value.
+    When invoked.
+    Then _build_dgraph_client is NEVER called.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--package", "RS232 ICs"])
+
+    assert result.exit_code == 1
+    mock_build.assert_not_called()
+
+
+def test_ac_sf_28_bad_min_stock_value_never_builds_dgraph_client() -> None:
+    """AC-SF-28: Given a non-numeric --min-stock value.
+    When invoked.
+    Then _build_dgraph_client is NEVER called.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--min-stock", "foo"])
+
+    assert result.exit_code == 1
+    mock_build.assert_not_called()
+
+
+def test_ac_sf_28_bad_max_price_value_never_builds_dgraph_client() -> None:
+    """AC-SF-28: Given a non-numeric --max-price value.
+    When invoked.
+    Then _build_dgraph_client is NEVER called.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--max-price", "abc"])
+
+    assert result.exit_code == 1
+    mock_build.assert_not_called()
+
+
+# ===========================================================================
+# Gate 3 (Security MUST): manufacturer/category value validation.
+#
+# A NEW permissive validator (distinct from the package charset regex — mfr/
+# category legitimately contain spaces and >20 chars) must reject empty/
+# whitespace-only values and enforce a NAMED length cap (DoS defense-in-depth,
+# ADR-0007-style bound). The exact cap constant is NOT pinned here (Gate 4
+# chooses it) — only that 500 chars is rejected and a normal ~40-char value is
+# accepted. Folded into the AC-SF-28 "never builds client" family per Gate 3's
+# instruction. PIN (first-pinned by this test suite, Gate 4 matches): fixed
+# error substrings "--manufacturer must be" / "--category must be".
+# ===========================================================================
+
+def test_ac_sf_1_manufacturer_empty_string_exits_1_no_db_query() -> None:
+    """Gate-3 Security MUST: Given `--manufacturer ""` (empty string).
+    When invoked.
+    Then exit code 1, a fixed path-free "--manufacturer must be" error, NO
+    Dgraph query is sent, and _build_dgraph_client is NEVER called.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--manufacturer", ""])
+
+    assert result.exit_code == 1, (
+        f"Gate-3: empty --manufacturer must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    assert "--manufacturer must be" in result.output, (
+        f"Gate-3: expected fixed '--manufacturer must be' error text. Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output and "Traceback" not in result.output, (
+        f"Gate-3: no path/traceback leak. Got: {result.output!r}"
+    )
+
+
+def test_ac_sf_1_manufacturer_whitespace_only_exits_1_no_db_query() -> None:
+    """Gate-3 Security MUST: Given `--manufacturer "   "` (whitespace-only).
+    When invoked.
+    Then exit code 1, fixed error, no Dgraph query, no client built.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--manufacturer", "   "])
+
+    assert result.exit_code == 1, (
+        f"Gate-3: whitespace-only --manufacturer must exit 1. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    assert "--manufacturer must be" in result.output, (
+        f"Gate-3: expected fixed '--manufacturer must be' error text. Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output and "Traceback" not in result.output, (
+        f"Gate-3: no path/traceback leak. Got: {result.output!r}"
+    )
+
+
+def test_ac_sf_1_manufacturer_oversized_exits_1_no_db_query() -> None:
+    """Gate-3 Security MUST: Given a 500-char --manufacturer value (DoS
+    defense-in-depth — the exact cap constant is NOT pinned here, only that
+    500 chars is rejected).
+    When invoked.
+    Then exit code 1, fixed error, no Dgraph query, no client built.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--manufacturer", "A" * 500])
+
+    assert result.exit_code == 1, (
+        f"Gate-3: oversized (500-char) --manufacturer must exit 1. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    assert "--manufacturer must be" in result.output, (
+        f"Gate-3: expected fixed '--manufacturer must be' error text. Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output and "Traceback" not in result.output, (
+        f"Gate-3: no path/traceback leak. Got: {result.output!r}"
+    )
+
+
+def test_ac_sf_6_category_empty_string_exits_1_no_db_query() -> None:
+    """Gate-3 Security MUST: Given `--category ""` (empty string).
+    When invoked.
+    Then exit code 1, a fixed path-free "--category must be" error, NO
+    Dgraph query is sent, and _build_dgraph_client is NEVER called.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--category", ""])
+
+    assert result.exit_code == 1, (
+        f"Gate-3: empty --category must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    assert "--category must be" in result.output, (
+        f"Gate-3: expected fixed '--category must be' error text. Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output and "Traceback" not in result.output, (
+        f"Gate-3: no path/traceback leak. Got: {result.output!r}"
+    )
+
+
+def test_ac_sf_6_category_whitespace_only_exits_1_no_db_query() -> None:
+    """Gate-3 Security MUST: Given `--category "   "` (whitespace-only).
+    When invoked.
+    Then exit code 1, fixed error, no Dgraph query, no client built.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--category", "   "])
+
+    assert result.exit_code == 1, (
+        f"Gate-3: whitespace-only --category must exit 1. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    assert "--category must be" in result.output, (
+        f"Gate-3: expected fixed '--category must be' error text. Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output and "Traceback" not in result.output, (
+        f"Gate-3: no path/traceback leak. Got: {result.output!r}"
+    )
+
+
+def test_ac_sf_6_category_oversized_exits_1_no_db_query() -> None:
+    """Gate-3 Security MUST: Given a 500-char --category value (DoS
+    defense-in-depth).
+    When invoked.
+    Then exit code 1, fixed error, no Dgraph query, no client built.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--category", "A" * 500])
+
+    assert result.exit_code == 1, (
+        f"Gate-3: oversized (500-char) --category must exit 1. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    assert "--category must be" in result.output, (
+        f"Gate-3: expected fixed '--category must be' error text. Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output and "Traceback" not in result.output, (
+        f"Gate-3: no path/traceback leak. Got: {result.output!r}"
+    )

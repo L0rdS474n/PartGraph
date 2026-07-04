@@ -5,15 +5,30 @@ normalised MPN, for the detail view) into a ``(query_text, variables)`` pair
 ready for ``txn.query(query_text, variables=variables)``.
 
 Security model (ADR-INJECT):
-- Free-text tokens and the package code are *never* interpolated into the query
-  string. They are bound as Dgraph ``$``-variables, so hostile characters stay
-  inside the variable value and can never alter the query structure.
-- Numeric parameter bounds are emitted as *float literals* (Dgraph variables are
-  strings and cannot type as floats for ``ge``/``le``). Every literal is produced
-  by :func:`_fmt_float`, which forces a locale-invariant representation and
-  validates it against a strict numeric charset before it can reach the query.
+- Free-text tokens, the package code and the ``--manufacturer``/``--category``
+  filter terms are *never* interpolated into the query string. They are bound as
+  Dgraph ``$``-variables (``$te``/``$rx``/``$ft``, ``$pkg``, ``$mfr``, ``$cat``),
+  so hostile characters stay inside the variable value and can never alter the
+  query structure. Manufacturer/category are matched with ``allofterms`` on the
+  bound ``$``-variable — never ``regexp`` on user input (ADR-0016).
+- Numeric parameter bounds and the ``--max-price`` ceiling are emitted as *float
+  literals* (Dgraph variables are strings and cannot type as floats for
+  ``ge``/``le``). Every literal is produced by :func:`_fmt_float`, which forces a
+  locale-invariant representation and validates it against a strict numeric
+  charset before it can reach the query.
+- The ``--min-stock``/``--in-stock`` threshold is emitted as a validated *integer
+  literal* by :func:`_fmt_int` (``ge(stock, 5)`` — never ``ge(stock, 5.0)``,
+  which Dgraph rejects for the integer ``stock`` predicate; ADR-0016). The
+  ``--basic``/``--extended`` flag is emitted as the fixed boolean literal
+  ``eq(is_basic, true)``/``eq(is_basic, false)`` — never derived from or bound to
+  user text.
 - The package code is re-validated against ``^[A-Z0-9][A-Z0-9\\-]{0,19}$`` and a
-  failure raises :class:`ValueError` (defence in depth on top of the parser).
+  failure raises :class:`ValueError` (defence in depth on top of the parser). The
+  manufacturer/category terms use a separate *permissive* validator
+  (:func:`_validate_filter_term`) — they legitimately contain spaces and exceed
+  20 characters, so the strict package charset cannot be reused; that validator
+  rejects empty/whitespace-only values and caps the length at
+  :data:`_MAX_FILTER_TERM_LEN` (DoS defence-in-depth, ADR-0007 style).
 
 DoS model (ADR-0007): the caller-supplied ``limit`` is clamped to
 ``MAX_RESULT_LIMIT`` so a single request can never stream the whole database.
@@ -85,8 +100,20 @@ _PROMOTED_PREDICATES: tuple[str, ...] = (
 #: Strict charset a formatted float literal must match before use in a query.
 _FLOAT_LITERAL_RE = re.compile(r"[0-9.eE+\-]+")
 
+#: Strict charset a formatted integer literal must match before use in a query.
+#: Only non-negative integers reach the query (``stock`` is a count), so no sign
+#: is permitted here (validate-before-emit, mirroring :data:`_FLOAT_LITERAL_RE`).
+_INT_LITERAL_RE = re.compile(r"[0-9]+")
+
 #: Package validation regex (ADR-INJECT). Mirrors the parser's final check.
 _PACKAGE_VALID_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-]{0,19}$")
+
+#: Maximum length of a ``--manufacturer``/``--category`` free-text filter term
+#: (ADR-0016 / ADR-0007-style DoS bound). Must comfortably exceed real names
+#: ("STMicroelectronics", "RS-232 Interface IC") yet reject pathological input;
+#: the value is bound as a ``$``-variable regardless, so this is a usability +
+#: defence-in-depth cap, not an injection guard.
+_MAX_FILTER_TERM_LEN = 128
 
 #: Minimum letter-run length to use as the related-parts MPN family prefix.
 _MIN_RELATED_PREFIX_LEN = 2
@@ -110,6 +137,41 @@ def _fmt_float(value: float) -> str:
     return text
 
 
+def _fmt_int(value: int) -> str:
+    """Return a safe, non-negative integer literal for *value*.
+
+    The ``stock`` predicate is an integer in the deployed schema and Dgraph
+    rejects a *float* literal for an integer comparison (LIVE-CONFIRMED:
+    ``ge(stock, 5.0)`` errors; ``ge(stock, 5)`` works). This helper therefore
+    emits a bare integer literal and refuses anything that is not a whole,
+    non-negative integer so a fractional/negative/non-numeric value can never
+    reach the query text. The emitted text is re-validated against a strict
+    digit charset before use (validate-before-emit, mirroring :func:`_fmt_float`).
+
+    Raises:
+        ValueError: If *value* is a bool, carries a fractional part, is negative,
+            or cannot be interpreted as an integer.
+        TypeError: If *value* is of a type ``int()`` cannot coerce.
+    """
+    # A bool is an int subclass; reject it so ``True`` can never become ``1``.
+    if isinstance(value, bool):
+        raise ValueError(f"Integer literal must not be a bool: {value!r}.")
+    # Guard the fractional-float case explicitly: int(5.5) would silently
+    # truncate to 5, so a value like 5.5 must be rejected before coercion.
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"Integer literal must be a whole number, got {value!r}.")
+        ivalue = int(value)
+    else:
+        ivalue = int(value)  # non-numeric str/other raises ValueError/TypeError.
+    if ivalue < 0:
+        raise ValueError(f"Integer literal must be non-negative, got {ivalue}.")
+    text = str(ivalue)
+    if not _INT_LITERAL_RE.fullmatch(text):  # pragma: no cover — defensive
+        raise ValueError(f"Unsafe integer literal: {text!r}.")
+    return text
+
+
 def _validate_package(package: str) -> str:
     """Return *package* unchanged if it passes the injection-guard regex.
 
@@ -122,6 +184,33 @@ def _validate_package(package: str) -> str:
             r"^[A-Z0-9][A-Z0-9\-]{0,19}$ (ADR-INJECT)."
         )
     return package
+
+
+def _validate_filter_term(value: str, *, field: str) -> str:
+    """Return *value* unchanged if it is a usable free-text filter term.
+
+    A *permissive* validator distinct from :func:`_validate_package`:
+    manufacturer and category names legitimately contain spaces and can exceed
+    20 characters, so the strict package charset cannot be reused. The value is
+    always bound as a Dgraph ``$``-variable (never inlined), so this is a
+    usability + DoS guard rather than an injection guard — it rejects an
+    empty/whitespace-only term and caps the length at :data:`_MAX_FILTER_TERM_LEN`
+    (defence-in-depth bound, ADR-0016 / ADR-0007 style).
+
+    Args:
+        value: The raw filter term (bound verbatim; never uppercased/stripped).
+        field: Human-readable field name used in the raised message.
+
+    Raises:
+        ValueError: If *value* is empty/whitespace-only or exceeds the length cap.
+    """
+    if not value.strip():
+        raise ValueError(f"{field} filter must be a non-empty value.")
+    if len(value) > _MAX_FILTER_TERM_LEN:
+        raise ValueError(
+            f"{field} filter must be at most {_MAX_FILTER_TERM_LEN} characters."
+        )
+    return value
 
 
 def _param_filter_terms(parsed: ParsedQuery) -> list[str]:
@@ -150,23 +239,139 @@ def _param_filter_terms(parsed: ParsedQuery) -> list[str]:
     return terms
 
 
-def _render_fields(indent: str, *, has_package: bool, package_var: str) -> str:
-    """Return the shared selection set rendered for every search block."""
-    lines = [
-        f"{indent}uid",
-        f"{indent}mpn",
-        f"{indent}mpn_norm",
-        f"{indent}stock",
-        f"{indent}is_basic",
-    ]
+def _scalar_filter_terms(
+    *,
+    min_stock: int | None,
+    is_basic: bool | None,
+    max_price: float | None,
+) -> list[str]:
+    """Return the root-level scalar filter terms for the structured filters.
+
+    Each term is an injection-safe literal added to the block ``@filter`` clause
+    (ADR-0016):
+    - ``min_stock`` -> ``ge(stock, <int>)`` via :func:`_fmt_int` (integer literal;
+      ``--in-stock`` is threaded as ``min_stock=1``).
+    - ``is_basic`` -> the fixed boolean literal ``eq(is_basic, true|false)``
+      (tri-state: ``None`` omits the term entirely).
+    - ``max_price`` -> ``le(price_usd, <float>)`` via :func:`_fmt_float`.
+
+    Raises:
+        ValueError: If ``min_stock`` is not a whole, non-negative integer, or if
+            ``max_price`` cannot be formatted as a safe float literal.
+    """
+    terms: list[str] = []
+    if min_stock is not None:
+        terms.append(f"ge(stock, {_fmt_int(min_stock)})")
+    if is_basic is not None:
+        terms.append(f"eq(is_basic, {'true' if is_basic else 'false'})")
+    if max_price is not None:
+        terms.append(f"le(price_usd, {_fmt_float(max_price)})")
+    return terms
+
+
+def _render_fields(  # noqa: PLR0913 — keyword-only selection descriptor; cohesive
+    indent: str,
+    *,
+    has_package: bool,
+    package_var: str,
+    has_manufacturer: bool = False,
+    manufacturer_var: str = "$mfr",
+    has_category: bool = False,
+    category_var: str = "$cat",
+) -> str:
+    """Return the shared selection set rendered for every search block.
+
+    ``made_by`` is *always* selected; it gains an ``@filter(allofterms(name,
+    $mfr))`` clause only when a manufacturer filter is active (plain
+    ``made_by { name }`` otherwise). ``in_category`` is *conditionally* selected —
+    present only when a category filter is active (mirroring the ``in_package``
+    conditional pattern). ``in_package`` gains its ``@filter(eq(name, $pkg))`` when
+    a package filter is active, plain otherwise.
+
+    Layout (ADR-0016): when a manufacturer/category filter is active the
+    *constrained* edges are grouped at the FRONT of the selection (order:
+    ``in_package``, ``made_by``, ``in_category``) so the active constraints lead
+    the block; any unconstrained edge keeps its trailing position. A query with
+    NO manufacturer/category filter (the no-filter and package-only paths) keeps
+    the historical trailing layout, so its output stays byte-identical to the
+    pre-filter builder (three guard tests pin this).
+    """
+
+    def made_by_line() -> str:
+        if has_manufacturer:
+            return f"{indent}made_by @filter(allofterms(name, {manufacturer_var})) {{ name }}"
+        return f"{indent}made_by {{ name }}"
+
+    def in_category_line() -> str:
+        return f"{indent}in_category @filter(allofterms(name, {category_var})) {{ name }}"
+
+    def in_package_line() -> str:
+        if has_package:
+            return f"{indent}in_package @filter(eq(name, {package_var})) {{ name }}"
+        return f"{indent}in_package {{ name }}"
+
+    # The manufacturer/category filters are the PR1 additions; their presence
+    # switches on the leading-constraints layout. Package alone keeps the
+    # historical trailing layout for byte-compat.
+    lead_with_constraints = has_manufacturer or has_category
+
+    lines: list[str] = []
+    if lead_with_constraints:
+        if has_package:
+            lines.append(in_package_line())
+        if has_manufacturer:
+            lines.append(made_by_line())
+        if has_category:
+            lines.append(in_category_line())
+
+    lines.extend(
+        [
+            f"{indent}uid",
+            f"{indent}mpn",
+            f"{indent}mpn_norm",
+            f"{indent}stock",
+            f"{indent}is_basic",
+        ]
+    )
     lines.extend(f"{indent}{pred}" for pred in _PROMOTED_PREDICATES)
-    lines.append(f"{indent}made_by {{ name }}")
-    if has_package:
-        lines.append(f"{indent}in_package @filter(eq(name, {package_var})) {{ name }}")
+
+    if lead_with_constraints:
+        # Only the unconstrained edges remain for the trailing section; the
+        # constrained ones were already emitted in the leading group.
+        if not has_manufacturer:
+            lines.append(made_by_line())
+        if not has_package:
+            lines.append(in_package_line())
     else:
-        lines.append(f"{indent}in_package {{ name }}")
+        # Historical (pre-PR1) trailing layout — byte-identical output.
+        lines.append(made_by_line())
+        lines.append(in_package_line())
+
     lines.append(f"{indent}datasheet {{ url }}")
     return "\n".join(lines)
+
+
+def _cascade_clause(
+    *, has_package: bool, has_manufacturer: bool, has_category: bool
+) -> str:
+    """Return the ``@cascade(...)`` clause covering the active edge filters.
+
+    ``@cascade`` drops parts whose listed edge prunes to empty, so each active
+    edge filter (package / manufacturer / category) acts as a real constraint
+    without inlining its value. The cascade is scoped to exactly the filtered
+    edges so unrelated optional edges (an unfiltered made_by / datasheet) never
+    additionally prune otherwise-matching parts. Only ``in_package`` is present
+    when just a package filter is active, keeping the no-extra-filter query
+    byte-identical to the pre-filter output (ADR-0016).
+    """
+    names: list[str] = []
+    if has_package:
+        names.append("in_package")
+    if has_manufacturer:
+        names.append("made_by")
+    if has_category:
+        names.append("in_category")
+    return f" @cascade({', '.join(names)})" if names else ""
 
 
 def _build_block(  # noqa: PLR0913 — keyword-only block descriptor; cohesive unit
@@ -174,8 +379,13 @@ def _build_block(  # noqa: PLR0913 — keyword-only block descriptor; cohesive u
     name: str,
     text_term: str | None,
     param_terms: list[str],
+    scalar_terms: list[str],
     has_package: bool,
     package_var: str,
+    has_manufacturer: bool,
+    manufacturer_var: str,
+    has_category: bool,
+    category_var: str,
     first: int,
 ) -> str:
     """Render a single named search block.
@@ -187,14 +397,21 @@ def _build_block(  # noqa: PLR0913 — keyword-only block descriptor; cohesive u
             ``"regexp(mpn_norm, $rx)"`` / ``"anyoftext(description, $ft)"``), or
             ``None`` to root on the parametric filter only.
         param_terms: Parametric filter terms (float literals).
+        scalar_terms: Structured scalar filter terms (``ge(stock, N)`` /
+            ``eq(is_basic, ...)`` / ``le(price_usd, ...)``); empty when none.
         has_package: Whether a package filter should be applied.
         package_var: The ``$``-variable holding the package name.
+        has_manufacturer: Whether a manufacturer filter should be applied.
+        manufacturer_var: The ``$``-variable holding the manufacturer term.
+        has_category: Whether a category filter should be applied.
+        category_var: The ``$``-variable holding the category term.
         first: The (already clamped) row cap for this block.
     """
     filter_terms: list[str] = []
     if text_term is not None:
         filter_terms.append(text_term)
     filter_terms.extend(param_terms)
+    filter_terms.extend(scalar_terms)
     # A search hit is only useful when it is datasheet-backed: require at least
     # one datasheet edge so every surfaced row carries a datasheet URL.
     filter_terms.append("has(datasheet)")
@@ -203,13 +420,21 @@ def _build_block(  # noqa: PLR0913 — keyword-only block descriptor; cohesive u
     if filter_terms:
         filter_clause = " @filter(" + " AND ".join(filter_terms) + ")"
 
-    # @cascade(in_package) drops parts whose in_package filter prunes to empty,
-    # so the package acts as a real constraint without inlining its value. The
-    # cascade is scoped to in_package so unrelated optional edges (made_by /
-    # datasheet) do not additionally prune otherwise-matching parts.
-    cascade = " @cascade(in_package)" if has_package else ""
+    cascade = _cascade_clause(
+        has_package=has_package,
+        has_manufacturer=has_manufacturer,
+        has_category=has_category,
+    )
 
-    body = _render_fields("    ", has_package=has_package, package_var=package_var)
+    body = _render_fields(
+        "    ",
+        has_package=has_package,
+        package_var=package_var,
+        has_manufacturer=has_manufacturer,
+        manufacturer_var=manufacturer_var,
+        has_category=has_category,
+        category_var=category_var,
+    )
     return (
         f"  {name}(func: type(Part), first: {first}){filter_clause}{cascade} {{\n"
         f"{body}\n"
@@ -217,34 +442,82 @@ def _build_block(  # noqa: PLR0913 — keyword-only block descriptor; cohesive u
     )
 
 
-def build_search_dql(
+def build_search_dql(  # noqa: PLR0913, PLR0915 — keyword-only structured filters
     parsed: ParsedQuery,
     *,
     limit: int = 20,
+    manufacturer: str | None = None,
+    package: str | None = None,
+    category: str | None = None,
+    min_stock: int | None = None,
+    is_basic: bool | None = None,
+    max_price: float | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Build the multi-block search DQL and its variable map.
 
     Returns ``(query_text, variables)``. The query declares typed ``string``
-    variables for every text token and (when present) the package; numeric
-    bounds are inline float literals. The per-block ``first:`` cap is clamped to
-    ``MAX_RESULT_LIMIT`` (ADR-0007).
+    variables for every text token and (when present) the package / manufacturer
+    / category filter terms; numeric bounds are inline float literals. The
+    per-block ``first:`` cap is clamped to ``MAX_RESULT_LIMIT`` (ADR-0007).
+
+    All structured-filter keyword arguments default to *off*, so a call with none
+    of them is byte-identical to the pre-filter output (ADR-0016, backward
+    compatible). Each active filter AND-composes into the SAME block ``@filter``/
+    nested-edge/``@cascade`` clause (ADR-0016):
+
+    Args:
+        manufacturer: Manufacturer name -> ``made_by @filter(allofterms(name,
+            $mfr))`` (case-insensitive recall; bound as ``$mfr``, never inlined).
+        package: Package code -> ``in_package @filter(eq(name, $pkg))``. Shares
+            ONE rendering path with the query-derived ``parsed.package`` (the two
+            are byte-identical). The caller must upper-case before passing;
+            re-validated against the package charset here.
+        category: Category name -> ``in_category @filter(allofterms(name,
+            $cat))`` (bound as ``$cat``, never inlined).
+        min_stock: Minimum stock -> ``ge(stock, <int>)`` (integer literal).
+        is_basic: Tri-state basic/extended flag -> ``eq(is_basic, true|false)``
+            (fixed literal; ``None`` omits the term).
+        max_price: Price ceiling (USD) -> ``le(price_usd, <float>)``.
 
     Raises:
-        ValueError: If a package code fails the injection-guard regex.
+        ValueError: If a package code fails the injection-guard regex, if a
+            manufacturer/category term is empty/whitespace-only or over the length
+            cap, or if ``min_stock`` is not a whole non-negative integer.
     """
     first = max(1, min(int(limit), MAX_RESULT_LIMIT))
 
     variables: dict[str, str] = {}
     var_decls: list[str] = []
 
-    has_package = parsed.package is not None
+    # Package: the NEW package= kwarg and the query-derived parsed.package share
+    # ONE rendering path (AC-SF-4 requires byte-identical output). The explicit
+    # kwarg wins when both are set; the CLI already rejects that collision, so in
+    # practice at most one is ever present.
+    effective_package = package if package is not None else parsed.package
+    has_package = effective_package is not None
     package_var = "$pkg"
-    if has_package:
-        validated = _validate_package(parsed.package)  # type: ignore[arg-type]
-        variables[package_var] = validated
+    if effective_package is not None:
+        variables[package_var] = _validate_package(effective_package)
         var_decls.append(f"{package_var}: string")
 
+    has_manufacturer = manufacturer is not None
+    manufacturer_var = "$mfr"
+    if manufacturer is not None:
+        variables[manufacturer_var] = _validate_filter_term(
+            manufacturer, field="manufacturer"
+        )
+        var_decls.append(f"{manufacturer_var}: string")
+
+    has_category = category is not None
+    category_var = "$cat"
+    if category is not None:
+        variables[category_var] = _validate_filter_term(category, field="category")
+        var_decls.append(f"{category_var}: string")
+
     param_terms = _param_filter_terms(parsed)
+    scalar_terms = _scalar_filter_terms(
+        min_stock=min_stock, is_basic=is_basic, max_price=max_price
+    )
 
     # Text tokens drive the exact / trig / fts blocks. ``mpn_norm`` is stored
     # normalised (uppercase [A-Z0-9]), so the token is normalised the same way
@@ -278,54 +551,34 @@ def build_search_dql(
         var_decls.append("$ft: string")
         fts_term = "anyoftext(description, $ft)"
 
+    def _mk_block(name: str, text_term: str | None) -> str:
+        """Render one block, threading the shared filter descriptor for this call."""
+        return _build_block(
+            name=name,
+            text_term=text_term,
+            param_terms=param_terms,
+            scalar_terms=scalar_terms,
+            has_package=has_package,
+            package_var=package_var,
+            has_manufacturer=has_manufacturer,
+            manufacturer_var=manufacturer_var,
+            has_category=has_category,
+            category_var=category_var,
+            first=first,
+        )
+
     blocks: list[str] = []
     if text_tokens:
-        blocks.append(
-            _build_block(
-                name="exact",
-                text_term=exact_term,
-                param_terms=param_terms,
-                has_package=has_package,
-                package_var=package_var,
-                first=first,
-            )
-        )
-        blocks.append(
-            _build_block(
-                name="trig",
-                text_term=trig_term,
-                param_terms=param_terms,
-                has_package=has_package,
-                package_var=package_var,
-                first=first,
-            )
-        )
-        blocks.append(
-            _build_block(
-                name="fts",
-                text_term=fts_term,
-                param_terms=param_terms,
-                has_package=has_package,
-                package_var=package_var,
-                first=first,
-            )
-        )
+        blocks.append(_mk_block("exact", exact_term))
+        blocks.append(_mk_block("trig", trig_term))
+        blocks.append(_mk_block("fts", fts_term))
     else:
         # No free text: a single parametric/package block under the "exact" name
         # so rank_results treats these rows as the top tier. No trig/fts blocks
         # are emitted (rank_results tolerates their absence); emitting an
         # ``eq(mpn_norm, "")`` placeholder would wrongly match parts with an
         # empty mpn_norm and pollute the results with a blank row.
-        blocks.append(
-            _build_block(
-                name="exact",
-                text_term=None,
-                param_terms=param_terms,
-                has_package=has_package,
-                package_var=package_var,
-                first=first,
-            )
-        )
+        blocks.append(_mk_block("exact", None))
 
     header = ""
     if var_decls:
@@ -335,11 +588,16 @@ def build_search_dql(
     return query_text, variables
 
 
-def build_semantic_dql(
+def build_semantic_dql(  # noqa: PLR0913 — keyword-only structured-filter kwargs
     vector: list[float],
     k: int,
     *,
     parsed: ParsedQuery | None = None,
+    manufacturer: str | None = None,
+    category: str | None = None,
+    min_stock: int | None = None,
+    is_basic: bool | None = None,
+    max_price: float | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Build the semantic (vector-similarity) search DQL and its variable map.
 
@@ -363,15 +621,33 @@ def build_semantic_dql(
     DoS (ADR-0007): ``k`` is clamped to ``[1, MAX_RESULT_LIMIT]`` so a single
     request can never ask Dgraph for an unbounded neighbour set.
 
+    The structured-filter keyword arguments (``manufacturer``/``category``/
+    ``min_stock``/``is_basic``/``max_price``) compose EXACTLY as they do for
+    :func:`build_search_dql`, extending the SAME ``similar_to(...)`` block's
+    ``@filter``/nested-edge/``@cascade`` clause — never a Python post-filter — so
+    the lexical and semantic paths share one filter contract (ADR-0016). Package
+    for the hybrid query is supplied via ``parsed.package`` (there is no separate
+    ``package`` kwarg here).
+
     Args:
         vector: The query embedding; must be length :data:`EMBED_DIM` (384).
         k: Requested number of nearest neighbours (clamped to the DoS bound).
         parsed: Optional parsed query supplying hybrid package / parametric
             filters layered on top of the vector search.
+        manufacturer: Manufacturer name -> ``made_by @filter(allofterms(name,
+            $mfr))`` (bound as ``$mfr``, never inlined).
+        category: Category name -> ``in_category @filter(allofterms(name,
+            $cat))`` (bound as ``$cat``, never inlined).
+        min_stock: Minimum stock -> ``ge(stock, <int>)`` (integer literal).
+        is_basic: Tri-state basic/extended flag -> ``eq(is_basic, true|false)``
+            (fixed literal; ``None`` omits the term).
+        max_price: Price ceiling (USD) -> ``le(price_usd, <float>)``.
 
     Raises:
         ValueError: If *vector* is not length 384, if any element is not a finite
-            float literal, or if a package code fails the injection-guard regex.
+            float literal, if a package code fails the injection-guard regex, if a
+            manufacturer/category term is empty/whitespace-only or over the length
+            cap, or if ``min_stock`` is not a whole non-negative integer.
         TypeError: If an element cannot be coerced to ``float``.
     """
     if len(vector) != EMBED_DIM:
@@ -394,26 +670,55 @@ def build_semantic_dql(
 
     has_package = parsed is not None and parsed.package is not None
     package_var = "$pkg"
-    if has_package:
-        validated = _validate_package(parsed.package)  # type: ignore[arg-type,union-attr]
-        variables[package_var] = validated
+    if parsed is not None and parsed.package is not None:
+        variables[package_var] = _validate_package(parsed.package)
         var_decls.append(f"{package_var}: string")
+
+    has_manufacturer = manufacturer is not None
+    manufacturer_var = "$mfr"
+    if manufacturer is not None:
+        variables[manufacturer_var] = _validate_filter_term(
+            manufacturer, field="manufacturer"
+        )
+        var_decls.append(f"{manufacturer_var}: string")
+
+    has_category = category is not None
+    category_var = "$cat"
+    if category is not None:
+        variables[category_var] = _validate_filter_term(category, field="category")
+        var_decls.append(f"{category_var}: string")
 
     # Hybrid parametric filters (float literals — injection-safe, ADR-PARAM).
     param_terms = _param_filter_terms(parsed) if parsed is not None else []
+    # Structured scalar filters compose exactly as in build_search_dql (ADR-0016).
+    scalar_terms = _scalar_filter_terms(
+        min_stock=min_stock, is_basic=is_basic, max_price=max_price
+    )
 
     filter_terms: list[str] = list(param_terms)
+    filter_terms.extend(scalar_terms)
     # A semantic hit is only useful when datasheet-backed (same as PR3 blocks).
     filter_terms.append("has(datasheet)")
 
     filter_clause = " @filter(" + " AND ".join(filter_terms) + ")"
-    # When a package is present, _render_fields emits
-    # ``in_package @filter(eq(name, $pkg))`` and the cascade prunes parts whose
-    # package filter is empty — so the package acts as a real constraint without
-    # inlining its value (mirrors the PR3 search blocks).
-    cascade = " @cascade(in_package)" if has_package else ""
+    # Each active edge filter (package / manufacturer / category) is @cascade-d so
+    # a part whose filtered edge prunes to empty is dropped — the filter acts as a
+    # real constraint without inlining its value (mirrors the PR3 search blocks).
+    cascade = _cascade_clause(
+        has_package=has_package,
+        has_manufacturer=has_manufacturer,
+        has_category=has_category,
+    )
 
-    body = _render_fields("    ", has_package=has_package, package_var=package_var)
+    body = _render_fields(
+        "    ",
+        has_package=has_package,
+        package_var=package_var,
+        has_manufacturer=has_manufacturer,
+        manufacturer_var=manufacturer_var,
+        has_category=has_category,
+        category_var=category_var,
+    )
 
     header = ""
     if var_decls:
