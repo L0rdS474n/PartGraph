@@ -84,6 +84,15 @@ lcsc_id:        string @index(exact) .
 # without one (same index-free precedent as `verified_at`).
 stock_checked_at: datetime .
 
+# sha256 hex digest of the text that produced a part's `embedding`. `embed_write`
+# stamps it alongside the vector; `partgraph embed --changed` reads it back and
+# compares it CLIENT-SIDE (in Python) against a freshly computed hash to detect a
+# changed source text without a full re-embed (issue #11 PR 4 / ADR-0015). No
+# @index and no @upsert: it is never filtered/looked up by hash VALUE in DQL —
+# only read and compared — mirroring the index-free precedent of stock_checked_at
+# and verified_at.
+embed_text_hash: string .
+
 # Provenance markers, e.g. "jlcparts@2026-06-11".
 source_refs:    [string] .
 
@@ -132,6 +141,7 @@ type Part {
     price_usd
     lcsc_id
     stock_checked_at
+    embed_text_hash
     source_refs
     made_by
     in_category

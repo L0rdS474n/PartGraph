@@ -9,7 +9,11 @@ Specifies the behaviour of:
 
 Design decisions pinned by PR4 plan:
   - Embed source of truth: GRAPH — write embedding by uid only.
-  - embed_write payload keys MUST be exactly {"uid", "embedding"} subset.
+  - embed_write payload keys MUST be exactly {"uid", "embedding",
+    "embed_text_hash"} subset (ADR-0015: embed_text_hash is the sha256 hex
+    digest of the text that produced the embedding — see
+    compute_embed_text_hash — so a later `embed --changed` run can detect a
+    changed source text without a full re-embed; issue #11 PR 4).
   - xid-absent parts are skipped silently.
   - sentence-transformers is an OPTIONAL extra [embed]; must NOT be imported at
     module level. Unit tests MOCK the encoder; they must pass even when
@@ -25,7 +29,9 @@ does not exist yet. That is the correct red state before PR4 implementation.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import sys
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -346,13 +352,19 @@ def _build_uid_lookup_response(parts: list[SimpleNamespace]) -> dict:
 def test_ac_ew_1_payload_keys_only_uid_and_embedding() -> None:
     """AC-EW-1: Given parts with full data.
     When embed_write is called with a fake encoder.
-    Then every mutate payload object has ONLY keys from {"uid", "embedding"}
-    — no mpn, description, made_by, stock, dgraph.type, xid or any other field.
+    Then every mutate payload object has ONLY keys from {"uid", "embedding",
+    "embed_text_hash"} — no mpn, description, made_by, stock, dgraph.type,
+    xid or any other field (ADR-0015: embed_text_hash is the sha256 hex
+    digest of the text that produced the embedding).
     """
     parts = _make_parts_with_uids(2)
     uid_resp = _build_uid_lookup_response(parts)
     mock_txn = _build_mock_txn(uid_response=uid_resp)
     mock_client = _build_mock_client(mock_txn)
+    oracle_hashes = {
+        part.uid: hashlib.sha256(build_embed_text(part).encode("utf-8")).hexdigest()
+        for part in parts
+    }
 
     embed_write(
         iter(parts),
@@ -364,6 +376,7 @@ def test_ac_ew_1_payload_keys_only_uid_and_embedding() -> None:
     mutate_calls = mock_txn.mutate.call_args_list
     assert mutate_calls, "embed_write must call mutate() at least once."
 
+    seen_uids: set[str] = set()
     for call_obj in mutate_calls:
         _, kwargs = call_obj
         set_obj = kwargs.get("set_obj")
@@ -378,11 +391,28 @@ def test_ac_ew_1_payload_keys_only_uid_and_embedding() -> None:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            extra_keys = set(item.keys()) - {"uid", "embedding"}
+            extra_keys = set(item.keys()) - {"uid", "embedding", "embed_text_hash"}
             assert not extra_keys, (
-                f"AC-EW-1: embed payload must ONLY have 'uid' and 'embedding'. "
-                f"Found extra keys: {extra_keys!r} in item: {item!r}"
+                f"AC-EW-1: embed payload must ONLY have 'uid', 'embedding' and "
+                f"'embed_text_hash'. Found extra keys: {extra_keys!r} in item: {item!r}"
             )
+            assert "embed_text_hash" in item, (
+                f"AC-EW-1 (ADR-0015): embed payload must carry 'embed_text_hash'. "
+                f"Item: {item!r}"
+            )
+            uid = item.get("uid")
+            if uid in oracle_hashes:
+                assert item["embed_text_hash"] == oracle_hashes[uid], (
+                    f"AC-EW-1: embed_text_hash for uid {uid!r} must equal the "
+                    f"sha256 oracle of its build_embed_text. Expected "
+                    f"{oracle_hashes[uid]!r}, got {item['embed_text_hash']!r}"
+                )
+                seen_uids.add(uid)
+
+    assert seen_uids == {part.uid for part in parts}, (
+        f"AC-EW-1: every part's uid must appear with a verified embed_text_hash. "
+        f"Expected {sorted(p.uid for p in parts)!r}, got {sorted(seen_uids)!r}"
+    )
 
 
 def test_ac_ew_2_upsert_resolves_existing_uid_by_xid_absent_skipped() -> None:
@@ -453,8 +483,9 @@ def test_ac_ew_2_upsert_resolves_existing_uid_by_xid_absent_skipped() -> None:
 def test_ac_ew_3_extra_fields_on_part_still_only_uid_and_embedding_written() -> None:
     """AC-EW-3: Given a part with many extra fields (mpn, stock, etc.).
     When embed_write is called.
-    Then the mutation payload still only contains uid+embedding.
-    (Regression guard: extra fields from the graph read must not pollute writes.)
+    Then the mutation payload still only contains uid+embedding+embed_text_hash
+    (ADR-0015). (Regression guard: extra fields from the graph read must not
+    pollute writes.)
     """
     rich_part = SimpleNamespace(
         uid="0xBEEF",
@@ -470,6 +501,7 @@ def test_ac_ew_3_extra_fields_on_part_still_only_uid_and_embedding_written() -> 
         made_by=[{"name": "RichMfr"}],
         dgraph_type="Part",
     )
+    oracle_hash = hashlib.sha256(build_embed_text(rich_part).encode("utf-8")).hexdigest()
 
     uid_resp = {"q": [{"uid": "0xBEEF", "xid": "RICH|TESTMFR"}]}
     mock_txn = _build_mock_txn(uid_response=uid_resp)
@@ -485,6 +517,7 @@ def test_ac_ew_3_extra_fields_on_part_still_only_uid_and_embedding_written() -> 
     mutate_calls = mock_txn.mutate.call_args_list
     assert mutate_calls, "embed_write must call mutate for a part with a resolved uid."
 
+    seen = False
     for call_obj in mutate_calls:
         _, kwargs = call_obj
         set_obj = kwargs.get("set_obj")
@@ -498,11 +531,24 @@ def test_ac_ew_3_extra_fields_on_part_still_only_uid_and_embedding_written() -> 
             items = set_obj if isinstance(set_obj, list) else [set_obj]
             for item in items:
                 if isinstance(item, dict):
-                    extra_keys = set(item.keys()) - {"uid", "embedding"}
+                    extra_keys = set(item.keys()) - {"uid", "embedding", "embed_text_hash"}
                     assert not extra_keys, (
-                        f"AC-EW-3: payload must ONLY have uid+embedding regardless of rich "
-                        f"part data. Extra keys: {extra_keys!r}"
+                        f"AC-EW-3: payload must ONLY have uid+embedding+embed_text_hash "
+                        f"regardless of rich part data. Extra keys: {extra_keys!r}"
                     )
+                    assert "embed_text_hash" in item, (
+                        f"AC-EW-3 (ADR-0015): payload must carry 'embed_text_hash' "
+                        f"even for a rich part. Item: {item!r}"
+                    )
+                    if item.get("uid") == "0xBEEF":
+                        assert item["embed_text_hash"] == oracle_hash, (
+                            f"AC-EW-3: embed_text_hash must equal the sha256 oracle "
+                            f"of build_embed_text(rich_part). Expected {oracle_hash!r}, "
+                            f"got {item['embed_text_hash']!r}"
+                        )
+                        seen = True
+
+    assert seen, "AC-EW-3: expected a mutation item for uid 0xBEEF."
 
 
 def test_ac_ew_4_empty_embed_text_skipped_no_mutation_for_it() -> None:
@@ -690,3 +736,122 @@ def test_ac_im_2_import_embed_module_does_not_import_sentence_transformers() -> 
         "AC-IM-2: importing partgraph.embed must NOT import sentence_transformers. "
         "Use lazy import inside get_encoder() only."
     )
+
+
+# ===========================================================================
+# AC-RE: incremental re-embedding (issue #11, PR 4; ADR-0015)
+#
+# compute_embed_text_hash(text) -> str is a NEW shared helper that does not
+# exist yet: sha256(text.encode("utf-8")).hexdigest() (64-char lowercase
+# hex). embed_write's payload is EXTENDED from {uid, embedding} to EXACTLY
+# {uid, embedding, embed_text_hash} (see the updated AC-EW-1/AC-EW-3 pins
+# above). compute_embed_text_hash is imported LOCALLY inside the one test
+# that needs it (not at module level) so a missing symbol fails that single
+# test at run time rather than erroring collection of this whole file.
+# ===========================================================================
+
+def test_ac_re_1_compute_embed_text_hash_matches_sha256_oracle_deterministic() -> None:
+    """AC-RE-1: Given two fixed embed-text strings (one repeated, one distinct).
+    When compute_embed_text_hash(text) is called.
+    Then the result equals hashlib.sha256(text.encode("utf-8")).hexdigest()
+    exactly for each text, is a 64-char lowercase-hex string, is
+    byte-identical across repeated calls on identical text, and differs for
+    differing text.
+    """
+    from partgraph.embed import compute_embed_text_hash  # noqa: PLC0415
+
+    text_a = "USB to RS-232 level converter Interface IC DIP-16"
+    text_b = "Linear voltage regulator Power IC SOT-23"
+
+    hash_a1 = compute_embed_text_hash(text_a)
+    hash_a2 = compute_embed_text_hash(text_a)
+    hash_b = compute_embed_text_hash(text_b)
+
+    oracle_a = hashlib.sha256(text_a.encode("utf-8")).hexdigest()
+    oracle_b = hashlib.sha256(text_b.encode("utf-8")).hexdigest()
+
+    assert hash_a1 == oracle_a, (
+        f"AC-RE-1: compute_embed_text_hash must equal the sha256 hexdigest "
+        f"oracle. Expected {oracle_a!r}, got {hash_a1!r}"
+    )
+    assert hash_b == oracle_b, (
+        f"AC-RE-1: compute_embed_text_hash must equal the sha256 hexdigest "
+        f"oracle for a different text. Expected {oracle_b!r}, got {hash_b!r}"
+    )
+    assert isinstance(hash_a1, str) and len(hash_a1) == 64, (
+        f"AC-RE-1: hash must be a 64-char string. Got: {hash_a1!r} (len={len(hash_a1)})"
+    )
+    assert re.fullmatch(r"[0-9a-f]{64}", hash_a1), (
+        f"AC-RE-1: hash must be lowercase hex only. Got: {hash_a1!r}"
+    )
+    assert hash_a1 == hash_a2, (
+        f"AC-RE-1: identical text must yield an identical hash. "
+        f"Got {hash_a1!r} vs {hash_a2!r}"
+    )
+    assert hash_a1 != hash_b, (
+        f"AC-RE-1: differing text must yield a differing hash. "
+        f"Got {hash_a1!r} == {hash_b!r} for different inputs."
+    )
+
+
+def test_ac_re_2_case_i_no_embedding_payload_has_hash_matching_oracle_encoder_called_once() -> None:
+    """AC-RE-2 (D2 case i): Given a part with NO existing embedding (the
+    existing missing-pass scenario) and full descriptive data.
+    When embed_write is called with a counting fake encoder.
+    Then the mutate payload for that part is EXACTLY
+    {"uid", "embedding", "embed_text_hash"} — no other keys — the
+    embed_text_hash equals the sha256 oracle of build_embed_text(part), and
+    the encoder was called exactly once (a genuine embed, not a backfill).
+    """
+    call_count = [0]
+
+    def _counting_fake_encoder(texts: list[str]) -> list[list[float]]:
+        call_count[0] += 1
+        return [[0.0] * _EMBED_DIM for _ in texts]
+
+    part = _make_fake_part(
+        uid="0xC0FFEE",
+        xid="NOEMB|TESTMFR",
+        description="Precision op-amp",
+        category="Analog IC",
+        package="SOIC-8",
+        tags=["low-noise"],
+    )
+    expected_text = build_embed_text(part)
+    oracle_hash = hashlib.sha256(expected_text.encode("utf-8")).hexdigest()
+
+    uid_resp = {"q": [{"uid": "0xC0FFEE", "xid": "NOEMB|TESTMFR"}]}
+    mock_txn = _build_mock_txn(uid_response=uid_resp)
+    mock_client = _build_mock_client(mock_txn)
+
+    embed_write(
+        iter([part]),
+        mock_client,
+        encoder=_counting_fake_encoder,
+        sleep=MagicMock(),
+    )
+
+    assert call_count[0] == 1, (
+        f"AC-RE-2: the encoder must be called exactly once for a genuine "
+        f"(no-prior-embedding) embed. Got {call_count[0]} call(s)."
+    )
+
+    matching_items = []
+    for call_obj in mock_txn.mutate.call_args_list:
+        _, kwargs = call_obj
+        set_obj = kwargs.get("set_obj") or []
+        matching_items.extend(
+            item for item in set_obj
+            if isinstance(item, dict) and item.get("uid") == "0xC0FFEE"
+        )
+
+    assert matching_items, "AC-RE-2: no mutation item found for uid 0xC0FFEE."
+    for item in matching_items:
+        assert set(item.keys()) == {"uid", "embedding", "embed_text_hash"}, (
+            f"AC-RE-2: payload must be EXACTLY {{uid, embedding, "
+            f"embed_text_hash}}. Got keys: {set(item.keys())!r}"
+        )
+        assert item["embed_text_hash"] == oracle_hash, (
+            f"AC-RE-2: embed_text_hash must equal sha256(build_embed_text(part)). "
+            f"Expected {oracle_hash!r}, got {item['embed_text_hash']!r}"
+        )

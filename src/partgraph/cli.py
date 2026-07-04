@@ -1100,6 +1100,216 @@ def _embed_all_pages(
     return embedded_total
 
 
+# ---------------------------------------------------------------------------
+# embed --changed: incremental re-embedding reconcile pass (issue #11 PR 4;
+# ADR-0015). Walks the has(embedding) partition (disjoint from the missing
+# pass's NOT has(embedding) partition) and re-embeds only parts whose source
+# text drifted, backfilling content hashes for parts embedded before the hash
+# predicate existed. Reuses the embed section's uid-cursor primitives
+# (_UID_RE, _page_max_uid, _EMBED_SELECT_PAGE_SIZE, _EMBED_CURSOR_STALL) — same
+# pipeline — rather than copying them.
+# ---------------------------------------------------------------------------
+
+
+def _select_parts_for_reembed(
+    client, limit: int | None, *, after: str | None = None
+) -> list:
+    """Select one page of already-embedded Part nodes via a READ-ONLY query.
+
+    Mirrors :func:`_select_parts_for_embed` but roots on
+    ``@filter(has(embedding))`` (the complement partition — parts already
+    embedded) and additionally PROJECTS the stored ``embed_text_hash`` plus the
+    ``build_embed_text`` source fields. The reconcile pass recomputes each part's
+    embed text and its sha256 CLIENT-SIDE and compares that to the stored hash in
+    Python, so the query NEVER filters or looks up by a hash VALUE (no
+    ``eq(embed_text_hash, ...)`` and no hash literal in the query text — the
+    predicate is index-free by design; ADR-0015).
+
+    The transaction is ``read_only=True`` and always discarded — selection never
+    mutates. When *after* is a valid uid it is emitted as a keyset cursor
+    (``after: <uid>``); the first page (*after* is ``None``) omits it entirely.
+    An *after* value that fails :data:`_UID_RE` is dropped rather than
+    interpolated raw (validate-before-interpolate; the same guard, and the same
+    ``_UID_RE`` domain, as :func:`_select_parts_for_embed`).
+    """
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    first = limit if limit is not None else _EMBED_SELECT_PAGE_SIZE
+    first = max(1, min(int(first), _EMBED_SELECT_PAGE_SIZE))
+    # Validate-before-interpolate: only a well-formed uid may reach query text.
+    after_clause = f", after: {after}" if after is not None and _UID_RE.match(after) else ""
+    query = (
+        f"{{ q(func: type(Part), first: {first}{after_clause}) @filter(has(embedding)) {{ "
+        "uid embed_text_hash description "
+        "in_category { name } in_package { name } tagged { name } "
+        "} }"
+    )
+    data = _run_block_query(client, query, {})
+    parts = []
+    for raw in data.get("q", []) or []:
+        if not isinstance(raw, dict):
+            continue
+        category = (raw.get("in_category") or [{}])
+        package = (raw.get("in_package") or [{}])
+        tags = [
+            t.get("name")
+            for t in (raw.get("tagged") or [])
+            if isinstance(t, dict) and t.get("name")
+        ]
+        parts.append(
+            SimpleNamespace(
+                uid=raw.get("uid"),
+                embed_text_hash=raw.get("embed_text_hash"),
+                description=raw.get("description"),
+                category=category[0].get("name") if category else None,
+                package=package[0].get("name") if package else None,
+                tags=tags,
+            )
+        )
+    return parts
+
+
+def _reconcile_page(page_parts, client, *, encoder, controller) -> int:
+    """Dispatch one reconcile page across the ADR-0015 D2 cases and write it.
+
+    For each part carrying a valid uid the embed text is rebuilt and, when
+    non-empty (the empty-text precondition — skip in ANY hash state, checked
+    BEFORE the case split), its stored hash is compared CLIENT-SIDE against a
+    freshly computed one:
+
+    - no stored hash  -> case (ii):  backfill ``{uid, embed_text_hash}`` (no encoder).
+    - stored == fresh -> case (iii): skip (no mutate, no encoder).
+    - stored != fresh -> case (iv):  re-embed ``{uid, embedding, embed_text_hash}``.
+
+    Case (i) — a part with no embedding at all — is out of scope here: the
+    selection roots on ``has(embedding)`` and the existing missing pass owns it.
+    Both write paths live in :mod:`partgraph.embed` (:func:`stamp_hashes` /
+    :func:`reembed_write`), which write by the already-resolved uid directly (no
+    xid round-trip) — cli.py never mutates directly. Returns the number of rows
+    written (backfilled + re-embedded).
+    """
+    from partgraph.embed import (  # noqa: PLC0415
+        build_embed_text,
+        compute_embed_text_hash,
+        reembed_write,
+        stamp_hashes,
+    )
+
+    backfill: list[tuple[str, str]] = []  # (uid, text) — case (ii)
+    reembed: list[tuple[str, str]] = []   # (uid, text) — case (iv)
+    for part in page_parts:
+        uid = getattr(part, "uid", None)
+        if not isinstance(uid, str) or not _UID_RE.match(uid):
+            continue  # no resolvable uid -> cannot write back
+        text = build_embed_text(part)
+        if not text:
+            continue  # empty-text precondition: skip in ANY hash state
+        stored = getattr(part, "embed_text_hash", None)
+        if not isinstance(stored, str) or not stored:
+            backfill.append((uid, text))            # (ii)
+            continue
+        if stored == compute_embed_text_hash(text):
+            continue                                # (iii)
+        reembed.append((uid, text))                 # (iv)
+
+    written = 0
+    if backfill:
+        written += stamp_hashes(client, backfill)
+    if reembed:
+        written += reembed_write(reembed, client, encoder=encoder, controller=controller)
+    return written
+
+
+def _reembed_all_pages(
+    client,
+    *,
+    encoder,
+    controller,
+    remaining: int | None,
+    progress_bar,
+) -> int:
+    """Reconcile already-embedded parts across cursor-paged selection queries.
+
+    The reconcile pass of ``partgraph embed --changed``: it walks the
+    ``has(embedding)`` partition (disjoint from the missing pass's
+    ``NOT has(embedding)`` partition) under a uid keyset cursor and, per page,
+    dispatches the ADR-0015 D2 cases via :func:`_reconcile_page`.
+
+    ``remaining`` bounds the run exactly as in :func:`_embed_all_pages`: a finite
+    ``int`` caps it at that many rows; ``None`` means unbounded (drive to
+    exhaustion). The loop terminates on ANY of: (a) a zero-row page, (b) a page
+    yielding fewer rows than the next page could still consume, (c) a cursor that
+    fails to strictly advance (defensive guard — emits the path-free
+    :data:`_EMBED_CURSOR_STALL` notice), or (d) ``remaining`` reaching 0. The
+    cursor tracks the max uid *selected*, never the count written, so a full page
+    of case-(iii) skip rows still advances past its block.
+
+    Termination (b) compares the page yield against the NEXT page's target
+    (``min(remaining, PAGE_SIZE)`` after the countdown), not the current page's
+    request: a bounded run whose page exactly satisfies the shrinking budget must
+    not be mistaken for a short (end-of-data) page. For an unbounded run this
+    reduces to the plain "fewer rows than a full page" test. Memory is per-page:
+    each page is selected, reconciled and released before the next is fetched.
+
+    Returns the number of parts written (backfilled + re-embedded) across all
+    pages.
+    """
+    reembedded_total = 0
+    selected_total = 0
+    target_total = remaining
+    task = progress_bar.add_task("Reconciling embeddings", total=target_total)
+
+    last_uid: str | None = None  # uid keyset cursor; None on page 1.
+    while remaining is None or remaining > 0:
+        page_limit = (
+            _EMBED_SELECT_PAGE_SIZE
+            if remaining is None
+            else min(remaining, _EMBED_SELECT_PAGE_SIZE)
+        )
+        parts = _select_parts_for_reembed(client, page_limit, after=last_uid)
+        if not parts:
+            break  # (a) no more embedded rows match the filter.
+
+        page_size = len(parts)
+        # Cursor = the max uid SELECTED this page, never the count written: a
+        # full page of case-(iii) skip rows must still advance past its block.
+        page_max_uid = _page_max_uid(parts)
+
+        # (c) Defensive guard: after the first page the cursor MUST strictly
+        # advance numerically, or the server re-served rows we already handled.
+        if last_uid is not None and (
+            page_max_uid is None or int(page_max_uid, 16) <= int(last_uid, 16)
+        ):
+            _console.print(_EMBED_CURSOR_STALL)
+            break
+
+        reembedded_total += _reconcile_page(
+            parts, client, encoder=encoder, controller=controller,
+        )
+        selected_total += page_size
+        progress_bar.update(task, completed=selected_total)
+
+        if remaining is not None:
+            remaining -= page_size  # (d) bounded run: count each row exactly once.
+
+        # (b) Short page: fewer rows than the NEXT page could still consume.
+        page_budget = (
+            _EMBED_SELECT_PAGE_SIZE
+            if remaining is None
+            else min(remaining, _EMBED_SELECT_PAGE_SIZE)
+        )
+        if page_size < page_budget:
+            break
+
+        # Advance the cursor past this page. A page with no valid uid yields no
+        # cursor, so stop rather than re-fetch page 1 forever.
+        if page_max_uid is None:
+            break
+        last_uid = page_max_uid
+
+    return reembedded_total
+
+
 @app.command()
 def embed(
     limit: str | None = typer.Option(
@@ -1110,14 +1320,30 @@ def embed(
             "run embeds the whole catalogue). Must be a positive integer."
         ),
     ),
+    changed: bool = typer.Option(
+        False,
+        "--changed",
+        help=(
+            "Also reconcile already-embedded parts: re-embed parts whose source "
+            "text changed since they were last embedded and backfill missing "
+            "content hashes, BEFORE the usual missing-only pass (issue #11 PR 4)."
+        ),
+    ),
 ) -> None:
     """Generate semantic embeddings for parts and write them back to Dgraph.
 
     Reads parts read-only, builds an embedding text per part (description +
     category + package + tags), encodes them with the sentence-transformers
-    model and writes the embedding back by uid (uid+embedding payload only —
-    never a new node). This is a heavy, one-off run; embeddings persist in the
-    graph and power `partgraph search --semantic`.
+    model and writes the embedding back by uid (uid + embedding + content hash
+    payload only — never a new node). This is a heavy, one-off run; embeddings
+    persist in the graph and power `partgraph search --semantic`.
+
+    With ``--changed`` a reconcile pass runs FIRST over already-embedded parts
+    (issue #11 PR 4; ADR-0015): parts whose source text drifted since they were
+    embedded are re-embedded and parts missing a content hash are backfilled,
+    then the usual missing-only pass runs. The two passes cover the disjoint
+    ``has(embedding)`` / ``NOT has(embedding)`` partitions. Plain ``embed`` (no
+    ``--changed``) is unchanged: the missing-only pass alone.
 
     Requires the optional [embed] extra (pip install -e ".[embed]"). Errors are
     path-free: a missing extra or a stopped database exits 1 with a clear hint.
@@ -1152,12 +1378,14 @@ def embed(
 
     start = _time.monotonic()
     stub = None
+    reembedded_total = 0
     embedded_total = 0
     try:
         client, stub = _build_dgraph_client()
-        # None (no --limit) drives _embed_all_pages unbounded — to exhaustion
-        # over the whole eligible catalogue; a finite --limit N bounds it to N
-        # rows exactly, never re-capped at any default (ADR-0011).
+        # None (no --limit) drives the pages unbounded — to exhaustion over the
+        # whole eligible catalogue; a finite --limit N bounds each pass to N rows
+        # exactly, never re-capped at any default (ADR-0011). --changed runs the
+        # reconcile pass FIRST, then the (unchanged) missing pass (ADR-0015).
         remaining = parsed_limit
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -1166,6 +1394,14 @@ def embed(
             console=_console,
             transient=True,
         ) as progress_bar:
+            if changed:
+                reembedded_total = _reembed_all_pages(
+                    client,
+                    encoder=encoder,
+                    controller=controller,
+                    remaining=remaining,
+                    progress_bar=progress_bar,
+                )
             embedded_total = _embed_all_pages(
                 client,
                 encoder=encoder,
@@ -1185,6 +1421,10 @@ def embed(
             stub.close()
 
     elapsed = _time.monotonic() - start
+    if changed:
+        _console.print(
+            f"[green]Reconciled {reembedded_total} changed parts.[/green]"
+        )
     _console.print(
         f"[green]Embedded {embedded_total} parts in {elapsed:.1f}s.[/green]"
     )
