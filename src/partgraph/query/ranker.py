@@ -83,6 +83,8 @@ class RankedRow:
     datasheet_urls: list[str] = field(default_factory=list)
     stock: int | None = None
     is_basic: bool | None = None
+    price_usd: float | None = None
+    category: str | None = None
 
     # Promoted numeric predicates (None when absent on the node).
     voltage_min: float | None = None
@@ -98,6 +100,20 @@ class RankedRow:
     #: Summed parameter distance to the target (nearest pass only); None on the
     #: hard path.
     _distance: float | None = None
+
+    def params_dict(self) -> dict[str, float]:
+        """Return the sparse map of promoted numeric predicates present on the row.
+
+        Only predicates carrying a non-``None`` value are included (``{}`` when
+        none). This is the PUBLIC surface the JSON serializer sources its
+        ``params`` map from, so :mod:`partgraph.query.renderer` never needs to
+        import the module-private :data:`_PROMOTED_PREDICATES` tuple.
+        """
+        return {
+            pred: value
+            for pred in _PROMOTED_PREDICATES
+            if (value := getattr(self, pred)) is not None
+        }
 
 
 @dataclass
@@ -163,6 +179,11 @@ def _make_row(raw: dict, tier: str) -> RankedRow:
         datasheet_urls=_datasheet_urls(raw),
         stock=stock,
         is_basic=is_basic,
+        # price_usd==0.0 is a genuine (free) price, not absence: _coerce_float
+        # returns 0.0 for a present 0.0 and None only when the predicate is
+        # absent/non-numeric on the node.
+        price_usd=_coerce_float(raw.get("price_usd")),
+        category=_first_name(raw, "in_category"),
     )
     for pred in _PROMOTED_PREDICATES:
         if pred in raw:
@@ -189,13 +210,65 @@ def _distance_to_target(row: RankedRow, parsed: ParsedQuery) -> float:
     return total
 
 
-def rank_results(blocks: dict[str, list[dict]], parsed: ParsedQuery) -> RankedResults:
+def _relevance_key(row: RankedRow) -> tuple:
+    """Today's default order: tier desc, stock>0, is_basic, mpn_norm, uid.
+
+    This is the byte-identical historical ordering; ``sort="relevance"`` (and the
+    no-``sort``-argument default) both use it unchanged.
+    """
+    return (
+        -_TIER_SCORE[row.tier],
+        0 if _stock_value(row) > 0 else 1,
+        0 if row.is_basic else 1,
+        row.mpn_norm,
+        row.uid,
+    )
+
+
+def _stock_key(row: RankedRow) -> tuple:
+    """``sort="stock"``: stock DESC (``None`` -> 0, sorts last), then mpn_norm, uid.
+
+    Tier is deliberately NOT part of the key — a high-stock fulltext hit outranks
+    a low-stock exact hit under this sort.
+    """
+    return (-_stock_value(row), row.mpn_norm, row.uid)
+
+
+def _price_key(row: RankedRow) -> tuple:
+    """``sort="price"``: price_usd ASC, rows lacking a price LAST, then mpn_norm, uid.
+
+    ``price_usd == 0.0`` is a real (lowest) price, never conflated with a missing
+    price: only a ``None`` price_usd sorts into the trailing block.
+    """
+    missing = row.price_usd is None
+    return (1 if missing else 0, 0.0 if missing else row.price_usd, row.mpn_norm, row.uid)
+
+
+#: Ordering-key function per ``sort`` value (hard path only). Unknown values fall
+#: back to ``relevance`` — the CLI validates ``--sort`` before this is reached.
+_SORT_KEYS = {
+    "relevance": _relevance_key,
+    "stock": _stock_key,
+    "price": _price_key,
+}
+
+
+def rank_results(
+    blocks: dict[str, list[dict]],
+    parsed: ParsedQuery,
+    *,
+    sort: str = "relevance",
+) -> RankedResults:
     """Rank, deduplicate and order multi-block DQL results.
 
     Args:
         blocks: DQL response keyed by block name (``exact``/``trig``/``fts`` and
             optionally ``nearest``). Missing keys are treated as empty.
         parsed: The parsed query (drives nearest-pass distance sorting).
+        sort: The hard-path ordering — ``"relevance"`` (default; today's
+            tier/stock/is_basic/mpn_norm/uid order), ``"stock"`` (stock DESC) or
+            ``"price"`` (price_usd ASC, missing last). Ignored entirely in
+            nearest-match mode, where the parameter-distance order always wins.
 
     Returns:
         A :class:`RankedResults` with deduplicated, deterministically ordered
@@ -236,20 +309,15 @@ def rank_results(blocks: dict[str, list[dict]], parsed: ParsedQuery) -> RankedRe
 
     if nearest_match:
         # Relaxed pass: order purely by ascending parameter distance, with a
-        # deterministic tie-break on mpn_norm then uid.
+        # deterministic tie-break on mpn_norm then uid. ``sort`` is a no-op here —
+        # the parameter-distance order always wins (AC-SF-23).
         for row in rows:
             row._distance = _distance_to_target(row, parsed)
         rows.sort(key=lambda r: (r._distance, r.mpn_norm, r.uid))
     else:
-        # Hard path: tier desc, then stock>0, then is_basic, then mpn_norm, uid.
-        rows.sort(
-            key=lambda r: (
-                -_TIER_SCORE[r.tier],
-                0 if _stock_value(r) > 0 else 1,
-                0 if r.is_basic else 1,
-                r.mpn_norm,
-                r.uid,
-            )
-        )
+        # Hard path: order by the selected ``sort`` key. ``relevance`` is the
+        # byte-identical historical order; ``stock``/``price`` are in-memory
+        # re-orders only (no DQL change).
+        rows.sort(key=_SORT_KEYS.get(sort, _relevance_key))
 
     return RankedResults(rows=rows, nearest_match=nearest_match)

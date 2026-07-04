@@ -158,3 +158,5 @@ error), and checks the Part count is unchanged before/after.
 - **PR slicing.** This PR delivers the filters only (its body reads *Part of
   #15*). `--sort` and `--json` land in **PR 2**, which will *Close #15*. Keeping
   them separate keeps each PR single-objective and reviewable.
+  (`--sort`/`--json` are realized by PR 2 — see
+  [ADR-0017](ADR-0017-search-sort-and-json.md).)

@@ -682,12 +682,12 @@ def _validate_filter_text_flag(value: str | None, *, flag: str) -> None:
     """
     if value is None:
         return
-    from partgraph.query.dql_builder import _MAX_FILTER_TERM_LEN  # noqa: PLC0415
+    from partgraph.query.dql_builder import MAX_FILTER_TERM_LEN  # noqa: PLC0415
 
-    if not value.strip() or len(value) > _MAX_FILTER_TERM_LEN:
+    if not value.strip() or len(value) > MAX_FILTER_TERM_LEN:
         _err_console.print(
             f"[red]Error:[/red] {flag} must be a non-empty value of at most "
-            f"{_MAX_FILTER_TERM_LEN} characters."
+            f"{MAX_FILTER_TERM_LEN} characters."
         )
         raise typer.Exit(code=1)
 
@@ -775,17 +775,58 @@ def _validate_package_flag(package: str | None) -> str | None:
     """
     if package is None:
         return None
-    from partgraph.query.dql_builder import _validate_package  # noqa: PLC0415
+    from partgraph.query.dql_builder import validate_package  # noqa: PLC0415
 
     candidate = package.strip().upper()
     try:
-        return _validate_package(candidate)
+        return validate_package(candidate)
     except ValueError as exc:
         _err_console.print(
             "[red]Error:[/red] --package must be 1-20 characters of A-Z, 0-9 or "
             "'-' (e.g. SOIC-16)."
         )
         raise typer.Exit(code=1) from exc
+
+
+#: The three valid ``--sort`` keys, in help/error order. ``relevance`` is the
+#: default (today's tier/stock/is_basic order); ``stock`` is most-in-stock first;
+#: ``price`` is cheapest first.
+_VALID_SORT_KEYS: tuple[str, ...] = ("relevance", "stock", "price")
+
+
+def _validate_sort_flag(sort: str) -> str:
+    """Validate the ``--sort`` value against the fixed key set; return it unchanged.
+
+    ``--sort`` is a plain ``str`` option validated in OUR code (never a Typer
+    ``Enum``/``Literal``/``click.Choice``, which would make Click reject a bad
+    value with its generic exit-2 usage error). A value outside
+    :data:`_VALID_SORT_KEYS` emits the fixed, path-free error and exits 1 — the
+    same boundary contract as the other structured-filter flags (AC-SF-40 /
+    Sec MUST-1). Validated in the shared block BEFORE any Dgraph client is built.
+    """
+    if sort not in _VALID_SORT_KEYS:
+        _err_console.print(
+            "[red]Error:[/red] --sort must be one of: relevance, stock, price."
+        )
+        raise typer.Exit(code=1)
+    return sort
+
+
+def _emit_search_json(result, parsed) -> None:
+    """Serialise *result* to the machine-readable JSON envelope and write stdout.
+
+    Emits with the stdlib ``print``/``json.dumps`` — never Rich — so stdout
+    carries EXACTLY one JSON object with no markup, table, banner, footer or ANSI
+    (Arch MUST-3). Only ever called on the SUCCESS path: every error path prints a
+    fixed, path-free message to stderr and emits no JSON at all, so a machine
+    consumer never receives a half-JSON blob or a traceback (Sec MUST-2).
+    """
+    import json as _json  # noqa: PLC0415
+
+    from partgraph.query.renderer import render_search_results_json  # noqa: PLC0415
+
+    envelope = render_search_results_json(result, parsed)
+    print(_json.dumps(envelope, ensure_ascii=False))
 
 
 @app.command()
@@ -872,6 +913,25 @@ def search(  # noqa: PLR0913 — Typer command surface: one option per filter fl
             "non-negative number)."
         ),
     ),
+    sort: str = typer.Option(
+        "relevance",
+        "--sort",
+        help=(
+            "Order results: 'relevance' (default — best match first: tier, then "
+            "in-stock and basic parts), 'stock' (most in stock first) or 'price' "
+            "(cheapest first; parts with no price last). Ignored in nearest-match "
+            "mode, where parameter distance always wins."
+        ),
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help=(
+            "Output results as a single machine-readable JSON object (stable "
+            "keys, version 1, no internal uids) instead of the human table. "
+            "Errors still exit non-zero and print no JSON."
+        ),
+    ),
 ) -> None:
     """Search the component graph by MPN, parameters and package.
 
@@ -906,6 +966,7 @@ def search(  # noqa: PLR0913 — Typer command surface: one option per filter fl
     is_basic_val = _resolve_is_basic_flag(basic=basic, extended=extended)
     max_price_val = _validate_max_price_flag(max_price)
     package_flag = _validate_package_flag(package)
+    sort_key = _validate_sort_flag(sort)
 
     if semantic is not None:
         _run_semantic_search(
@@ -919,6 +980,8 @@ def search(  # noqa: PLR0913 — Typer command surface: one option per filter fl
             is_basic=is_basic_val,
             max_price=max_price_val,
             package_flag=package_flag,
+            sort=sort_key,
+            json_output=json_output,
         )
         return
 
@@ -960,7 +1023,7 @@ def search(  # noqa: PLR0913 — Typer command surface: one option per filter fl
         # Pass 1 (hard): full parametric + text filter + all structured filters.
         query_text, variables = build_search_dql(parsed, limit=limit, **filter_kwargs)
         data = _run_block_query(client, query_text, variables)
-        result = rank_results(data, parsed)
+        result = rank_results(data, parsed, sort=sort_key)
 
         if not result.rows and parsed.quantities:
             # Pass 2 (relaxed): drop parametric filters, keep text + package + the
@@ -996,7 +1059,9 @@ def search(  # noqa: PLR0913 — Typer command surface: one option per filter fl
                 "fts": data.get("fts", []) or [],
                 "nearest": nearest_rows,
             }
-            result = rank_results(merged, parsed)
+            # ``sort`` is threaded for consistency; rank_results ignores it in
+            # nearest-match mode (parameter-distance order always wins).
+            result = rank_results(merged, parsed, sort=sort_key)
     except typer.Exit:
         raise
     except Exception as exc:
@@ -1006,7 +1071,13 @@ def search(  # noqa: PLR0913 — Typer command surface: one option per filter fl
         if stub is not None:
             stub.close()
 
-    render_search_results(result, parsed, _console, no_truncate=no_truncate)
+    # Success path only: under --json emit exactly one JSON envelope (Arch
+    # MUST-3) — including the empty-result envelope, never the human "No matches
+    # found" banner (AC-SF-26); otherwise render the human Rich table unchanged.
+    if json_output:
+        _emit_search_json(result, parsed)
+    else:
+        render_search_results(result, parsed, _console, no_truncate=no_truncate)
 
 
 def _run_semantic_search(  # noqa: PLR0913 — keyword-only filter passthrough
@@ -1021,6 +1092,8 @@ def _run_semantic_search(  # noqa: PLR0913 — keyword-only filter passthrough
     is_basic: bool | None = None,
     max_price: float | None = None,
     package_flag: str | None = None,
+    sort: str = "relevance",
+    json_output: bool = False,
 ) -> None:
     """Run a read-only semantic (embedding-similarity) search.
 
@@ -1094,7 +1167,9 @@ def _run_semantic_search(  # noqa: PLR0913 — keyword-only filter passthrough
             max_price=max_price,
         )
         data = _run_block_query(client, query_text, variables)
-        result = rank_results(data, parsed if parsed is not None else parse_query(""))
+        result = rank_results(
+            data, parsed if parsed is not None else parse_query(""), sort=sort
+        )
     except typer.Exit:
         raise
     except Exception as exc:
@@ -1104,16 +1179,27 @@ def _run_semantic_search(  # noqa: PLR0913 — keyword-only filter passthrough
         if stub is not None:
             stub.close()
 
+    envelope_parsed = parsed if parsed is not None else parse_query("")
+
+    # Under --json the empty-result path emits the empty envelope and NEVER the
+    # human "run `partgraph embed` first" hint (AC-SF-27): the short-circuit that
+    # prints _NO_EMBEDDINGS_HINT on the human path is bypassed entirely.
     if not result.rows:
+        if json_output:
+            _emit_search_json(result, envelope_parsed)
+            return
         _console.print(_NO_EMBEDDINGS_HINT)
         return
 
-    render_search_results(
-        result,
-        parsed if parsed is not None else parse_query(""),
-        _console,
-        no_truncate=no_truncate,
-    )
+    if json_output:
+        _emit_search_json(result, envelope_parsed)
+    else:
+        render_search_results(
+            result,
+            envelope_parsed,
+            _console,
+            no_truncate=no_truncate,
+        )
 
 
 @app.command()

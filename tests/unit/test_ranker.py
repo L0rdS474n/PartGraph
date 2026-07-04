@@ -942,3 +942,523 @@ def test_ac_sr_existing_tier_scores_preserved() -> None:
         f"Regression: PR3 tier ordering must be preserved after PR4. "
         f"Order: {mpn_norms}"
     )
+
+
+# ===========================================================================
+# AC-SF-19..23 + AC-SF-32: issue #15 PR2 — `rank_results(..., sort=...)` and
+# RankedRow.price_usd / RankedRow.category
+#
+# NEW contract (not yet implemented):
+#   rank_results(blocks, parsed, *, sort: str = "relevance") -> RankedResults
+#   sort is one of {"relevance", "stock", "price"}; "relevance" is today's
+#   default (-tier, stock>0, is_basic, mpn_norm, uid) order, unchanged.
+#   RankedRow gains price_usd: float | None and category: str | None,
+#   populated in _make_row from the raw 'price_usd' / 'in_category:[{name}]'
+#   predicates (mirrors the existing manufacturer/package_name propagation).
+#
+# RED reasons in this section are DELIBERATELY split:
+#   - AC-SF-19..23 (sort=...) fail with `TypeError: rank_results() got an
+#     unexpected keyword argument 'sort'` — sort does not exist as a
+#     parameter yet. Not a collection error: rank_results itself already
+#     exists and imports fine today.
+#   - AC-SF-32 (price_usd/category) tests deliberately call rank_results
+#     WITHOUT sort=..., so they fail on a clean, isolated
+#     `AttributeError: 'RankedRow' object has no attribute 'price_usd'`/
+#     `'category'` — the missing-field reason, not entangled with the
+#     missing-sort-kwarg reason above.
+# ===========================================================================
+
+def _raw(uid: str, mpn_norm: str, **extra) -> dict:
+    """Build a bare raw DQL part dict with ONLY uid/mpn/mpn_norm plus whatever
+    predicates are explicitly passed as keyword arguments.
+
+    Unlike _part()/_part_rich(), this never injects a default stock/is_basic,
+    so a predicate can be genuinely ABSENT from the dict — simulating a node
+    where that DQL predicate was never set (needed for the None-stock/
+    None-price_usd "missing predicate" test cases below).
+    """
+    row: dict = {"uid": uid, "mpn": mpn_norm, "mpn_norm": mpn_norm}
+    row.update(extra)
+    return row
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-19: no sort arg / sort="relevance" == today's default order
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_19_no_sort_arg_matches_pinned_tier_stock_basic_mpn_uid_order() -> None:
+    """AC-SF-19 (regression pin — PASSES TODAY, no new kwarg used): Given a
+    fixture spanning tier, the in-tier stock boost, the is_basic boost, and
+    the mpn_norm/uid tie-breaks.
+    When rank_results(blocks, parsed) is called with NO sort argument.
+    Then the row order is EXACTLY the documented
+    (-tier, stock>0, is_basic, mpn_norm, uid) order — i.e. today's behavior,
+    captured as a golden fixture so PR2 cannot silently change the
+    no-sort-arg default.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [
+            _part("0xF4", "ZZZ", stock=0, is_basic=False),   # exact, no boost.
+            _part("0xF3", "MMM", stock=0, is_basic=True),    # exact, is_basic boost.
+            _part("0xF2", "AAA", stock=5, is_basic=False),   # exact, stock boost (wins).
+        ],
+        "trig": [
+            _part("0xF1", "AAA", stock=100, is_basic=True),  # trig -> ranks below ALL exact.
+        ],
+    }
+
+    result = rank_results(blocks, parsed)  # NO sort kwarg — today's default.
+
+    uids_in_order = [row.uid for row in result.rows]
+    assert uids_in_order == ["0xF2", "0xF3", "0xF4", "0xF1"], (
+        "AC-SF-19 regression: no-sort-arg order must stay "
+        f"(-tier, stock>0, is_basic, mpn_norm, uid). Got: {uids_in_order}"
+    )
+
+
+def test_ac_sf_19_sort_relevance_kwarg_matches_default_order() -> None:
+    """AC-SF-19: Given the SAME fixture as the regression-pin test above.
+    When rank_results(blocks, parsed, sort="relevance") is called.
+    Then the row order is IDENTICAL to the no-sort-arg call — sort="relevance"
+    is an explicit alias for today's default tier/stock/is_basic/mpn_norm/uid
+    order.
+
+    RED: `sort` does not exist as a rank_results parameter yet -> TypeError.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [
+            _part("0xF4", "ZZZ", stock=0, is_basic=False),
+            _part("0xF3", "MMM", stock=0, is_basic=True),
+            _part("0xF2", "AAA", stock=5, is_basic=False),
+        ],
+        "trig": [
+            _part("0xF1", "AAA", stock=100, is_basic=True),
+        ],
+    }
+
+    default_result = rank_results(blocks, parsed)
+    explicit_result = rank_results(blocks, parsed, sort="relevance")
+
+    default_uids = [row.uid for row in default_result.rows]
+    explicit_uids = [row.uid for row in explicit_result.rows]
+    assert explicit_uids == default_uids, (
+        f"AC-SF-19: sort='relevance' must match the no-sort-arg default order. "
+        f"default={default_uids} explicit={explicit_uids}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-20: sort="stock" -> stock DESC, tier NOT a key, None -> 0 (last)
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_20_sort_stock_orders_by_stock_desc_ignoring_tier() -> None:
+    """AC-SF-20: Given a fts-tier part with HIGH stock and an exact-tier part
+    with LOW stock (distinct uids — no dedup collision).
+    When rank_results(blocks, parsed, sort="stock") is called.
+    Then the fts-tier (higher stock) row ranks ABOVE the exact-tier (lower
+    stock) row — proving tier is NOT a sort key under sort="stock".
+
+    RED: `sort` kwarg does not exist yet -> TypeError.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [_part("0xG1", "LOWSTOCK", stock=5)],
+        "fts":   [_part("0xG2", "HIGHSTOCK", stock=500)],
+    }
+
+    result = rank_results(blocks, parsed, sort="stock")
+    uids = [row.uid for row in result.rows]
+
+    assert uids == ["0xG2", "0xG1"], (
+        f"AC-SF-20: sort='stock' must rank by stock DESC regardless of tier. "
+        f"Got: {uids}"
+    )
+
+
+def test_ac_sf_20_sort_stock_tier_never_breaks_ties() -> None:
+    """AC-SF-20: Given two parts with EQUAL stock and EQUAL mpn_norm, one in
+    'exact' and one in 'fts'.
+    When rank_results(blocks, parsed, sort="stock") is called.
+    Then the tie is broken by uid ALONE — tier contributes nothing to the
+    sort key (unlike sort="relevance", where tier is primary).
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [_part("0xG42", "SAME", stock=10)],
+        "fts":   [_part("0xG41", "SAME", stock=10)],
+    }
+
+    result = rank_results(blocks, parsed, sort="stock")
+    uids = [row.uid for row in result.rows]
+
+    assert uids == ["0xG41", "0xG42"], (
+        f"AC-SF-20: equal stock+mpn_norm ties must break by uid alone "
+        f"(tier must not be a sort key under sort='stock'). Got: {uids}"
+    )
+
+
+def test_ac_sf_20_sort_stock_ties_broken_by_mpn_norm_then_uid() -> None:
+    """AC-SF-20: Given three parts with EQUAL stock.
+    When rank_results(blocks, parsed, sort="stock") is called.
+    Then ties are broken by mpn_norm ascending, then uid ascending.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [
+            _part("0xG13", "ZZZ", stock=10),
+            _part("0xG11", "AAA", stock=10),
+            _part("0xG12", "AAA", stock=10),
+        ],
+    }
+
+    result = rank_results(blocks, parsed, sort="stock")
+    order = [(row.mpn_norm, row.uid) for row in result.rows]
+
+    assert order == [("AAA", "0xG11"), ("AAA", "0xG12"), ("ZZZ", "0xG13")], (
+        f"AC-SF-20: equal-stock ties must break by mpn_norm then uid. Got: {order}"
+    )
+
+
+def test_ac_sf_20_sort_stock_none_treated_as_zero_sorts_last() -> None:
+    """AC-SF-20: Given one part with stock=20 (present) and one with the
+    'stock' predicate entirely ABSENT from the raw DQL dict (row.stock is
+    None).
+    When rank_results(blocks, parsed, sort="stock") is called.
+    Then the None-stock row is treated as 0 and sorts LAST (behind the real,
+    positive stock) — no crash from comparing None to an int.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [
+            _raw("0xG21", "HASSTOCK", stock=20),
+            _raw("0xG22", "NOSTOCKFIELD"),  # no "stock" key at all -> row.stock is None.
+        ],
+    }
+
+    result = rank_results(blocks, parsed, sort="stock")
+    uids = [row.uid for row in result.rows]
+
+    assert uids == ["0xG21", "0xG22"], (
+        f"AC-SF-20: a None stock must sort as 0 (last, behind real stock). "
+        f"Got: {uids}"
+    )
+
+
+def test_ac_sf_20_sort_stock_all_none_orders_by_mpn_norm_then_uid_no_error() -> None:
+    """AC-SF-20: Given ALL rows with the 'stock' predicate entirely absent.
+    When rank_results(blocks, parsed, sort="stock") is called.
+    Then no error is raised and rows are ordered by mpn_norm then uid (the
+    all-None tie-break — never a TypeError from comparing None to an int).
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [
+            _raw("0xG32", "ZZZ"),
+            _raw("0xG31", "AAA"),
+        ],
+    }
+
+    result = rank_results(blocks, parsed, sort="stock")
+    order = [(row.mpn_norm, row.uid) for row in result.rows]
+
+    assert order == [("AAA", "0xG31"), ("ZZZ", "0xG32")], (
+        f"AC-SF-20: all-None stock must fall back to mpn_norm/uid order. Got: {order}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-21: sort="price" -> price_usd ASC, missing LAST, 0.0 is valid
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_21_sort_price_ascending_missing_price_last() -> None:
+    """AC-SF-21: Given price_usd=0.50, price_usd=0.10, and price_usd absent
+    entirely (never set on the node).
+    When rank_results(blocks, parsed, sort="price") is called.
+    Then order is ascending price_usd with the missing-price row LAST:
+    [0.10, 0.50, missing].
+
+    RED: `sort` kwarg does not exist yet -> TypeError.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [
+            _raw("0xH1", "HIGH", price_usd=0.50),
+            _raw("0xH2", "LOW", price_usd=0.10),
+            _raw("0xH3", "NOPRICE"),  # price_usd predicate entirely absent.
+        ],
+    }
+
+    result = rank_results(blocks, parsed, sort="price")
+    uids = [row.uid for row in result.rows]
+
+    assert uids == ["0xH2", "0xH1", "0xH3"], (
+        f"AC-SF-21: sort='price' must be ascending with missing price LAST. "
+        f"Got: {uids}"
+    )
+
+
+def test_ac_sf_21_sort_price_zero_is_valid_not_treated_as_missing() -> None:
+    """AC-SF-21: Given price_usd=0.0 (a genuine free/zero price) and a row
+    with the price_usd predicate entirely absent.
+    When rank_results(blocks, parsed, sort="price") is called.
+    Then the price_usd=0.0 row sorts FIRST (a real, present value) and the
+    missing-price row sorts LAST — 0.0 must never be conflated with
+    "missing".
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [
+            _raw("0xH11", "MISSING"),          # price_usd absent.
+            _raw("0xH12", "FREE", price_usd=0.0),
+            _raw("0xH13", "PAID", price_usd=1.0),
+        ],
+    }
+
+    result = rank_results(blocks, parsed, sort="price")
+    uids = [row.uid for row in result.rows]
+
+    assert uids == ["0xH12", "0xH13", "0xH11"], (
+        f"AC-SF-21: price_usd=0.0 must sort as a real (lowest) price, never "
+        f"as missing; the truly-absent row must sort last. Got: {uids}"
+    )
+
+
+def test_ac_sf_21_sort_price_ties_broken_by_mpn_norm_then_uid() -> None:
+    """AC-SF-21: Given three parts with EQUAL price_usd.
+    When rank_results(blocks, parsed, sort="price") is called.
+    Then ties are broken by mpn_norm ascending, then uid ascending.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [
+            _raw("0xH23", "ZZZ", price_usd=1.0),
+            _raw("0xH21", "AAA", price_usd=1.0),
+            _raw("0xH22", "AAA", price_usd=1.0),
+        ],
+    }
+
+    result = rank_results(blocks, parsed, sort="price")
+    order = [(row.mpn_norm, row.uid) for row in result.rows]
+
+    assert order == [("AAA", "0xH21"), ("AAA", "0xH22"), ("ZZZ", "0xH23")], (
+        f"AC-SF-21: equal-price ties must break by mpn_norm then uid. Got: {order}"
+    )
+
+
+def test_ac_sf_21_sort_price_all_missing_orders_by_mpn_norm_then_uid_no_error() -> None:
+    """AC-SF-21: Given ALL rows with price_usd entirely absent.
+    When rank_results(blocks, parsed, sort="price") is called.
+    Then no error is raised and rows are ordered by mpn_norm then uid.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [
+            _raw("0xH32", "ZZZ"),
+            _raw("0xH31", "AAA"),
+        ],
+    }
+
+    result = rank_results(blocks, parsed, sort="price")
+    order = [(row.mpn_norm, row.uid) for row in result.rows]
+
+    assert order == [("AAA", "0xH31"), ("ZZZ", "0xH32")], (
+        f"AC-SF-21: all-missing price must fall back to mpn_norm/uid order. Got: {order}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-23: nearest-match mode -> sort is a no-op
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_23_nearest_match_order_identical_regardless_of_sort_value() -> None:
+    """AC-SF-23: Given a nearest-match scenario (all hard blocks empty, a
+    'nearest' block populated) with a parametric target.
+    When rank_results is called once per sort in {"relevance", "stock", "price"}.
+    Then the row order is IDENTICAL across all three — sort is a no-op in
+    nearest-match mode; ordering always follows the parameter-distance
+    (_distance, mpn_norm, uid) key.
+    """
+    parsed = _make_parsed(quantities=[_q("voltage_max", 1.2, "1.2V")])
+    blocks = {
+        "exact": [], "trig": [], "fts": [],
+        "nearest": [
+            _part_rich("0xJ1", "FAR", voltage_max=5.5, stock=1, price_usd=9.0),
+            _part_rich("0xJ2", "CLOSE", voltage_max=1.8, stock=100, price_usd=0.1),
+            _part_rich("0xJ3", "MID", voltage_max=3.3, stock=50, price_usd=1.0),
+        ],
+    }
+
+    baseline = rank_results(blocks, parsed)  # today's default (implicit nearest sort).
+    baseline_uids = [row.uid for row in baseline.rows]
+    assert baseline_uids == ["0xJ2", "0xJ3", "0xJ1"], (
+        "AC-SF-23 setup sanity: expected distance-ascending order CLOSE, MID, FAR. "
+        f"Got: {baseline_uids}"
+    )
+
+    for sort_value in ("relevance", "stock", "price"):
+        result = rank_results(blocks, parsed, sort=sort_value)
+        uids = [row.uid for row in result.rows]
+        assert uids == baseline_uids, (
+            f"AC-SF-23: sort={sort_value!r} must be a no-op in nearest-match "
+            f"mode (distance order preserved). Got: {uids}; expected {baseline_uids}"
+        )
+
+
+# ===========================================================================
+# AC-SF-32: RankedRow gains price_usd / category, populated in _make_row
+# ===========================================================================
+
+def test_ac_sf_32_rank_row_propagates_price_usd_float() -> None:
+    """AC-SF-32: Given a raw block dict with price_usd=1.23.
+    When rank_results is called (NO sort kwarg — isolates this test from the
+    AC-SF-19..23 sort-kwarg RED reason above).
+    Then row.price_usd == 1.23 (float attribute directly on RankedRow).
+
+    RED: RankedRow has no 'price_usd' field yet -> AttributeError.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {"exact": [_raw("0xK1", "PRICED232", price_usd=1.23)]}
+
+    result = rank_results(blocks, parsed)
+    assert result.rows, "Expected at least one row."
+    row = result.rows[0]
+
+    assert hasattr(row, "price_usd"), (
+        "AC-SF-32: RankedRow must expose 'price_usd' attribute (propagated "
+        "from the 'price_usd' predicate in the raw dict)."
+    )
+    assert row.price_usd == pytest.approx(1.23), (
+        f"AC-SF-32: row.price_usd must be 1.23. Got: {row.price_usd!r}"
+    )
+
+
+def test_ac_sf_32_rank_row_price_usd_none_when_absent() -> None:
+    """AC-SF-32: Given a raw block dict with no price_usd field.
+    When rank_results is called.
+    Then row.price_usd is None (field present but nullable).
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {"exact": [_raw("0xK2", "NOPRICE232")]}
+
+    result = rank_results(blocks, parsed)
+    assert result.rows, "Expected at least one row."
+    row = result.rows[0]
+
+    assert hasattr(row, "price_usd"), (
+        "AC-SF-32: RankedRow must always expose 'price_usd' (None when absent)."
+    )
+    assert row.price_usd is None, (
+        f"AC-SF-32: row.price_usd must be None when absent. Got: {row.price_usd!r}"
+    )
+
+
+def test_ac_sf_32_rank_row_price_usd_zero_is_not_none() -> None:
+    """AC-SF-32: Given price_usd=0.0 (a genuine zero price, not absence).
+    When rank_results is called.
+    Then row.price_usd == 0.0 exactly (never coerced to None).
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {"exact": [_raw("0xK3", "FREE232", price_usd=0.0)]}
+
+    result = rank_results(blocks, parsed)
+    row = result.rows[0]
+
+    assert row.price_usd == 0.0 and row.price_usd is not None, (
+        f"AC-SF-32: price_usd=0.0 must round-trip as 0.0, not None. "
+        f"Got: {row.price_usd!r}"
+    )
+
+
+def test_ac_sf_32_rank_row_propagates_category_from_in_category() -> None:
+    """AC-SF-32: Given a raw block dict with in_category:[{name:"RS232 ICs"}].
+    When rank_results is called.
+    Then row.category == "RS232 ICs" (str, not None).
+
+    RED: RankedRow has no 'category' field yet -> AttributeError.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [
+            _raw("0xK4", "CATTED232", in_category=[{"name": "RS232 ICs"}])
+        ]
+    }
+
+    result = rank_results(blocks, parsed)
+    assert result.rows, "Expected at least one row."
+    row = result.rows[0]
+
+    assert hasattr(row, "category"), (
+        "AC-SF-32: RankedRow must expose 'category' attribute (propagated "
+        "from in_category[0].name in the raw dict)."
+    )
+    assert row.category == "RS232 ICs", (
+        f"AC-SF-32: row.category must be 'RS232 ICs'. Got: {row.category!r}"
+    )
+
+
+def test_ac_sf_32_rank_row_category_none_when_in_category_absent() -> None:
+    """AC-SF-32: Given a raw block dict with no in_category field.
+    When rank_results is called.
+    Then row.category is None.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {"exact": [_raw("0xK5", "NOCAT232")]}
+
+    result = rank_results(blocks, parsed)
+    row = result.rows[0]
+
+    assert hasattr(row, "category"), (
+        "AC-SF-32: RankedRow must always expose 'category' (None when absent)."
+    )
+    assert row.category is None, (
+        f"AC-SF-32: row.category must be None when in_category is absent. "
+        f"Got: {row.category!r}"
+    )
+
+
+def test_ac_sf_32_existing_ranked_row_fields_still_present_regression() -> None:
+    """AC-SF-32 (regression guard — largely PASSES TODAY already, since it
+    only inspects PRE-EXISTING fields via hasattr; it does not itself assert
+    on price_usd/category): Given a fully-populated part dict.
+    When rank_results is called.
+    Then all PRE-EXISTING RankedRow fields (uid, mpn_norm, tier, mpn,
+    manufacturer, package_name, datasheet_urls, stock, is_basic, and every
+    promoted numeric predicate) are still present — adding price_usd/category
+    must not remove or rename anything.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [
+            _part_rich(
+                "0xK6",
+                "MAX232CPE",
+                made_by=[{"name": "Texas Instruments"}],
+                in_package=[{"name": "PDIP-16"}],
+                datasheet=[{"url": "https://example.com/ds.pdf"}],
+                voltage_max=5.5,
+                resistance=None,
+                tolerance_pct=None,
+                price_usd=2.5,
+                in_category=[{"name": "RS232 ICs"}],
+            )
+        ]
+    }
+
+    result = rank_results(blocks, parsed)
+    row = result.rows[0]
+
+    for field_name in (
+        "uid", "mpn_norm", "tier", "mpn", "manufacturer", "package_name",
+        "datasheet_urls", "stock", "is_basic", "voltage_min", "voltage_max",
+        "current_max", "resistance", "capacitance", "inductance",
+        "frequency_max", "power", "tolerance_pct",
+    ):
+        assert hasattr(row, field_name), (
+            f"AC-SF-32 regression: pre-existing RankedRow field {field_name!r} "
+            f"must still be present after adding price_usd/category."
+        )
+    assert row.manufacturer == "Texas Instruments"
+    assert row.package_name == "PDIP-16"
+    assert row.voltage_max == pytest.approx(5.5)

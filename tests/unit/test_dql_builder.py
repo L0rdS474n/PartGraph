@@ -1663,112 +1663,476 @@ def test_ac_sf_1_manufacturer_omitted_made_by_has_no_filter() -> None:
     )
 
 
-def test_ac_sf_6_category_omitted_in_category_absent_entirely() -> None:
-    """Gate-3 Architecture SHOULD-1 (in_category conditional-selection pin):
-    Given category is NOT passed (default).
+def test_ac_sf_35_category_omitted_in_category_present_without_filter() -> None:
+    """AC-SF-35 (UPDATED — INVERTED from the pre-PR2 test named
+    test_ac_sf_6_category_omitted_in_category_absent_entirely): Given category
+    is NOT passed (default).
     When build_search_dql(parsed) is called (no category kwarg at all).
-    Then "in_category" does NOT appear anywhere in the query text — it is
-    CONDITIONALLY selected (mirrors in_package's existing conditional
-    pattern), so a no-filter query stays byte-identical to the pre-PR1
-    output (which never selected in_category at all).
+    Then `in_category { name }` IS present — AC-SF-33 makes in_category an
+    UNCONDITIONAL selection — with NO `in_category @filter(` clause attached.
+
+    CHANGED FROM PRE-PR2 (documented, not silent): the original version of
+    this test asserted the OPPOSITE — that "in_category" was absent entirely
+    from the query text when --category was omitted (the PR1
+    conditional-selection contract, mirroring in_package's conditional
+    pattern). PR2 makes in_category UNCONDITIONAL (AC-SF-33), so the correct
+    post-PR2 contract is inverted: present, but filter-free by default.
     """
     parsed = _make_parsed(text_tokens=["MAX232"])
     query_text, _variables = build_search_dql(parsed)
 
-    assert "in_category" not in query_text, (
-        f"Gate-3: in_category must be absent entirely when --category is not "
-        f"used (conditional selection, backward-compat). Got:\n{query_text}"
+    assert "in_category { name }" in query_text, (
+        f"AC-SF-35: in_category must be present (unconditional selection, "
+        f"AC-SF-33) even when --category is omitted. Got:\n{query_text}"
+    )
+    assert not re.search(r"in_category\s*@filter\(", query_text), (
+        f"AC-SF-35: in_category must carry NO @filter when --category is "
+        f"not used. Got:\n{query_text}"
     )
 
 
-def test_ac_sf_no_filter_default_output_byte_identical_to_pre_pr1() -> None:
-    """Gate-3 Architecture SHOULD-1: Given a ParsedQuery with text_tokens=
-    ["MAX232"], package="0402" (query-derived), raw_query="MAX232 0402" — and
-    NO new PR1 kwargs at all.
+def test_ac_sf_34_no_filter_default_output_structural_not_byte_golden() -> None:
+    """AC-SF-34 (UPDATED — REWRITTEN from the pre-PR2 test named
+    test_ac_sf_no_filter_default_output_byte_identical_to_pre_pr1): Given a
+    ParsedQuery with text_tokens=["MAX232"], package="0402" (query-derived),
+    raw_query="MAX232 0402" — and NO new PR1/PR2 kwargs at all.
     When build_search_dql(parsed) is called.
-    Then the (query_text, variables) result is BYTE-IDENTICAL to the golden
-    reference captured from the pre-PR1 implementation (characterization /
-    backward-compat test — this exact string was captured by actually running
-    the pre-PR1 build_search_dql before any PR1 kwarg existed).
-    """
-    golden_query_text = (
-        'query search($pkg: string, $te: string, $rx: string, $ft: string) {\n'
-        '  exact(func: type(Part), first: 20) @filter(eq(mpn_norm, $te) AND has(datasheet)) @cascade(in_package) {\n'
-        '    uid\n'
-        '    mpn\n'
-        '    mpn_norm\n'
-        '    stock\n'
-        '    is_basic\n'
-        '    voltage_min\n'
-        '    voltage_max\n'
-        '    current_max\n'
-        '    resistance\n'
-        '    capacitance\n'
-        '    inductance\n'
-        '    frequency_max\n'
-        '    power\n'
-        '    tolerance_pct\n'
-        '    made_by { name }\n'
-        '    in_package @filter(eq(name, $pkg)) { name }\n'
-        '    datasheet { url }\n'
-        '  }\n'
-        '  trig(func: type(Part), first: 20) @filter(regexp(mpn_norm, $rx) AND has(datasheet)) @cascade(in_package) {\n'
-        '    uid\n'
-        '    mpn\n'
-        '    mpn_norm\n'
-        '    stock\n'
-        '    is_basic\n'
-        '    voltage_min\n'
-        '    voltage_max\n'
-        '    current_max\n'
-        '    resistance\n'
-        '    capacitance\n'
-        '    inductance\n'
-        '    frequency_max\n'
-        '    power\n'
-        '    tolerance_pct\n'
-        '    made_by { name }\n'
-        '    in_package @filter(eq(name, $pkg)) { name }\n'
-        '    datasheet { url }\n'
-        '  }\n'
-        '  fts(func: type(Part), first: 20) @filter(anyoftext(description, $ft) AND has(datasheet)) @cascade(in_package) {\n'
-        '    uid\n'
-        '    mpn\n'
-        '    mpn_norm\n'
-        '    stock\n'
-        '    is_basic\n'
-        '    voltage_min\n'
-        '    voltage_max\n'
-        '    current_max\n'
-        '    resistance\n'
-        '    capacitance\n'
-        '    inductance\n'
-        '    frequency_max\n'
-        '    power\n'
-        '    tolerance_pct\n'
-        '    made_by { name }\n'
-        '    in_package @filter(eq(name, $pkg)) { name }\n'
-        '    datasheet { url }\n'
-        '  }\n'
-        '}'
-    )
-    golden_variables = {
-        "$pkg": "0402",
-        "$te": "MAX232",
-        "$rx": "/MAX232/",
-        "$ft": "MAX232",
-    }
+    Then the output satisfies STRUCTURAL invariants (not a byte-exact
+    golden):
+      - `price_usd` is selected as a bare field, positioned AFTER `is_basic`.
+      - `in_category { name }` is present with NO `@filter(` attached
+        (AC-SF-33/35).
+      - Exactly one `datasheet { url }` per block (3 blocks — unchanged
+        datasheet shape).
+      - The package/text-token variable contract is unchanged.
 
+    CHANGED FROM PRE-PR2 (documented, not silent): the original version of
+    this test pinned a BYTE-IDENTICAL golden query string captured before
+    PR1. PR2 makes `price_usd` and `in_category` UNCONDITIONAL selections
+    (AC-SF-33), so that golden string is now stale by construction — its
+    EXACT new bytes are not knowable before PR2 is implemented (the whole
+    point of a RED-first test). This test is rewritten to assert the
+    STRUCTURAL shape PR2 must produce instead of guessing a new byte-golden.
+    Gate 4 may reintroduce an exact byte-golden once PR2's implementation
+    settles the final formatting.
+
+    REMOVED (Gate 4, evidence-based, documented not silent): a cross-edge
+    "made_by -> in_category -> in_package" ORDER sub-assertion used to live
+    here (AC-SF-37 follow-up (b)). It relied on unifying the selection layout
+    by dropping `lead_with_constraints`, which Gate 4 correctly did NOT do —
+    that follow-up was explicitly OPTIONAL ("unless a test pins the layout
+    load-bearing"), and the merged AC-SF-15 test DOES pin the opposite
+    (in_package must LEAD the body when package+manufacturer are active), so
+    the guard condition is met and the reorder is correctly skipped. The
+    assertion was also measurement-confounded: naive `.index("in_package")`
+    on the whole query matches the earlier `@cascade(in_package)` block-header
+    occurrence, not the selection-body line. See ADR-0017. The remaining
+    assertions below (price_usd/in_category/datasheet-count/variables) still
+    pin PR2's REAL, implemented selection changes.
+    """
     parsed = _make_parsed(
         text_tokens=["MAX232"], package="0402", raw_query="MAX232 0402"
     )
     query_text, variables = build_search_dql(parsed)
 
-    assert query_text == golden_query_text, (
-        f"Gate-3: no-filter build_search_dql output must be BYTE-IDENTICAL to "
-        f"the pre-PR1 golden reference (backward-compat). Got:\n{query_text}"
+    # price_usd is a bare selected field, positioned after is_basic.
+    assert re.search(r"^\s*price_usd\s*$", query_text, re.MULTILINE), (
+        f"AC-SF-34: expected a bare 'price_usd' selected field. Got:\n{query_text}"
     )
-    assert variables == golden_variables, (
-        f"Gate-3: no-filter build_search_dql variables must be IDENTICAL to "
-        f"the pre-PR1 golden reference. Got: {variables}"
+    idx_is_basic = query_text.index("is_basic")
+    idx_price_usd = query_text.index("price_usd")
+    assert idx_price_usd > idx_is_basic, (
+        f"AC-SF-34: 'price_usd' must be present AFTER 'is_basic' in the "
+        f"selection. is_basic@{idx_is_basic}, price_usd@{idx_price_usd}. "
+        f"Got:\n{query_text}"
+    )
+
+    # in_category is present, unconditional, with NO @filter attached.
+    assert "in_category { name }" in query_text, (
+        f"AC-SF-34: expected unconditional 'in_category {{ name }}'. "
+        f"Got:\n{query_text}"
+    )
+    assert not re.search(r"in_category\s*@filter\(", query_text), (
+        f"AC-SF-34: in_category must carry NO @filter with no --category "
+        f"flag. Got:\n{query_text}"
+    )
+
+    # NOTE: the former "edge order: made_by -> in_category -> in_package"
+    # cross-edge assertion was REMOVED here (Gate 4, evidence-based) — see
+    # the docstring above and ADR-0017; it pinned an optional reorder
+    # (AC-SF-37 follow-up (b)) that Gate 4 correctly did NOT implement
+    # because the merged AC-SF-15 test requires the opposite layout.
+
+    # Exactly one `datasheet { url }` per block (3 blocks: exact/trig/fts).
+    datasheet_count = query_text.count("datasheet { url }")
+    assert datasheet_count == 3, (
+        f"AC-SF-34: expected exactly one 'datasheet {{ url }}' per block "
+        f"(3 blocks total). Got {datasheet_count} occurrences in:\n{query_text}"
+    )
+
+    # The package/text-token variable contract is unchanged (still $pkg/$te/$rx/$ft).
+    assert variables == {
+        "$pkg": "0402",
+        "$te": "MAX232",
+        "$rx": "/MAX232/",
+        "$ft": "MAX232",
+    }, f"AC-SF-34: variables dict must be unchanged. Got: {variables}"
+
+
+# ===========================================================================
+# AC-SF-33: issue #15 PR2 — price_usd bare field + unconditional in_category
+#
+# build_search_dql / build_semantic_dql selections must ALWAYS include a bare
+# `price_usd` field and a plain `in_category { name }` (no @filter) even with
+# NO category filter active; with --category the existing allofterms filter
+# (AC-SF-6) is unchanged.
+#
+# NOTE: build_search_dql/build_semantic_dql already accept these calls with NO
+# new kwargs — these tests RED via a plain ASSERTION failure against current
+# output (not an import/kwarg TypeError), because the missing selection is a
+# query-SHAPE gap, not a missing parameter. Still the correct RED state (not
+# a collection error).
+# ===========================================================================
+
+def test_ac_sf_33_build_search_dql_selects_bare_price_usd_field() -> None:
+    """AC-SF-33: Given a plain ParsedQuery with no structured filters.
+    When build_search_dql(parsed) is called.
+    Then the selection set contains a BARE `price_usd` field (its own line,
+    not merely present as part of a `le(price_usd, ...)` filter clause).
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    query_text, _variables = build_search_dql(parsed)
+
+    assert re.search(r"^\s*price_usd\s*$", query_text, re.MULTILINE), (
+        f"AC-SF-33: expected a bare 'price_usd' selected field. Got:\n{query_text}"
+    )
+
+
+def test_ac_sf_33_build_search_dql_selects_plain_in_category_no_filter_by_default() -> None:
+    """AC-SF-33: Given NO --category filter.
+    When build_search_dql(parsed) is called.
+    Then the selection contains plain `in_category { name }` with NO
+    `in_category @filter(` clause (in_category becomes UNCONDITIONAL, unlike
+    the pre-PR2 conditional-selection behavior pinned by the old AC-SF-6
+    test).
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    query_text, _variables = build_search_dql(parsed)
+
+    assert "in_category { name }" in query_text, (
+        f"AC-SF-33: expected unconditional 'in_category {{ name }}'. Got:\n{query_text}"
+    )
+    assert not re.search(r"in_category\s*@filter\(", query_text), (
+        f"AC-SF-33: in_category must carry NO @filter when --category is not "
+        f"used. Got:\n{query_text}"
+    )
+
+
+def test_ac_sf_33_build_search_dql_with_category_flag_keeps_allofterms_filter() -> None:
+    """AC-SF-33 (unchanged — PASSES TODAY already, a regression guard): Given
+    category="RS232 ICs".
+    When build_search_dql(parsed, category=...) is called.
+    Then in_category still carries the AC-SF-6 allofterms filter, unchanged:
+    'in_category @filter(allofterms(name, $cat)) { name }'.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    query_text, _variables = build_search_dql(parsed, category="RS232 ICs")
+
+    assert "in_category @filter(allofterms(name, $cat)) { name }" in query_text, (
+        f"AC-SF-33: --category filter clause must be unchanged. Got:\n{query_text}"
+    )
+
+
+def test_ac_sf_33_build_semantic_dql_selects_bare_price_usd_field() -> None:
+    """AC-SF-33: Given a 384-dim vector and k=5, no category filter.
+    When build_semantic_dql(vector, k=5) is called.
+    Then the selection contains a bare `price_usd` field.
+    """
+    if build_semantic_dql is None:
+        pytest.skip("build_semantic_dql not yet implemented (expected red)")
+
+    vector = _unit_vector()
+    query_text, _variables = build_semantic_dql(vector, 5)
+
+    assert re.search(r"^\s*price_usd\s*$", query_text, re.MULTILINE), (
+        f"AC-SF-33: semantic query must select a bare 'price_usd' field. "
+        f"Got:\n{query_text}"
+    )
+
+
+def test_ac_sf_33_build_semantic_dql_selects_plain_in_category_no_filter_by_default() -> None:
+    """AC-SF-33: Given a 384-dim vector, k=5, no category filter.
+    When build_semantic_dql(vector, k=5) is called.
+    Then the selection contains plain `in_category { name }` with NO
+    `in_category @filter(` clause.
+    """
+    if build_semantic_dql is None:
+        pytest.skip("build_semantic_dql not yet implemented (expected red)")
+
+    vector = _unit_vector()
+    query_text, _variables = build_semantic_dql(vector, 5)
+
+    assert "in_category { name }" in query_text, (
+        f"AC-SF-33: expected unconditional 'in_category {{ name }}' in the "
+        f"semantic query. Got:\n{query_text}"
+    )
+    assert not re.search(r"in_category\s*@filter\(", query_text), (
+        f"AC-SF-33: semantic in_category must carry NO @filter by default. "
+        f"Got:\n{query_text}"
+    )
+
+
+def test_ac_sf_33_build_semantic_dql_with_category_flag_keeps_allofterms_filter() -> None:
+    """AC-SF-33 (unchanged — PASSES TODAY already, a regression guard): Given
+    a 384-dim vector, k=5, and category="RS232 ICs".
+    When build_semantic_dql(vector, k=5, category=...) is called.
+    Then in_category still carries the AC-SF-16 allofterms filter, unchanged.
+    """
+    if build_semantic_dql is None:
+        pytest.skip("build_semantic_dql not yet implemented (expected red)")
+
+    vector = _unit_vector()
+    query_text, _variables = build_semantic_dql(vector, 5, category="RS232 ICs")
+
+    assert "in_category @filter(allofterms(name, $cat)) { name }" in query_text, (
+        f"AC-SF-33: semantic --category filter clause must be unchanged. "
+        f"Got:\n{query_text}"
+    )
+
+
+# ===========================================================================
+# AC-SF-36: issue #15 PR2 — public promotion of validate_package /
+# MAX_FILTER_TERM_LEN (dropping the leading underscore so cli.py's two lazy
+# imports of the PRIVATE names can become PUBLIC imports).
+#
+# NOTE: `validate_package` / `MAX_FILTER_TERM_LEN` do not exist yet (only the
+# PRIVATE `_validate_package` / `_MAX_FILTER_TERM_LEN` do today). Every import
+# below is LOCAL to its test function (never at module level) so a missing
+# name only fails THAT test at call time (ImportError) rather than erroring
+# collection of the whole file.
+# ===========================================================================
+
+def test_ac_sf_36_validate_package_public_name_importable() -> None:
+    """AC-SF-36: Given the dql_builder module.
+    When `from partgraph.query.dql_builder import validate_package` is
+    attempted.
+    Then the import succeeds (the PUBLIC name exists) and behaves exactly
+    like the private predecessor.
+
+    RED today via ImportError (only the private `_validate_package` exists
+    pre-PR2).
+    """
+    from partgraph.query.dql_builder import validate_package  # noqa: PLC0415
+
+    assert validate_package("SOIC-16") == "SOIC-16", (
+        "AC-SF-36: validate_package('SOIC-16') must return 'SOIC-16' unchanged."
+    )
+
+
+def test_ac_sf_36_validate_package_rejects_bad_charset() -> None:
+    """AC-SF-36: Given a package value with a disallowed character (space).
+    When validate_package(...) is called.
+    Then a ValueError is raised (same contract as the private predecessor).
+    """
+    from partgraph.query.dql_builder import validate_package  # noqa: PLC0415
+
+    with pytest.raises(ValueError):
+        validate_package("RS232 ICs")
+
+
+def test_ac_sf_36_max_filter_term_len_public_name_importable() -> None:
+    """AC-SF-36: Given the dql_builder module.
+    When `from partgraph.query.dql_builder import MAX_FILTER_TERM_LEN` is
+    attempted.
+    Then the import succeeds and the value equals the pre-PR2 private
+    constant's value (128).
+
+    RED today via ImportError.
+    """
+    from partgraph.query.dql_builder import MAX_FILTER_TERM_LEN  # noqa: PLC0415
+
+    assert MAX_FILTER_TERM_LEN == 128, (
+        f"AC-SF-36: MAX_FILTER_TERM_LEN must be 128 (unchanged value). "
+        f"Got: {MAX_FILTER_TERM_LEN!r}"
+    )
+
+
+def test_ac_sf_36_validate_package_and_max_filter_term_len_in_dunder_all() -> None:
+    """AC-SF-36: Given the dql_builder module's __all__ list.
+    When inspected.
+    Then both 'validate_package' and 'MAX_FILTER_TERM_LEN' are present in
+    __all__ (the public export contract).
+    """
+    import partgraph.query.dql_builder as dql_builder_mod
+
+    assert "validate_package" in dql_builder_mod.__all__, (
+        f"AC-SF-36: 'validate_package' must be in __all__. "
+        f"Got: {dql_builder_mod.__all__}"
+    )
+    assert "MAX_FILTER_TERM_LEN" in dql_builder_mod.__all__, (
+        f"AC-SF-36: 'MAX_FILTER_TERM_LEN' must be in __all__. "
+        f"Got: {dql_builder_mod.__all__}"
+    )
+
+
+def test_ac_sf_36_cli_imports_public_names_not_underscore_privates() -> None:
+    """AC-SF-36: Given the cli.py source text.
+    When grepped for the two lazy import statements that currently read the
+    PRIVATE names (`from partgraph.query.dql_builder import
+    _MAX_FILTER_TERM_LEN` and `from partgraph.query.dql_builder import
+    _validate_package`).
+    Then NEITHER underscore-prefixed import remains in cli.py — both call
+    sites must import the PUBLIC `MAX_FILTER_TERM_LEN` / `validate_package`
+    names instead.
+
+    RED today: cli.py (production code, frozen for this PR) still imports
+    the two private names — this test fails until cli.py's imports are
+    updated by the implementation phase.
+    """
+    import pathlib
+
+    import partgraph.cli as cli_mod
+
+    cli_source = pathlib.Path(cli_mod.__file__).read_text(encoding="utf-8")
+
+    assert "import _validate_package" not in cli_source, (
+        "AC-SF-36: cli.py must no longer import the private '_validate_package'."
+    )
+    assert "import _MAX_FILTER_TERM_LEN" not in cli_source, (
+        "AC-SF-36: cli.py must no longer import the private '_MAX_FILTER_TERM_LEN'."
+    )
+    assert "import validate_package" in cli_source, (
+        "AC-SF-36: cli.py must import the PUBLIC 'validate_package'."
+    )
+    assert "import MAX_FILTER_TERM_LEN" in cli_source, (
+        "AC-SF-36: cli.py must import the PUBLIC 'MAX_FILTER_TERM_LEN'."
+    )
+
+
+# ===========================================================================
+# AC-SF-37: issue #15 PR2 — single fixed edge layout (made_by -> in_category
+# -> in_package), replacing the PR1 "lead_with_constraints" reorder.
+#
+# Regardless of which of manufacturer/package/category filters are active,
+# the relative ORDER of the three edges in the selection must always be
+# made_by, then in_category, then in_package. These tests assert against the
+# CURRENT build_search_dql (no new kwargs) — RED today via assertion
+# failure, since the present _render_fields still reorders constrained edges
+# to the front when a manufacturer/category filter is active.
+# ===========================================================================
+
+def _edge_positions(query_text: str) -> dict[str, int]:
+    """Return {edge_name: first character index} for made_by/in_category/in_package.
+
+    Uses str.find (never str.index) so a NOT-YET-PRESENT edge (e.g.
+    in_category before AC-SF-33 is implemented) yields -1 rather than
+    raising KeyError — callers get a clear, readable assertion failure
+    showing the -1 instead of an opaque KeyError.
+    """
+    return {
+        edge: query_text.find(edge)
+        for edge in ("made_by", "in_category", "in_package")
+    }
+
+
+def test_ac_sf_37_edge_order_made_by_in_category_in_package_no_filters() -> None:
+    """AC-SF-37: Given NO manufacturer/package/category filters.
+    When build_search_dql(parsed) is called.
+    Then the edges appear in the fixed order made_by, in_category, in_package.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    query_text, _variables = build_search_dql(parsed)
+
+    positions = _edge_positions(query_text)
+    assert positions["made_by"] < positions["in_category"] < positions["in_package"], (
+        f"AC-SF-37: expected fixed edge order made_by -> in_category -> "
+        f"in_package. Positions: {positions}"
+    )
+
+
+def test_ac_sf_37_edge_order_unchanged_with_manufacturer_filter_active() -> None:
+    """AC-SF-37: Given --manufacturer active (a PR1 'constrained' edge).
+    When build_search_dql(parsed, manufacturer=...) is called.
+    Then the edge order is STILL made_by, in_category, in_package — the PR1
+    lead-with-constraints reorder must be gone.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    query_text, _variables = build_search_dql(parsed, manufacturer="Texas Instruments")
+
+    positions = _edge_positions(query_text)
+    assert positions["made_by"] < positions["in_category"] < positions["in_package"], (
+        f"AC-SF-37: edge order must stay made_by -> in_category -> in_package "
+        f"even with --manufacturer active. Positions: {positions}"
+    )
+
+
+
+# Follow-up (b) [lead_with_constraints removal] intentionally NOT done — its
+# guard "unless a test pins the layout" is met by the merged AC-SF-15, which
+# requires in_package to lead the selection body; see ADR-0017. The two
+# edge-order-unification tests that used to live here
+# (test_ac_sf_37_edge_order_unchanged_with_category_and_package_filters_active
+# and test_ac_sf_37_edge_order_identical_regardless_of_active_filter_combo)
+# were REMOVED (Gate 4, evidence-based, documented not silent) rather than
+# replaced with layout-order assertions.
+
+
+# ===========================================================================
+# Gate 3 (Security SHOULD): direct boundary pins on the newly-PUBLIC
+# validate_package. AC-SF-36 already proves the public name is importable
+# and preserves the "SOIC-16" happy path; these tests pin the SPECIFIC
+# reject/accept boundary cases the promotion must preserve exactly, calling
+# validate_package(...) DIRECTLY (never through build_search_dql/the CLI).
+# ===========================================================================
+
+def test_ac_sf_36_validate_package_rejects_overlength() -> None:
+    """Gate 3 / AC-SF-36 (Security SHOULD): Given a 21-character package
+    value (one over the 20-char cap: "^[A-Z0-9][A-Z0-9\\-]{0,19}$").
+    When validate_package(...) is called directly.
+    Then a ValueError is raised.
+    """
+    from partgraph.query.dql_builder import validate_package  # noqa: PLC0415
+
+    with pytest.raises(ValueError):
+        validate_package("A" * 21)
+
+
+def test_ac_sf_36_validate_package_rejects_lowercase() -> None:
+    """Gate 3 / AC-SF-36 (Security SHOULD): Given a lowercase package value
+    ("soic-16" — the charset requires uppercase A-Z/0-9/- only).
+    When validate_package(...) is called directly.
+    Then a ValueError is raised.
+    """
+    from partgraph.query.dql_builder import validate_package  # noqa: PLC0415
+
+    with pytest.raises(ValueError):
+        validate_package("soic-16")
+
+
+def test_ac_sf_36_validate_package_rejects_injection_shaped_payload() -> None:
+    """Gate 3 / AC-SF-36 (Security SHOULD): Given an injection-shaped
+    payload ("0402; drop" — contains a space and a semicolon, well outside
+    the package charset).
+    When validate_package(...) is called directly.
+    Then a ValueError is raised (defence in depth — the value would be bound
+    as a $var regardless, but the charset guard must still reject it
+    outright before it ever reaches that point).
+    """
+    from partgraph.query.dql_builder import validate_package  # noqa: PLC0415
+
+    with pytest.raises(ValueError):
+        validate_package("0402; drop")
+
+
+def test_ac_sf_36_validate_package_accepts_valid_value_returns_unchanged() -> None:
+    """Gate 3 / AC-SF-36 (Security SHOULD): Given a valid package value
+    ("SOIC-16").
+    When validate_package(...) is called directly.
+    Then it returns the value unchanged (str, not mutated) — confirms the
+    promotion preserves the exact pre-promotion charset/length logic.
+    """
+    from partgraph.query.dql_builder import validate_package  # noqa: PLC0415
+
+    assert validate_package("SOIC-16") == "SOIC-16", (
+        "Gate3/AC-SF-36: validate_package('SOIC-16') must return 'SOIC-16' unchanged."
     )

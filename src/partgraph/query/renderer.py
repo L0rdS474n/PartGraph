@@ -26,7 +26,26 @@ from rich.table import Table
 from partgraph.query.parser import ParsedQuery
 from partgraph.query.ranker import RankedResults, RankedRow
 
-__all__ = ["render_search_results", "render_show_result"]
+__all__ = [
+    "render_search_results",
+    "render_search_results_json",
+    "render_show_result",
+]
+
+#: JSON envelope schema version. Forward-compat policy (ADR-0017): additive keys
+#: do NOT bump this; removing, renaming or retyping a key does.
+_JSON_ENVELOPE_VERSION = 1
+
+#: Machine-safe match-type name per RankedRow tier for the JSON envelope. These
+#: are deliberately NOT the human, bracket-carrying :data:`_MATCH_LABELS`
+#: ("[Semantic]" etc, ADR-0008) — a machine consumer gets a plain, stable token.
+_MATCH_TYPE_JSON: dict[str, str] = {
+    "exact": "exact",
+    "trig": "trigram",
+    "fts": "fulltext",
+    "semantic": "semantic",
+    "nearest": "nearest",
+}
 
 #: Compact unit suffixes for the "Key params" column, per promoted predicate.
 _PARAM_DISPLAY: tuple[tuple[str, str], ...] = (
@@ -146,6 +165,53 @@ def render_search_results(
     console.print(table)
     count = len(results.rows)
     console.print(f"Showing {count} result(s).")
+
+
+def _json_row(row: RankedRow) -> dict:
+    """Return the machine-safe allowlist dict for a single ranked *row*.
+
+    HAND-BUILT (never ``dataclasses.asdict`` and never the raw Dgraph dict, both
+    of which carry ``uid``/edge data) so the output is exactly the 11 documented
+    keys and no ``uid``/``0x…`` value can ever leak. Null policy: the seven
+    scalars are present-but-``None`` when absent; ``mpn_norm`` is always the
+    non-null identity string; ``datasheets`` is the raw URL-string list (``[]``
+    when none); ``params`` is the sparse present-predicates map sourced from the
+    PUBLIC ranker surface (``[]``/``{}`` never ``None``); ``match_type`` is the
+    machine-safe tier name (never the human, bracketed ``_MATCH_LABELS``).
+    """
+    return {
+        "mpn": row.mpn,
+        "mpn_norm": row.mpn_norm,
+        "manufacturer": row.manufacturer,
+        "package": row.package_name,
+        "category": row.category,
+        "stock": row.stock,
+        "is_basic": row.is_basic,
+        "price_usd": row.price_usd,
+        "match_type": _MATCH_TYPE_JSON.get(row.tier, row.tier),
+        "datasheets": list(row.datasheet_urls or []),
+        "params": row.params_dict(),
+    }
+
+
+def render_search_results_json(results: RankedResults, parsed: ParsedQuery) -> dict:
+    """Return the machine-readable JSON envelope for a ranked search result set.
+
+    A PURE serializer: it builds and returns a plain, JSON-serialisable ``dict``
+    with no Console/Rich/print side effects (the CLI owns emission). The envelope
+    is ``{version, query, nearest_match, count, results}`` with ``version`` fixed
+    at :data:`_JSON_ENVELOPE_VERSION`, ``query`` the original ``parsed.raw_query``,
+    ``count`` equal to ``len(results.rows)`` and each row shaped by
+    :func:`_json_row`. Price/category surface ONLY here and via ``--sort`` — the
+    human table (:func:`render_search_results`) stays unchanged (ADR-0016 §D-E).
+    """
+    return {
+        "version": _JSON_ENVELOPE_VERSION,
+        "query": parsed.raw_query,
+        "nearest_match": results.nearest_match,
+        "count": len(results.rows),
+        "results": [_json_row(row) for row in results.rows],
+    }
 
 
 def _first_name(items: object) -> str | None:
