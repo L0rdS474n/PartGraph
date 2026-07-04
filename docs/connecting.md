@@ -253,6 +253,8 @@ Key predicates for querying:
   `datasheet`, `tagged`, `attr`.
 - Promoted numeric parameters (SI-normalised floats): `resistance`,
   `capacitance`, `voltage_min/max`, `tolerance_pct`, `stock`, …
+- Commercial: `price_usd` — unit price in USD (a float; **may be absent** on a
+  part) — and `is_basic` — a bool for the JLCPCB basic/extended tier.
 - Semantic: `embedding` — a 384-dim vector with an HNSW cosine index.
 
 > `variant_of` and `equivalent_to` exist in the schema but are **not exercised**
@@ -399,6 +401,29 @@ $ partgraph search "10k 0402 1%"
 CRCW040210K0FKTD | Vishay     | 0402 | ...
 ERJ2RKF1002X     | PANASONIC  | 0402 |  370007
 ...   (20 rows)
+```
+
+#### Sorting and machine-readable output
+
+`partgraph search` accepts two output flags (both read-only, both compose with
+the filters above):
+
+- `--sort relevance|stock|price` orders the results. `relevance` (the default)
+  is best-match-first (match tier, then in-stock and basic parts); `stock` puts
+  the **most in stock first**; `price` puts the **cheapest first** (parts with no
+  `price_usd` sort last). In nearest-match mode `--sort` is ignored — parameter
+  distance always wins.
+- `--json` prints a single machine-readable JSON object instead of the human
+  table: `{"version": 1, "query": …, "nearest_match": …, "count": N,
+  "results": [ … ]}`. Each result row has the stable keys `mpn`, `mpn_norm`,
+  `manufacturer`, `package`, `category`, `stock`, `is_basic`, `price_usd`,
+  `match_type`, `datasheets`, `params`. The envelope carries **no internal
+  `uid`s**; `version` is `1` and only ever bumps on a breaking key change
+  (additive keys do not bump it). On any error the command exits non-zero and
+  prints no JSON.
+
+```bash
+partgraph search "MAX232" --json --sort price --limit 50
 ```
 
 ### `partgraph search --semantic "<query>"`

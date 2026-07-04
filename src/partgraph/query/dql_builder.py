@@ -28,7 +28,7 @@ Security model (ADR-INJECT):
   (:func:`_validate_filter_term`) — they legitimately contain spaces and exceed
   20 characters, so the strict package charset cannot be reused; that validator
   rejects empty/whitespace-only values and caps the length at
-  :data:`_MAX_FILTER_TERM_LEN` (DoS defence-in-depth, ADR-0007 style).
+  :data:`MAX_FILTER_TERM_LEN` (DoS defence-in-depth, ADR-0007 style).
 
 DoS model (ADR-0007): the caller-supplied ``limit`` is clamped to
 ``MAX_RESULT_LIMIT`` so a single request can never stream the whole database.
@@ -53,10 +53,12 @@ from partgraph.normalize.model import normalize_mpn
 from partgraph.query.parser import ParsedQuery
 
 __all__ = [
+    "MAX_FILTER_TERM_LEN",
     "MAX_RESULT_LIMIT",
     "build_search_dql",
     "build_semantic_dql",
     "build_show_dql",
+    "validate_package",
 ]
 
 #: Maximum number of rows any single block may return (ADR-0007 DoS bound).
@@ -112,8 +114,9 @@ _PACKAGE_VALID_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-]{0,19}$")
 #: (ADR-0016 / ADR-0007-style DoS bound). Must comfortably exceed real names
 #: ("STMicroelectronics", "RS-232 Interface IC") yet reject pathological input;
 #: the value is bound as a ``$``-variable regardless, so this is a usability +
-#: defence-in-depth cap, not an injection guard.
-_MAX_FILTER_TERM_LEN = 128
+#: defence-in-depth cap, not an injection guard. PUBLIC (ADR-0017): the CLI
+#: imports it directly rather than reaching for a private name.
+MAX_FILTER_TERM_LEN = 128
 
 #: Minimum letter-run length to use as the related-parts MPN family prefix.
 _MIN_RELATED_PREFIX_LEN = 2
@@ -172,8 +175,13 @@ def _fmt_int(value: int) -> str:
     return text
 
 
-def _validate_package(package: str) -> str:
+def validate_package(package: str) -> str:
     """Return *package* unchanged if it passes the injection-guard regex.
+
+    PUBLIC (ADR-0017): the CLI imports this directly (``--package`` boundary
+    re-validation) rather than reaching for a private name. The charset
+    (``^[A-Z0-9][A-Z0-9\\-]{0,19}$``) and logic are unchanged from the original
+    private ``_validate_package``.
 
     Raises:
         ValueError: If *package* does not match ``^[A-Z0-9][A-Z0-9\\-]{0,19}$``.
@@ -189,12 +197,12 @@ def _validate_package(package: str) -> str:
 def _validate_filter_term(value: str, *, field: str) -> str:
     """Return *value* unchanged if it is a usable free-text filter term.
 
-    A *permissive* validator distinct from :func:`_validate_package`:
+    A *permissive* validator distinct from :func:`validate_package`:
     manufacturer and category names legitimately contain spaces and can exceed
     20 characters, so the strict package charset cannot be reused. The value is
     always bound as a Dgraph ``$``-variable (never inlined), so this is a
     usability + DoS guard rather than an injection guard — it rejects an
-    empty/whitespace-only term and caps the length at :data:`_MAX_FILTER_TERM_LEN`
+    empty/whitespace-only term and caps the length at :data:`MAX_FILTER_TERM_LEN`
     (defence-in-depth bound, ADR-0016 / ADR-0007 style).
 
     Args:
@@ -206,9 +214,9 @@ def _validate_filter_term(value: str, *, field: str) -> str:
     """
     if not value.strip():
         raise ValueError(f"{field} filter must be a non-empty value.")
-    if len(value) > _MAX_FILTER_TERM_LEN:
+    if len(value) > MAX_FILTER_TERM_LEN:
         raise ValueError(
-            f"{field} filter must be at most {_MAX_FILTER_TERM_LEN} characters."
+            f"{field} filter must be at most {MAX_FILTER_TERM_LEN} characters."
         )
     return value
 
@@ -281,20 +289,26 @@ def _render_fields(  # noqa: PLR0913 — keyword-only selection descriptor; cohe
 ) -> str:
     """Return the shared selection set rendered for every search block.
 
-    ``made_by`` is *always* selected; it gains an ``@filter(allofterms(name,
-    $mfr))`` clause only when a manufacturer filter is active (plain
-    ``made_by { name }`` otherwise). ``in_category`` is *conditionally* selected —
-    present only when a category filter is active (mirroring the ``in_package``
-    conditional pattern). ``in_package`` gains its ``@filter(eq(name, $pkg))`` when
-    a package filter is active, plain otherwise.
+    Scalar fields are fixed and always selected, including a bare ``price_usd``
+    (positioned immediately after ``is_basic``) so every row carries a price for
+    ``--json`` / ``--sort price`` (ADR-0017). ``price_usd`` is a plain selected
+    field, NOT a promoted predicate: it is never query-parsed into a ge/le
+    bracket, so it is deliberately absent from :data:`_PROMOTED_PREDICATES` (which
+    drives ADR-PARAM bracket semantics for query-derived quantities).
 
-    Layout (ADR-0016): when a manufacturer/category filter is active the
-    *constrained* edges are grouped at the FRONT of the selection (order:
-    ``in_package``, ``made_by``, ``in_category``) so the active constraints lead
-    the block; any unconstrained edge keeps its trailing position. A query with
-    NO manufacturer/category filter (the no-filter and package-only paths) keeps
-    the historical trailing layout, so its output stays byte-identical to the
-    pre-filter builder (three guard tests pin this).
+    ``made_by`` and ``in_category`` are BOTH selected unconditionally (so every
+    row can report its manufacturer/category even with no filter active), each
+    gaining its ``@filter(allofterms(name, $mfr|$cat))`` clause only when its own
+    filter is active; ``in_package`` gains ``@filter(eq(name, $pkg))`` only when a
+    package filter is active.
+
+    Layout (ADR-0016, retained): when a manufacturer/category filter is active
+    the *constrained* edges lead the selection (order ``in_package``,
+    ``made_by``, ``in_category``) so the active constraint immediately follows the
+    block's ``@cascade`` clause; the no-filter and package-only paths keep the
+    historical trailing layout. Filter/cascade BEHAVIOUR is unchanged — only the
+    selection surface is extended (bare ``price_usd`` + unconditional
+    ``in_category``).
     """
 
     def made_by_line() -> str:
@@ -303,16 +317,18 @@ def _render_fields(  # noqa: PLR0913 — keyword-only selection descriptor; cohe
         return f"{indent}made_by {{ name }}"
 
     def in_category_line() -> str:
-        return f"{indent}in_category @filter(allofterms(name, {category_var})) {{ name }}"
+        if has_category:
+            return f"{indent}in_category @filter(allofterms(name, {category_var})) {{ name }}"
+        return f"{indent}in_category {{ name }}"
 
     def in_package_line() -> str:
         if has_package:
             return f"{indent}in_package @filter(eq(name, {package_var})) {{ name }}"
         return f"{indent}in_package {{ name }}"
 
-    # The manufacturer/category filters are the PR1 additions; their presence
-    # switches on the leading-constraints layout. Package alone keeps the
-    # historical trailing layout for byte-compat.
+    # The manufacturer/category filters switch on the leading-constraints layout
+    # (the constrained edge leads the block); package alone keeps the historical
+    # trailing layout for backward-compatible output.
     lead_with_constraints = has_manufacturer or has_category
 
     lines: list[str] = []
@@ -331,20 +347,26 @@ def _render_fields(  # noqa: PLR0913 — keyword-only selection descriptor; cohe
             f"{indent}mpn_norm",
             f"{indent}stock",
             f"{indent}is_basic",
+            f"{indent}price_usd",
         ]
     )
     lines.extend(f"{indent}{pred}" for pred in _PROMOTED_PREDICATES)
 
     if lead_with_constraints:
-        # Only the unconstrained edges remain for the trailing section; the
-        # constrained ones were already emitted in the leading group.
+        # Only the edges NOT already emitted in the leading group remain. made_by
+        # and in_category are unconditional, so a non-leading one still trails
+        # here as a plain (unfiltered) selection.
         if not has_manufacturer:
             lines.append(made_by_line())
+        if not has_category:
+            lines.append(in_category_line())
         if not has_package:
             lines.append(in_package_line())
     else:
-        # Historical (pre-PR1) trailing layout — byte-identical output.
+        # Historical (pre-filter) trailing layout, extended with the now
+        # unconditional in_category { name } between made_by and in_package.
         lines.append(made_by_line())
+        lines.append(in_category_line())
         lines.append(in_package_line())
 
     lines.append(f"{indent}datasheet {{ url }}")
@@ -497,7 +519,7 @@ def build_search_dql(  # noqa: PLR0913, PLR0915 — keyword-only structured filt
     has_package = effective_package is not None
     package_var = "$pkg"
     if effective_package is not None:
-        variables[package_var] = _validate_package(effective_package)
+        variables[package_var] = validate_package(effective_package)
         var_decls.append(f"{package_var}: string")
 
     has_manufacturer = manufacturer is not None
@@ -671,7 +693,7 @@ def build_semantic_dql(  # noqa: PLR0913 — keyword-only structured-filter kwar
     has_package = parsed is not None and parsed.package is not None
     package_var = "$pkg"
     if parsed is not None and parsed.package is not None:
-        variables[package_var] = _validate_package(parsed.package)
+        variables[package_var] = validate_package(parsed.package)
         var_decls.append(f"{package_var}: string")
 
     has_manufacturer = manufacturer is not None

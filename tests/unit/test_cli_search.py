@@ -2982,3 +2982,836 @@ def test_ac_sf_6_category_oversized_exits_1_no_db_query() -> None:
     assert "/home/" not in result.output and "Traceback" not in result.output, (
         f"Gate-3: no path/traceback leak. Got: {result.output!r}"
     )
+
+
+# ===========================================================================
+# AC-SF-19..27, 32, 38: issue #15 PR2 — `partgraph search --sort` / `--json`
+#
+# New `partgraph search` flags/behavior under test:
+#   --sort {relevance,stock,price}   (default: relevance)
+#   --json                            (machine-readable envelope; suppresses
+#                                       the Rich table / banners / footer)
+#
+# Neither flag exists yet on the search command. Until implemented, Typer/
+# Click rejects them as "No such option" (a usage error, exit code 2) — the
+# correct RED state (a per-test runtime failure, never a collection error,
+# mirroring the established AC-SF flag-rollout pattern above).
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Help-copy pins (mirrors the AC-SF help-copy pins above for every new flag).
+# ---------------------------------------------------------------------------
+
+def test_cli_search_help_contains_sort_flag() -> None:
+    """PIN: `partgraph search --help` must document --sort."""
+    result = _invoke(["search", "--help"])
+    assert "--sort" in result.output, (
+        f"AC-SF: search --help must contain '--sort'. Got:\n{result.output}"
+    )
+
+
+def test_cli_search_help_contains_json_flag() -> None:
+    """PIN: `partgraph search --help` must document --json."""
+    result = _invoke(["search", "--help"])
+    assert "--json" in result.output, (
+        f"AC-SF: search --help must contain '--json'. Got:\n{result.output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# --json fixtures
+# ---------------------------------------------------------------------------
+
+def _make_json_search_response() -> dict:
+    """Single DQL response with one richly-populated part (AC-SF-24/25)."""
+    return {
+        "exact": [
+            {
+                "uid": "0xJS1",
+                "mpn": "MAX232CPE",
+                "mpn_norm": "MAX232CPE",
+                "stock": 250,
+                "is_basic": True,
+                "price_usd": 0.4123,
+                "made_by": [{"name": "Texas Instruments"}],
+                "in_package": [{"name": "PDIP-16"}],
+                "in_category": [{"name": "RS232 ICs"}],
+                "datasheet": [
+                    {"url": "https://www.ti.com/lit/ds/symlink/max232.pdf"},
+                    {"url": "https://example.com/alt-max232.pdf"},
+                ],
+                "voltage_max": 5.5,
+            }
+        ],
+        "trig": [],
+        "fts": [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-24: --json stdout is exactly one JSON object; no Rich table/banners
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_24_json_flag_stdout_is_single_json_object_with_envelope_keys() -> None:
+    """AC-SF-24: Given a search result with one part.
+    When `partgraph search MAX232 --json` is invoked.
+    Then stdout parses as EXACTLY ONE JSON object via json.loads(), with keys
+    {version, query, nearest_match, count, results}, count == len(results),
+    and NO Rich table / banner / "Showing N result(s)." footer text.
+    """
+    mock_txn = _make_mock_txn([_make_json_search_response()])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--json"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-24: --json search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    envelope = json.loads(result.output)  # must be exactly one JSON value.
+    assert set(envelope) == {"version", "query", "nearest_match", "count", "results"}, (
+        f"AC-SF-24: envelope must have exactly the 5 documented keys. "
+        f"Got: {sorted(envelope)}"
+    )
+    assert envelope["version"] == 1
+    assert envelope["count"] == len(envelope["results"])
+
+    assert "Showing" not in result.output, (
+        f"AC-SF-24: --json output must not contain the Rich footer. Got:\n{result.output}"
+    )
+    assert "No matches found" not in result.output
+    for box_char in ("┃", "│", "┌", "└"):
+        assert box_char not in result.output, (
+            f"AC-SF-24: --json output must not contain a Rich table "
+            f"(box-drawing char {box_char!r} found). Got:\n{result.output}"
+        )
+
+
+def test_ac_sf_24_json_output_has_no_ansi_escape_codes_raw() -> None:
+    """AC-SF-24: Given a populated result.
+    When `partgraph search MAX232 --json` is invoked.
+    Then the RAW (unstripped) captured stdout contains NO ANSI escape
+    sequences at all — --json must never go through Rich's colour styling,
+    unlike the human table path.
+    """
+    mock_txn = _make_mock_txn([_make_json_search_response()])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        raw_result = RUNNER.invoke(app, ["search", "MAX232", "--json"])
+
+    # Exit-code check FIRST: today, --json is an unrecognized flag, and
+    # Click's own "No such option" usage-error panel happens to carry no ANSI
+    # codes either — which would make the ANSI-absence assertion below a
+    # VACUOUS pass (failing for an unrelated reason) unless exit_code==0 is
+    # asserted here first, forcing a genuine RED today.
+    assert raw_result.exit_code == 0, (
+        f"AC-SF-24: --json must exit 0. Got {raw_result.exit_code}.\n{raw_result.output}"
+    )
+    assert not _ANSI_RE.search(raw_result.output), (
+        f"AC-SF-24: --json output must contain no ANSI escape codes (raw). "
+        f"Got: {raw_result.output!r}"
+    )
+
+
+def test_ac_sf_24_json_flag_query_field_matches_raw_query() -> None:
+    """AC-SF-24: Given `partgraph search "MAX232" --json`.
+    When invoked.
+    Then envelope["query"] == "MAX232" (the raw query string).
+    """
+    mock_txn = _make_mock_txn([_make_json_search_response()])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--json"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-24: --json search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    envelope = json.loads(result.output)
+    assert envelope["query"] == "MAX232", (
+        f"AC-SF-24: envelope['query'] must equal the raw query text. "
+        f"Got: {envelope['query']!r}"
+    )
+
+
+def test_ac_sf_24_json_flag_nearest_match_false_for_hard_hit() -> None:
+    """AC-SF-24: Given a hard (exact-tier) hit.
+    When `partgraph search MAX232 --json` is invoked.
+    Then envelope["nearest_match"] is False (JSON boolean, not string).
+    """
+    mock_txn = _make_mock_txn([_make_json_search_response()])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--json"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-24: --json search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    envelope = json.loads(result.output)
+    assert envelope["nearest_match"] is False, (
+        f"AC-SF-24: nearest_match must be JSON false for a hard hit. "
+        f"Got: {envelope['nearest_match']!r}"
+    )
+
+
+def test_ac_sf_24_json_flag_no_truncate_is_a_no_op() -> None:
+    """AC-SF-24: Given `partgraph search MAX232 --json --no-truncate`.
+    When invoked.
+    Then the output is IDENTICAL to `--json` alone — --no-truncate has no
+    effect once --json is active (there is no column-cropping decision to
+    make for a machine-readable envelope).
+    """
+    mock_txn_a = _make_mock_txn([_make_json_search_response()])
+    mock_client_a = _make_mock_client(mock_txn_a)
+    with _patch_dgraph(mock_client_a):
+        result_plain = _invoke(["search", "MAX232", "--json"])
+
+    mock_txn_b = _make_mock_txn([_make_json_search_response()])
+    mock_client_b = _make_mock_client(mock_txn_b)
+    with _patch_dgraph(mock_client_b):
+        result_no_truncate = _invoke(["search", "MAX232", "--json", "--no-truncate"])
+
+    # Exit-code checks FIRST (and separately): today, --json is an unrecognized
+    # flag, so BOTH invocations hit the IDENTICAL Click "No such option: --json"
+    # usage error regardless of --no-truncate — which would make the output
+    # equality assertion below a VACUOUS pass (both sides fail identically,
+    # proving nothing about the real no-op contract) unless exit_code==0 is
+    # asserted here first, forcing a genuine RED today.
+    assert result_plain.exit_code == 0, (
+        f"AC-SF-24: --json alone must exit 0. Got {result_plain.exit_code}.\n{result_plain.output}"
+    )
+    assert result_no_truncate.exit_code == 0, (
+        f"AC-SF-24: --json --no-truncate must exit 0. "
+        f"Got {result_no_truncate.exit_code}.\n{result_no_truncate.output}"
+    )
+    assert result_plain.output == result_no_truncate.output, (
+        "AC-SF-24: --no-truncate must be a no-op under --json.\n"
+        f"--json alone:\n{result_plain.output}\n"
+        f"--json --no-truncate:\n{result_no_truncate.output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-25: row shape + null policy + machine-safe match_type
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_25_json_row_has_exact_key_set() -> None:
+    """AC-SF-25: Given one richly-populated result row.
+    When `partgraph search MAX232 --json` is invoked.
+    Then each row in results has EXACTLY the keys: mpn, mpn_norm,
+    manufacturer, package, category, stock, is_basic, price_usd, match_type,
+    datasheets, params (no more, no less — in particular no 'uid').
+    """
+    mock_txn = _make_mock_txn([_make_json_search_response()])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--json"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-25: --json search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    envelope = json.loads(result.output)
+    assert envelope["results"], "Expected at least one result row."
+    row = envelope["results"][0]
+    expected_keys = {
+        "mpn", "mpn_norm", "manufacturer", "package", "category", "stock",
+        "is_basic", "price_usd", "match_type", "datasheets", "params",
+    }
+    assert set(row) == expected_keys, (
+        f"AC-SF-25: row must have exactly these keys: {sorted(expected_keys)}. "
+        f"Got: {sorted(row)}"
+    )
+
+
+def test_ac_sf_25_json_row_values_match_source_data() -> None:
+    """AC-SF-25: Given the fixture in _make_json_search_response().
+    When `partgraph search MAX232 --json` is invoked.
+    Then the row's scalar values match the source DQL data exactly.
+    """
+    mock_txn = _make_mock_txn([_make_json_search_response()])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--json"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-25: --json search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    row = json.loads(result.output)["results"][0]
+    assert row["mpn"] == "MAX232CPE"
+    assert row["mpn_norm"] == "MAX232CPE"
+    assert row["manufacturer"] == "Texas Instruments"
+    assert row["package"] == "PDIP-16"
+    assert row["category"] == "RS232 ICs"
+    assert row["stock"] == 250
+    assert row["is_basic"] is True
+    assert row["price_usd"] == pytest.approx(0.4123)
+    assert row["match_type"] == "exact"
+    assert row["datasheets"] == [
+        "https://www.ti.com/lit/ds/symlink/max232.pdf",
+        "https://example.com/alt-max232.pdf",
+    ]
+    assert row["params"] == {"voltage_max": pytest.approx(5.5)}
+
+
+def test_ac_sf_25_json_row_null_policy_for_absent_scalars() -> None:
+    """AC-SF-25: Given a minimal row with NO manufacturer/package/category/
+    stock/is_basic/price_usd (all absent on the source node).
+    When `partgraph search MAX232 --json` is invoked.
+    Then the 7 scalar fields are present but JSON null; mpn_norm is
+    non-null; datasheets == []; params == {}.
+    """
+    sparse_response = {
+        "exact": [{"uid": "0xJS2", "mpn_norm": "SPARSE232"}],
+        "trig": [],
+        "fts": [],
+    }
+    mock_txn = _make_mock_txn([sparse_response])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--json"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-25: --json search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    row = json.loads(result.output)["results"][0]
+    assert row["mpn_norm"] == "SPARSE232", "mpn_norm must always be non-null."
+    for scalar in (
+        "mpn", "manufacturer", "package", "category", "stock", "is_basic", "price_usd",
+    ):
+        assert scalar in row and row[scalar] is None, (
+            f"AC-SF-25: absent scalar {scalar!r} must be present and JSON "
+            f"null. Got: {row.get(scalar, '<MISSING KEY>')!r}"
+        )
+    assert row["datasheets"] == [], "AC-SF-25: datasheets must be [] when none."
+    assert row["params"] == {}, (
+        "AC-SF-25: params must be {} when no promoted predicate is present."
+    )
+
+
+def test_ac_sf_25_json_row_match_type_is_machine_safe_not_bracketed_label() -> None:
+    """AC-SF-25: Given a result row from the 'trig' tier.
+    When `partgraph search MAX232 --json` is invoked.
+    Then match_type == "trigram" (machine-safe), never the human "Match"
+    label and never containing brackets like "[Semantic]".
+    """
+    response = {
+        "exact": [],
+        "trig": [{"uid": "0xJS3", "mpn_norm": "TRIGPART232", "mpn": "TRIGPART232"}],
+        "fts": [],
+    }
+    mock_txn = _make_mock_txn([response])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--json"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-25: --json search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    row = json.loads(result.output)["results"][0]
+    assert row["match_type"] == "trigram", (
+        f"AC-SF-25: trig-tier row must report match_type='trigram'. "
+        f"Got: {row['match_type']!r}"
+    )
+    assert "[" not in row["match_type"] and "]" not in row["match_type"], (
+        "AC-SF-25: match_type must never contain brackets (machine-safe, "
+        "not the human _MATCH_LABELS)."
+    )
+
+
+def test_ac_sf_25_json_output_never_contains_uid_or_hex_address() -> None:
+    """AC-SF-25: Given any populated result.
+    When `partgraph search MAX232 --json` is invoked.
+    Then the literal string "uid" and any Dgraph uid-shaped value ("0x...")
+    appear NOWHERE in the raw stdout text.
+    """
+    mock_txn = _make_mock_txn([_make_json_search_response()])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--json"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-25: --json search must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert "uid" not in result.output, (
+        f"AC-SF-25: the string 'uid' must never appear in --json output. "
+        f"Got:\n{result.output}"
+    )
+    assert not re.search(r"0x[0-9a-fA-F]+", result.output), (
+        f"AC-SF-25: no '0x...' uid-shaped value may appear in --json output. "
+        f"Got:\n{result.output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-26: empty/no-match under --json -> empty envelope, exit 0, never
+# "No matches found"
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_26_json_flag_empty_results_gives_empty_envelope_exit_0() -> None:
+    """AC-SF-26: Given zero results (all blocks empty).
+    When `partgraph search MAX232 --json` is invoked.
+    Then stdout is EXACTLY {"version":1,"query":"MAX232","nearest_match":false,
+    "count":0,"results":[]}, exit code 0, and "No matches found" NEVER
+    appears.
+    """
+    mock_txn = _make_mock_txn([{"exact": [], "trig": [], "fts": []}])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--json"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-26: empty --json result must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    envelope = json.loads(result.output)
+    assert envelope == {
+        "version": 1,
+        "query": "MAX232",
+        "nearest_match": False,
+        "count": 0,
+        "results": [],
+    }, f"AC-SF-26: empty envelope must match the exact documented shape. Got: {envelope}"
+    assert "No matches found" not in result.output, (
+        f"AC-SF-26: '--json' must NEVER print the human 'No matches found' "
+        f"banner. Got:\n{result.output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-27: --semantic ... --json — empty block bypasses _NO_EMBEDDINGS_HINT;
+# populated block -> match_type == "semantic", nearest_match == False
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_27_semantic_json_empty_block_gives_empty_envelope_no_embed_hint() -> None:
+    """AC-SF-27: Given a mocked encoder and a mocked client returning an
+    EMPTY semantic block.
+    When `partgraph search --semantic "rs232 transceiver" --json` is invoked.
+    Then exit code is 0, stdout is the empty envelope (count 0, results []),
+    and the human _NO_EMBEDDINGS_HINT text ("run `partgraph embed` first")
+    is NEVER printed — the cli.py short-circuit that prints it under the
+    non-JSON path must be bypassed entirely under --json.
+    """
+    empty_resp = {"exact": [], "trig": [], "fts": [], "semantic": []}
+    mock_txn = _make_mock_txn([empty_resp])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232 transceiver", "--json"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-27: empty --semantic --json must exit 0. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    envelope = json.loads(result.output)
+    assert envelope["count"] == 0 and envelope["results"] == [], (
+        f"AC-SF-27: empty semantic --json must give an empty envelope. Got: {envelope}"
+    )
+    assert "embed" not in result.output.lower(), (
+        f"AC-SF-27: the '_NO_EMBEDDINGS_HINT' embed-run hint must NEVER be "
+        f"printed under --json. Got:\n{result.output}"
+    )
+
+
+def test_ac_sf_27_semantic_json_populated_rows_have_semantic_match_type() -> None:
+    """AC-SF-27: Given a populated semantic result.
+    When `partgraph search --semantic "rs232 transceiver" --json` is invoked.
+    Then every row's match_type == "semantic" and envelope["nearest_match"]
+    is False.
+    """
+    mock_txn = _make_mock_txn([_make_semantic_response_with_max232()])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232 transceiver", "--json"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-27: populated --semantic --json must exit 0. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    envelope = json.loads(result.output)
+    assert envelope["nearest_match"] is False, (
+        f"AC-SF-27: semantic hit must never set nearest_match. "
+        f"Got: {envelope['nearest_match']!r}"
+    )
+    assert envelope["results"], "Expected at least one semantic result row."
+    for row in envelope["results"]:
+        assert row["match_type"] == "semantic", (
+            f"AC-SF-27: every semantic row must have match_type='semantic'. "
+            f"Got: {row['match_type']!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC-SF-38: --json --sort price -> one valid envelope, ordered per AC-SF-21
+# ---------------------------------------------------------------------------
+
+def test_ac_sf_38_json_with_sort_price_orders_results_ascending_price_missing_last() -> None:
+    """AC-SF-38: Given three parts: price_usd=0.50, price_usd=0.10, and a
+    part with price_usd entirely absent.
+    When `partgraph search MAX232 --json --sort price` is invoked.
+    Then envelope["results"] is ordered ascending by price_usd with the
+    missing-price row LAST (mirrors AC-SF-21's rank_results contract, now
+    proven end-to-end through the CLI + JSON envelope).
+    """
+    response = {
+        "exact": [
+            {"uid": "0xM1", "mpn_norm": "HIGH", "price_usd": 0.50},
+            {"uid": "0xM2", "mpn_norm": "LOW", "price_usd": 0.10},
+            {"uid": "0xM3", "mpn_norm": "NOPRICE"},
+        ],
+        "trig": [],
+        "fts": [],
+    }
+    mock_txn = _make_mock_txn([response])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--json", "--sort", "price"])
+
+    assert result.exit_code == 0, (
+        f"AC-SF-38: --json --sort price must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    envelope = json.loads(result.output)
+    mpn_norms = [row["mpn_norm"] for row in envelope["results"]]
+    assert mpn_norms == ["LOW", "HIGH", "NOPRICE"], (
+        f"AC-SF-38: --sort price must order ascending with missing price "
+        f"last. Got: {mpn_norms}"
+    )
+
+
+# ===========================================================================
+# AC-SF-40 (Gate 3 security FAIL-blocking, flagged by all three reviewers):
+# invalid --sort value -> exit 1 (NEVER Click's usage-error exit code 2),
+# fixed error text, no Dgraph client ever built.
+#
+# PIN: --sort MUST be implemented as a plain `str` option validated by OUR
+# code (a `_validate_sort_flag`, mirroring `_validate_min_stock_flag` /
+# `_validate_max_price_flag` / `_validate_package_flag`), NEVER as a Typer
+# `Enum`/`Literal`/`click.Choice` — either of those would make Click itself
+# reject a bad value with exit code 2 and Click's own generic usage-error
+# text, breaking both the exit-1 AND the fixed-message contract pinned here.
+# Mirrors the AC-SF-28 "never builds client" pattern exactly.
+# ===========================================================================
+
+def test_ac_sf_40_sort_bogus_value_exits_1_not_2_no_db_query() -> None:
+    """AC-SF-40: Given `--sort bogus` (not one of relevance/stock/price).
+    When invoked.
+    Then exit code is 1 (NEVER Click's usage-error exit code 2), the fixed
+    message '--sort must be one of: relevance, stock, price.' is printed,
+    _build_dgraph_client is NEVER called, and no path/traceback leaks.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--sort", "bogus"])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-40: bad --sort must exit 1 (never Click's exit-2). "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    assert "--sort must be one of: relevance, stock, price." in result.output, (
+        f"AC-SF-40: expected the fixed '--sort must be one of: relevance, "
+        f"stock, price.' error text. Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output and "Traceback" not in result.output, (
+        f"AC-SF-40: no path/traceback leak. Got: {result.output!r}"
+    )
+
+
+def test_ac_sf_40_sort_empty_string_exits_1_not_2_no_db_query() -> None:
+    """AC-SF-40: Given `--sort ""` (empty string).
+    When invoked.
+    Then exit code 1, fixed error, no Dgraph client built, no path/traceback
+    leak.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--sort", ""])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-40: empty --sort must exit 1 (never Click's exit-2). "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    assert "--sort must be one of: relevance, stock, price." in result.output, (
+        f"AC-SF-40: expected the fixed '--sort must be one of: relevance, "
+        f"stock, price.' error text. Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output and "Traceback" not in result.output, (
+        f"AC-SF-40: no path/traceback leak. Got: {result.output!r}"
+    )
+
+
+def test_ac_sf_40_sort_uppercase_relevance_exits_1_not_2_no_db_query() -> None:
+    """AC-SF-40: Given `--sort Relevance` (uppercase — case-sensitive
+    mismatch of an otherwise-valid value; --sort is never case-folded).
+    When invoked.
+    Then exit code 1, fixed error, no Dgraph client built, no path/traceback
+    leak.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--sort", "Relevance"])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-40: uppercase --sort ('Relevance') must exit 1 (never "
+        f"Click's exit-2). Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    assert "--sort must be one of: relevance, stock, price." in result.output, (
+        f"AC-SF-40: expected the fixed '--sort must be one of: relevance, "
+        f"stock, price.' error text. Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output and "Traceback" not in result.output, (
+        f"AC-SF-40: no path/traceback leak. Got: {result.output!r}"
+    )
+
+
+def test_ac_sf_40_sort_numeric_string_exits_1_not_2_no_db_query() -> None:
+    """AC-SF-40: Given `--sort 1` (a numeric-looking string, not a valid
+    sort key).
+    When invoked.
+    Then exit code 1, fixed error, no Dgraph client built, no path/traceback
+    leak.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--sort", "1"])
+
+    assert result.exit_code == 1, (
+        f"AC-SF-40: numeric-string --sort ('1') must exit 1 (never Click's "
+        f"exit-2). Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    assert "--sort must be one of: relevance, stock, price." in result.output, (
+        f"AC-SF-40: expected the fixed '--sort must be one of: relevance, "
+        f"stock, price.' error text. Got:\n{result.output}"
+    )
+    assert "/home/" not in result.output and "Traceback" not in result.output, (
+        f"AC-SF-40: no path/traceback leak. Got: {result.output!r}"
+    )
+
+
+# ===========================================================================
+# Gate 3 (Security MUST-2): --json x error paths.
+#
+# A machine consumer parsing stdout must NEVER receive a half-JSON blob or a
+# raw Python traceback on an error path — every error (DB failure, bad
+# structured filter, empty query) must produce NO JSON envelope on stdout,
+# with the error handled the SAME way (fixed message, exit 1) as the
+# non-JSON path.
+# ===========================================================================
+
+def test_gate3_json_db_query_exception_exit_1_no_envelope_no_traceback() -> None:
+    """Gate 3 (Security MUST-2): Given a mock txn.query that raises
+    RuntimeError (DB down) — mirrors the existing _DB_QUERY_ERROR tests.
+    When `partgraph search MAX232 --json` is invoked.
+    Then exit code is 1, stdout is NOT a valid JSON envelope (no stray '{'),
+    no traceback, no path leak, and the fixed 'partgraph db up' hint is still
+    present (same B1/E4 contract as the non-JSON path).
+    """
+    mock_txn = MagicMock()
+    mock_txn.query.side_effect = RuntimeError("connection refused")
+    mock_txn.discard.return_value = None
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--json"])
+
+    assert result.exit_code == 1, (
+        f"Gate3: --json with a DB exception must exit 1. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    assert "{" not in result.output, (
+        f"Gate3: --json error output must NOT contain a stray JSON envelope "
+        f"opening brace. Got:\n{result.output}"
+    )
+    with pytest.raises(ValueError):
+        json.loads(result.output)
+    assert "Traceback" not in result.output, (
+        f"Gate3: no raw traceback may leak into --json error output. "
+        f"Got:\n{result.output!r}"
+    )
+    assert "/home/" not in result.output, (
+        f"Gate3: no filesystem path may leak into --json error output. "
+        f"Got:\n{result.output!r}"
+    )
+    assert "connection refused" not in result.output, (
+        f"Gate3/B1: raw exception text must not leak. Got: {result.output!r}"
+    )
+
+
+def test_gate3_json_invalid_package_exit_1_no_db_client_no_envelope() -> None:
+    """Gate 3 (Security MUST-2): Given `--json` combined with an invalid
+    --package value ("bad value" — contains a space, fails the package
+    charset).
+    When invoked.
+    Then exit code 1, _build_dgraph_client is NEVER called, and stdout is
+    NOT a valid JSON envelope.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--json", "--package", "bad value"])
+
+    assert result.exit_code == 1, (
+        f"Gate3: --json + invalid --package must exit 1. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    with pytest.raises(ValueError):
+        json.loads(result.output)
+
+
+def test_gate3_json_invalid_min_stock_exit_1_no_db_client_no_envelope() -> None:
+    """Gate 3 (Security MUST-2): Given `--json` combined with an invalid
+    --min-stock value (-1, negative).
+    When invoked.
+    Then exit code 1, _build_dgraph_client is NEVER called, and stdout is
+    NOT a valid JSON envelope.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--json", "--min-stock", "-1"])
+
+    assert result.exit_code == 1, (
+        f"Gate3: --json + invalid --min-stock must exit 1. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    with pytest.raises(ValueError):
+        json.loads(result.output)
+
+
+def test_gate3_json_empty_query_exit_1_no_envelope() -> None:
+    """Gate 3 (Security MUST-2): Given `--json` combined with an empty query
+    "".
+    When invoked.
+    Then exit code 1, the fixed 'empty' error text is present, and stdout is
+    NOT a valid JSON envelope.
+    """
+    mock_client = _make_mock_client()
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "", "--json"])
+
+    assert result.exit_code == 1, (
+        f"Gate3: --json + empty query must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    assert "empty" in result.output.lower(), (
+        f"Gate3: expected the fixed empty-query error text. Got:\n{result.output}"
+    )
+    with pytest.raises(ValueError):
+        json.loads(result.output)
+
+
+# ===========================================================================
+# Gate 3 (UI/UX MUST-2/3): --sort / --json help-text content.
+# ===========================================================================
+
+def test_gate3_help_sort_mentions_all_three_values() -> None:
+    """Gate 3 (UI/UX MUST-2): Given `partgraph search --help`.
+    When invoked.
+    Then the output documents --sort AND mentions all three valid values:
+    relevance, stock, price.
+    """
+    result = _invoke(["search", "--help"])
+    assert "--sort" in result.output, (
+        f"Gate3: search --help must document --sort. Got:\n{result.output}"
+    )
+    for value in ("relevance", "stock", "price"):
+        assert value in result.output, (
+            f"Gate3: search --help must mention the --sort value {value!r}. "
+            f"Got:\n{result.output}"
+        )
+
+
+def test_gate3_help_sort_mentions_default_relevance() -> None:
+    """Gate 3 (UI/UX MUST-3, 'ideally'): Given `partgraph search --help`.
+    When invoked.
+    Then the output documents that the DEFAULT --sort value is 'relevance'
+    (Typer's own "[default: ...]" annotation, mirroring how --limit already
+    shows "[default: 20]" in this repo's help output today).
+    """
+    result = _invoke(["search", "--help"])
+    assert "default" in result.output.lower() and "relevance" in result.output, (
+        f"Gate3: search --help should document 'relevance' as the --sort "
+        f"default. Got:\n{result.output}"
+    )
+
+
+def test_gate3_help_json_mentions_json_machine_readable() -> None:
+    """Gate 3 (UI/UX MUST-2): Given `partgraph search --help`.
+    When invoked.
+    Then the output documents --json AND the substring "JSON" appears
+    (machine-readable output contract).
+    """
+    result = _invoke(["search", "--help"])
+    assert "--json" in result.output, (
+        f"Gate3: search --help must document --json. Got:\n{result.output}"
+    )
+    assert "JSON" in result.output, (
+        f"Gate3: search --help must mention 'JSON' (machine-readable "
+        f"output). Got:\n{result.output}"
+    )
+
+
+# ===========================================================================
+# Gate 3 (ADR-0016 Option B, OPTIONAL guard): the human table stays
+# UNCHANGED — price/category surface ONLY via --json, never as a new column
+# in the Rich table.
+# ===========================================================================
+
+def test_gate3_human_table_never_shows_price_value_option_b() -> None:
+    """Gate 3 / ADR-0016 Option B (OPTIONAL — likely already implied by the
+    existing render tests; added as an explicit regression guard): Given a
+    search result whose underlying part carries price_usd=1.2345.
+    When `partgraph search MAX232` (the human, NON --json table) is invoked.
+    Then the price value does NOT appear anywhere in the rendered output —
+    ADR-0016 decided price/category surface ONLY via --json; the human table
+    stays UNCHANGED (no new price column).
+
+    NOTE: this PASSES TODAY already (pass-by-design regression guard, not a
+    RED test) — the current renderer's Rich table never reads price_usd at
+    all (confirmed: partgraph.query.renderer._PARAM_DISPLAY has no price_usd
+    entry). Flagged honestly as such.
+    """
+    response = {
+        "exact": [
+            {
+                "uid": "0xG3P1",
+                "mpn": "MAX232CPE",
+                "mpn_norm": "MAX232CPE",
+                "stock": 250,
+                "is_basic": True,
+                "price_usd": 1.2345,
+                "made_by": [{"name": "Texas Instruments"}],
+                "in_package": [{"name": "PDIP-16"}],
+                "datasheet": [{"url": "https://example.com/ds.pdf"}],
+            }
+        ],
+        "trig": [],
+        "fts": [],
+    }
+    mock_txn = _make_mock_txn([response])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232"])
+
+    assert "1.2345" not in result.output and "1.23" not in result.output, (
+        f"Gate3/ADR-0016 Option B: the human table must NOT show a price "
+        f"value. Got:\n{result.output}"
+    )
