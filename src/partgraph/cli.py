@@ -19,6 +19,7 @@ Design notes:
 
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -662,8 +663,133 @@ def _run_block_query(client, query_text: str, variables: dict[str, str]) -> dict
         txn.discard()
 
 
+#: Fixed, path-free error shown when a package is supplied BOTH in the positional
+#: query text and via --package. Names the conflict without echoing either value.
+_PACKAGE_TWICE_ERROR = (
+    "[red]Error:[/red] package given twice (once in the query text and once via "
+    "--package); use only one."
+)
+
+
+def _validate_filter_text_flag(value: str | None, *, flag: str) -> None:
+    """Validate a --manufacturer/--category free-text filter value.
+
+    A no-op when *value* is ``None``. Emits the fixed, path-free "<flag> must be
+    ..." error and exits 1 when the value is empty/whitespace-only or exceeds the
+    shared length cap. Enforced at the CLI boundary (mirroring
+    ``dql_builder._validate_filter_term``) so a bad value never builds a Dgraph
+    client (AC-SF-28).
+    """
+    if value is None:
+        return
+    from partgraph.query.dql_builder import _MAX_FILTER_TERM_LEN  # noqa: PLC0415
+
+    if not value.strip() or len(value) > _MAX_FILTER_TERM_LEN:
+        _err_console.print(
+            f"[red]Error:[/red] {flag} must be a non-empty value of at most "
+            f"{_MAX_FILTER_TERM_LEN} characters."
+        )
+        raise typer.Exit(code=1)
+
+
+def _validate_min_stock_flag(min_stock: str | None, *, in_stock: bool) -> int | None:
+    """Resolve the effective minimum-stock threshold from --min-stock/--in-stock.
+
+    ``--in-stock`` is sugar for ``--min-stock 1``; the two are mutually exclusive.
+    ``--min-stock`` is accepted as a string and parsed here (not by Typer's native
+    ``int``) so a bad value hits OUR fixed exit-1 message rather than Click's
+    exit-2 usage error. A non-integer/negative value emits the fixed, path-free
+    error and exits 1. Returns the integer threshold, or ``None`` when neither
+    flag is given.
+    """
+    if in_stock and min_stock is not None:
+        _err_console.print(
+            "[red]Error:[/red] --in-stock and --min-stock cannot be combined; "
+            "use only one."
+        )
+        raise typer.Exit(code=1)
+    if in_stock:
+        return 1
+    if min_stock is None:
+        return None
+    text = min_stock.strip()
+    try:
+        value = int(text)
+    except ValueError:
+        value = None
+    if value is None or value < 0:
+        _err_console.print("[red]Error:[/red] --min-stock must be a non-negative integer.")
+        raise typer.Exit(code=1)
+    return value
+
+
+def _resolve_is_basic_flag(*, basic: bool, extended: bool) -> bool | None:
+    """Resolve the tri-state basic/extended filter from the two boolean flags.
+
+    ``--basic`` and ``--extended`` are mutually exclusive (emits a fixed,
+    path-free error and exits 1). Returns ``True`` for ``--basic``, ``False`` for
+    ``--extended``, and ``None`` when neither is given (no filter).
+    """
+    if basic and extended:
+        _err_console.print(
+            "[red]Error:[/red] --basic and --extended cannot be combined; use only one."
+        )
+        raise typer.Exit(code=1)
+    if basic:
+        return True
+    if extended:
+        return False
+    return None
+
+
+def _validate_max_price_flag(max_price: str | None) -> float | None:
+    """Resolve the --max-price ceiling (USD) as a non-negative finite float.
+
+    Accepted as a string and parsed here (not by Typer's native ``float``) so a
+    bad value hits OUR fixed exit-1 message rather than Click's exit-2 usage
+    error. A non-numeric/negative/non-finite value emits the fixed, path-free
+    error and exits 1. Returns the float, or ``None`` when the flag is not given.
+    """
+    if max_price is None:
+        return None
+    text = max_price.strip()
+    try:
+        value = float(text)
+    except ValueError:
+        value = None
+    if value is None or not math.isfinite(value) or value < 0:
+        _err_console.print("[red]Error:[/red] --max-price must be a non-negative number (USD).")
+        raise typer.Exit(code=1)
+    return value
+
+
+def _validate_package_flag(package: str | None) -> str | None:
+    """Upper-case and charset-validate a --package flag value.
+
+    Returns the upper-cased package (ready to bind as ``$pkg``), or ``None`` when
+    the flag was not given. The caller is responsible for upper-casing before the
+    builder (the builder re-validates but does not upper-case); doing it here lets
+    ``--package soic-16`` succeed as ``SOIC-16``. A charset/length violation emits
+    the fixed, path-free "--package must be ..." error and exits 1 at the CLI
+    boundary, so a bad value never builds a Dgraph client (AC-SF-28).
+    """
+    if package is None:
+        return None
+    from partgraph.query.dql_builder import _validate_package  # noqa: PLC0415
+
+    candidate = package.strip().upper()
+    try:
+        return _validate_package(candidate)
+    except ValueError as exc:
+        _err_console.print(
+            "[red]Error:[/red] --package must be 1-20 characters of A-Z, 0-9 or "
+            "'-' (e.g. SOIC-16)."
+        )
+        raise typer.Exit(code=1) from exc
+
+
 @app.command()
-def search(
+def search(  # noqa: PLR0913 — Typer command surface: one option per filter flag
     query: str = typer.Argument(
         "",
         help="Free-text component query, e.g. 'MAX232' or '10k 0402 1%'.",
@@ -686,6 +812,64 @@ def search(
             "embedding similarity (e.g. 'rs232 transceiver'). Any positional "
             "query is then used only for parametric/package filters. Requires the "
             'optional [embed] extra (pip install -e ".[embed]").'
+        ),
+    ),
+    manufacturer: str | None = typer.Option(
+        None,
+        "--manufacturer",
+        help=(
+            "Filter by manufacturer name (case-insensitive; matches all tokens, "
+            "e.g. 'Texas Instruments')."
+        ),
+    ),
+    package: str | None = typer.Option(
+        None,
+        "--package",
+        help=(
+            "Filter by exact package code, e.g. 'SOIC-16' (case-insensitive; "
+            "cannot also be given as a package token in the query)."
+        ),
+    ),
+    category: str | None = typer.Option(
+        None,
+        "--category",
+        help=(
+            "Filter by category name (case-insensitive; matches all tokens, "
+            "e.g. 'RS232 ICs')."
+        ),
+    ),
+    in_stock: bool = typer.Option(
+        False,
+        "--in-stock",
+        help=(
+            "Only show parts in stock (stock > 0). Mutually exclusive with "
+            "--min-stock."
+        ),
+    ),
+    min_stock: str | None = typer.Option(
+        None,
+        "--min-stock",
+        help=(
+            "Only show parts with at least N units in stock (a non-negative "
+            "integer). Mutually exclusive with --in-stock."
+        ),
+    ),
+    basic: bool = typer.Option(
+        False,
+        "--basic",
+        help="Only show JLCPCB 'basic' parts. Mutually exclusive with --extended.",
+    ),
+    extended: bool = typer.Option(
+        False,
+        "--extended",
+        help="Only show JLCPCB 'extended' parts. Mutually exclusive with --basic.",
+    ),
+    max_price: str | None = typer.Option(
+        None,
+        "--max-price",
+        help=(
+            "Only show parts priced at or below this amount in USD (a "
+            "non-negative number)."
         ),
     ),
 ) -> None:
@@ -712,8 +896,30 @@ def search(
     --limit to bound the result count and --no-truncate to print full URLs.
     The command searches related parts by MPN similarity.
     """
+    # Shared structured-filter validation (AC-SF-28): validate every new filter
+    # flag BEFORE the --semantic branch split and BEFORE any Dgraph client is
+    # built, so both paths share one contract and a bad value never opens a
+    # connection. Each helper emits a fixed, path-free error and exits 1.
+    _validate_filter_text_flag(manufacturer, flag="--manufacturer")
+    _validate_filter_text_flag(category, flag="--category")
+    min_stock_val = _validate_min_stock_flag(min_stock, in_stock=in_stock)
+    is_basic_val = _resolve_is_basic_flag(basic=basic, extended=extended)
+    max_price_val = _validate_max_price_flag(max_price)
+    package_flag = _validate_package_flag(package)
+
     if semantic is not None:
-        _run_semantic_search(query, semantic, limit=limit, no_truncate=no_truncate)
+        _run_semantic_search(
+            query,
+            semantic,
+            limit=limit,
+            no_truncate=no_truncate,
+            manufacturer=manufacturer,
+            category=category,
+            min_stock=min_stock_val,
+            is_basic=is_basic_val,
+            max_price=max_price_val,
+            package_flag=package_flag,
+        )
         return
 
     from partgraph.query.dql_builder import build_search_dql  # noqa: PLC0415
@@ -727,25 +933,48 @@ def search(
 
     parsed = parse_query(query)
 
+    # A package may come from the query text (parsed.package) OR --package, never
+    # both (AC-SF-5). Reject the collision here — after parsing, before the client
+    # is built — so no query is issued on a contradictory request.
+    if parsed.package is not None and package_flag is not None:
+        _err_console.print(_PACKAGE_TWICE_ERROR)
+        raise typer.Exit(code=1)
+
+    # Hard user constraints threaded into BOTH the hard pass and the relaxed
+    # (nearest-match) pass — only the query-derived parametric quantities relax
+    # (AC-SF-17). package_flag is None when the package came from the query text,
+    # in which case the builder falls back to parsed.package.
+    filter_kwargs = {
+        "package": package_flag,
+        "manufacturer": manufacturer,
+        "category": category,
+        "min_stock": min_stock_val,
+        "is_basic": is_basic_val,
+        "max_price": max_price_val,
+    }
+
     stub = None
     try:
         client, stub = _build_dgraph_client()
 
-        # Pass 1 (hard): full parametric + text filter.
-        query_text, variables = build_search_dql(parsed, limit=limit)
+        # Pass 1 (hard): full parametric + text filter + all structured filters.
+        query_text, variables = build_search_dql(parsed, limit=limit, **filter_kwargs)
         data = _run_block_query(client, query_text, variables)
         result = rank_results(data, parsed)
 
         if not result.rows and parsed.quantities:
-            # Pass 2 (relaxed): drop parametric filters, keep text + package, and
-            # merge the relaxed rows under the "nearest" key for the ranker.
+            # Pass 2 (relaxed): drop parametric filters, keep text + package + the
+            # hard structured filters, and merge the relaxed rows under the
+            # "nearest" key for the ranker.
             relaxed = ParsedQuery(
                 quantities=[],
                 package=parsed.package,
                 text_tokens=parsed.text_tokens,
                 raw_query=parsed.raw_query,
             )
-            relaxed_text, relaxed_vars = build_search_dql(relaxed, limit=limit)
+            relaxed_text, relaxed_vars = build_search_dql(
+                relaxed, limit=limit, **filter_kwargs
+            )
             relaxed_data = _run_block_query(client, relaxed_text, relaxed_vars)
 
             hard_uids = {
@@ -780,28 +1009,38 @@ def search(
     render_search_results(result, parsed, _console, no_truncate=no_truncate)
 
 
-def _run_semantic_search(
+def _run_semantic_search(  # noqa: PLR0913 — keyword-only filter passthrough
     query: str,
     semantic_text: str,
     *,
     limit: int,
     no_truncate: bool,
+    manufacturer: str | None = None,
+    category: str | None = None,
+    min_stock: int | None = None,
+    is_basic: bool | None = None,
+    max_price: float | None = None,
+    package_flag: str | None = None,
 ) -> None:
     """Run a read-only semantic (embedding-similarity) search.
 
     *semantic_text* is embedded into a query vector; the positional *query* (if
     any) is parsed only for parametric/package filters layered onto the vector
-    search (a hybrid query). The path is strictly read-only and never mutates.
+    search (a hybrid query). The structured filters (already validated by the
+    caller) compose into the SAME similar_to block exactly as on the lexical path
+    (AC-SF-16). The path is strictly read-only and never mutates.
 
     Error handling (path-free, never leaks an exception or filesystem path):
     - empty *semantic_text* is rejected before the encoder or DB is touched;
     - a missing [embed] extra (ImportError) exits 1 with the install hint and
       issues NO Dgraph query;
+    - a package supplied both in the query text and via --package exits 1 with the
+      fixed collision message, before the client is built;
     - a DB failure exits 1 with the fixed "partgraph db up" message;
     - an empty result prints an actionable "run `partgraph embed` first" hint.
     """
     from partgraph.query.dql_builder import build_semantic_dql  # noqa: PLC0415
-    from partgraph.query.parser import parse_query  # noqa: PLC0415
+    from partgraph.query.parser import ParsedQuery, parse_query  # noqa: PLC0415
     from partgraph.query.ranker import rank_results  # noqa: PLC0415
     from partgraph.query.renderer import render_search_results  # noqa: PLC0415
 
@@ -826,10 +1065,34 @@ def _run_semantic_search(
     # text is NOT embedded (the --semantic text drives the embedding).
     parsed = parse_query(query) if query.strip() else None
 
+    # Thread --package into the hybrid parsed filters (build_semantic_dql reads the
+    # package from parsed.package). Reject the same package-given-twice collision
+    # as the lexical path, before the client is built.
+    if package_flag is not None:
+        if parsed is not None and parsed.package is not None:
+            _err_console.print(_PACKAGE_TWICE_ERROR)
+            raise typer.Exit(code=1)
+        base = parsed if parsed is not None else parse_query("")
+        parsed = ParsedQuery(
+            quantities=base.quantities,
+            package=package_flag,
+            text_tokens=base.text_tokens,
+            raw_query=base.raw_query,
+        )
+
     stub = None
     try:
         client, stub = _build_dgraph_client()
-        query_text, variables = build_semantic_dql(query_vector, limit, parsed=parsed)
+        query_text, variables = build_semantic_dql(
+            query_vector,
+            limit,
+            parsed=parsed,
+            manufacturer=manufacturer,
+            category=category,
+            min_stock=min_stock,
+            is_basic=is_basic,
+            max_price=max_price,
+        )
         data = _run_block_query(client, query_text, variables)
         result = rank_results(data, parsed if parsed is not None else parse_query(""))
     except typer.Exit:

@@ -532,3 +532,66 @@ def test_query_parser_10000_char_input_no_raise() -> None:
     assert isinstance(pq, ParsedQuery), (
         f"parse_query('x'*10000) must return a ParsedQuery. Got: {type(pq)!r}"
     )
+
+
+# ===========================================================================
+# Guard (issue #15 PR1 — structured search filters): parser.py is FROZEN.
+#
+# The new --manufacturer/--package/--category/--in-stock/--min-stock/--basic/
+# --extended/--max-price CLI flags thread as KEYWORD ARGUMENTS on
+# build_search_dql/build_semantic_dql (see tests/unit/test_dql_builder.py,
+# AC-SF-*) — they must NOT be added as new ParsedQuery fields, and parse_query's
+# existing behavior must not change. This guard test is expected to PASS
+# immediately (parser.py is untouched by PR1); it exists to catch any future
+# regression where a filter flag is wired in as a ParsedQuery field instead of
+# a builder kwarg.
+# ===========================================================================
+
+def test_ac_sf_guard_parsed_query_has_exactly_its_four_existing_fields() -> None:
+    """Guard (issue #15 PR1): ParsedQuery must keep EXACTLY its four existing
+    fields (quantities, package, text_tokens, raw_query).
+
+    Given: PR1 adds --manufacturer/--package/--category/--in-stock/--min-stock/
+           --basic/--extended/--max-price as build_search_dql/build_semantic_dql
+           keyword arguments (per AC-SF-* in test_dql_builder.py).
+    When:  dataclasses.fields(ParsedQuery) is inspected.
+    Then:  the field set is unchanged — no new field (e.g. "manufacturer",
+           "category", "min_stock", "is_basic", "max_price") has been added to
+           ParsedQuery. parser.py stays frozen for PR1.
+    """
+    import dataclasses
+
+    field_names = {f.name for f in dataclasses.fields(ParsedQuery)}
+    assert field_names == {"quantities", "package", "text_tokens", "raw_query"}, (
+        "PR1 guard violated: ParsedQuery must keep exactly its 4 existing fields "
+        "(parser.py is frozen for issue #15 PR1 — new filters thread as "
+        "build_search_dql/build_semantic_dql keyword arguments instead). "
+        f"Got fields: {sorted(field_names)}"
+    )
+
+
+def test_ac_sf_guard_parse_query_max232_output_unchanged() -> None:
+    """Guard (issue #15 PR1): parse_query("MAX232") output is byte-identical to
+    its pre-PR1 shape — no package/category/manufacturer side-channel is
+    smuggled onto ParsedQuery by parsing free text differently.
+    """
+    pq = parse_query("MAX232")
+
+    assert pq.quantities == []
+    assert pq.package is None
+    assert pq.text_tokens == ["MAX232"]
+    assert pq.raw_query == "MAX232"
+
+
+def test_ac_sf_guard_parse_query_10k_0402_1pct_output_unchanged() -> None:
+    """Guard (issue #15 PR1): parse_query("10k 0402 1%") — the composition
+    fixture reused by AC-SF-15 — still parses to exactly the pre-PR1 shape.
+    """
+    pq = parse_query("10k 0402 1%")
+
+    assert pq.package == "0402"
+    assert pq.text_tokens == []
+    predicates = {q.predicate for q in pq.quantities}
+    assert predicates == {"resistance", "tolerance_pct"}, (
+        f"Expected resistance+tolerance_pct quantities only. Got: {predicates}"
+    )
