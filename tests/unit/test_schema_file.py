@@ -446,3 +446,87 @@ class TestDatasheetFailCount:
             f"type Datasheet must still include {existing_field!r} after "
             f"adding fail_count. Found block:\n{block}"
         )
+
+
+# ---------------------------------------------------------------------------
+# AC-RE-10 — Part.embed_text_hash (issue #11, PR 4: incremental re-embedding;
+# ADR-0015). Content hash (sha256 hex digest) of the text that produced a
+# Part's embedding, stamped alongside `embedding` by `embed_write` and
+# compared CLIENT-SIDE (in Python) by `partgraph embed --changed` to detect a
+# changed source text without a full re-embed. INDEX-FREE by design: the
+# reconcile pass never filters or looks up by hash VALUE in DQL — it only
+# reads the stored value (a plain has()/field read) and compares it to a
+# freshly computed one in Python, mirroring the index-free precedent already
+# set by stock_checked_at (issue #11 PR 2) and verified_at (issue #11 PR 1).
+# ---------------------------------------------------------------------------
+
+class TestEmbedTextHash:
+    def test_embed_text_hash_declared_as_string(self, schema_text: str) -> None:
+        """Given partgraph.dql defines the embed_text_hash predicate.
+        When we scan for its declaration.
+        Then it must be declared with type string.
+        """
+        assert _has_predicate_with_attrs(schema_text, "embed_text_hash", "string"), (
+            "Predicate 'embed_text_hash' must be declared as string in "
+            f"{SCHEMA_REL} (sha256 hex digest of the text that produced the "
+            "embedding; issue #11 PR 4)."
+        )
+
+    def test_embed_text_hash_is_index_free_and_never_upsert(self, schema_text: str) -> None:
+        """Given partgraph.dql defines the embed_text_hash predicate.
+        When we scan for its declaration.
+        Then it must carry NEITHER an @index directive NOR @upsert — the
+        reconcile pass compares hashes client-side (in Python), never via a
+        Dgraph index or an upsert-conflict lookup, mirroring the index-free
+        precedent set by stock_checked_at / verified_at (Gate 3 SHOULD —
+        security: ties the client-side-comparison invariant to the schema
+        itself, not only to query text).
+        """
+        lines = schema_text.splitlines()
+        window = ""
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("embed_text_hash:"):
+                window = "\n".join(lines[i : i + 5])
+                break
+        assert window, f"Predicate 'embed_text_hash' not found in {SCHEMA_REL}."
+        assert "@index" not in window, (
+            "Predicate 'embed_text_hash' must be INDEX-FREE (mirrors "
+            "stock_checked_at/verified_at — comparison is client-side, never "
+            f"a Dgraph index). Found:\n{window}"
+        )
+        assert "@upsert" not in window, (
+            "Predicate 'embed_text_hash' must NEVER carry @upsert — it is "
+            "compared client-side, never used as an upsert conflict key. "
+            f"Found:\n{window}"
+        )
+
+    def test_part_type_includes_embed_text_hash(self, schema_text: str) -> None:
+        """Given the Part type declaration.
+        When we inspect its field list.
+        Then it must include 'embed_text_hash'.
+        """
+        block = _type_block_text(schema_text, "Part")
+        assert block, f"type Part {{ ... }} not found in {SCHEMA_REL}."
+        assert re.search(r"\bembed_text_hash\b", block), (
+            f"type Part must include 'embed_text_hash'. Found block:\n{block}"
+        )
+
+    @pytest.mark.parametrize(
+        "existing_field",
+        ["xid", "embedding", "stock_checked_at", "description", "source_refs"],
+    )
+    def test_part_type_still_includes_existing_fields(
+        self, schema_text: str, existing_field: str
+    ) -> None:
+        """Given the Part type declaration is extended with embed_text_hash.
+        When we inspect its field list.
+        Then every pre-existing field (xid/embedding/stock_checked_at/
+        description/source_refs) must still be present — adding
+        embed_text_hash must not displace any existing field.
+        """
+        block = _type_block_text(schema_text, "Part")
+        assert block, f"type Part {{ ... }} not found in {SCHEMA_REL}."
+        assert re.search(rf"\b{re.escape(existing_field)}\b", block), (
+            f"type Part must still include {existing_field!r} after adding "
+            f"embed_text_hash. Found block:\n{block}"
+        )

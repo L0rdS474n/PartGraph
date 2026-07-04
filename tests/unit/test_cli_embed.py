@@ -73,6 +73,12 @@ AC-EC-12 (_EMBED_SELECT_DEFAULT removed):
   - the old 200_000 default-selection-cap constant no longer exists on
     the cli module at all; --limit is the only way to bound a run.
 
+AC-RE-9 (issue #11 PR 4; ADR-0015 — incremental re-embedding):
+  - embed_write's payload contract is EXTENDED to {"uid", "embedding",
+    "embed_text_hash"}; test_ac_ec_6_write_txn_payload_only_uid_and_embedding
+    is updated accordingly (the ONLY AC-EC assertion this PR touches — see
+    tests/unit/test_cli_reembed.py for the new `embed --changed` behaviour).
+
 NOTE: COLUMNS=200 set before partgraph.cli import (matches existing CLI test pattern).
 Collection will ERROR until `embed` command exists in cli.py. That is the
 correct red state before PR4 implementation.
@@ -80,6 +86,7 @@ correct red state before PR4 implementation.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -96,6 +103,7 @@ import pytest  # noqa: E402
 from typer.testing import CliRunner  # noqa: E402
 
 from partgraph.cli import app  # noqa: E402, F401
+from partgraph.embed import build_embed_text  # noqa: E402
 
 RUNNER = CliRunner()
 
@@ -410,8 +418,9 @@ def test_ac_ec_6_selection_txn_is_read_only() -> None:
 def test_ac_ec_6_write_txn_payload_only_uid_and_embedding() -> None:
     """AC-EC-6: Given mocked client with one selectable part.
     When `partgraph embed --limit 10` is invoked.
-    Then every item in the write txn's mutate payload has ONLY uid+embedding keys.
-    (No mpn, description, made_by, stock, dgraph.type, xid — only uid+embedding.)
+    Then every item in the write txn's mutate payload has ONLY
+    uid+embedding+embed_text_hash keys (ADR-0015). (No mpn, description,
+    made_by, stock, dgraph.type, xid — only uid+embedding+embed_text_hash.)
     """
     read_txn = _make_mock_parts_txn()
     write_txn = _make_write_txn()
@@ -425,6 +434,15 @@ def test_ac_ec_6_write_txn_payload_only_uid_and_embedding() -> None:
         # If no mutate was called (e.g. part was skipped), accept it.
         return
 
+    # Oracle: mirrors _select_parts_for_embed's ACTUAL parsing of the default
+    # mock response — "category" comes from the "in_category" key, which the
+    # default fixture does not set, so the parsed part's category is None.
+    default_part = SimpleNamespace(
+        description="RS-232 level converter", category=None, package="DIP-16", tags=[],
+    )
+    oracle_hash = hashlib.sha256(build_embed_text(default_part).encode("utf-8")).hexdigest()
+
+    seen_hash = False
     for c_obj in mutate_calls:
         _, kwargs = c_obj
         set_obj = kwargs.get("set_obj")
@@ -439,11 +457,26 @@ def test_ac_ec_6_write_txn_payload_only_uid_and_embedding() -> None:
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                extra_keys = set(item.keys()) - {"uid", "embedding"}
+                extra_keys = set(item.keys()) - {"uid", "embedding", "embed_text_hash"}
                 assert not extra_keys, (
-                    f"AC-EC-6: write payload must ONLY have uid+embedding. "
-                    f"Found extra keys: {extra_keys!r} in: {item!r}"
+                    f"AC-EC-6: write payload must ONLY have uid+embedding+"
+                    f"embed_text_hash. Found extra keys: {extra_keys!r} in: {item!r}"
                 )
+                assert "embed_text_hash" in item, (
+                    f"AC-EC-6 (ADR-0015): write payload must carry "
+                    f"'embed_text_hash'. Item: {item!r}"
+                )
+                if item.get("uid") == "0xA001":
+                    assert item["embed_text_hash"] == oracle_hash, (
+                        f"AC-EC-6: embed_text_hash must equal the sha256 oracle "
+                        f"of the selected part's build_embed_text. Expected "
+                        f"{oracle_hash!r}, got {item['embed_text_hash']!r}"
+                    )
+                    seen_hash = True
+
+    assert seen_hash, (
+        "AC-EC-6: expected a mutation item for uid 0xA001 carrying embed_text_hash."
+    )
 
 
 def test_embed_selection_default_is_paged_below_grpc_receive_limit() -> None:

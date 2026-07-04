@@ -11,18 +11,32 @@ only via ``pip install -e ".[embed]"``. It is imported **lazily inside
 ``partgraph.embed`` (and running the unit suite, which mocks the encoder) never
 loads the heavy model stack.
 
-Write contract (AC-EW)
-----------------------
+Write contract (AC-EW / ADR-0015)
+---------------------------------
 Each successfully embedded part produces a mutation object that is *exactly*
-``{"uid": "<resolved_uid>", "embedding": "[...]"}`` — the resolved uid string
-(never a blank node) and the embedding encoded as Dgraph's ``float32vector``
-string literal (see :func:`_vector_literal`), and nothing else. A part without an
-``xid`` (so it cannot be resolved to an existing node) or whose embedding text is
-empty produces no mutation, so the run never mints new nodes.
+``{"uid": "<resolved_uid>", "embedding": "[...]", "embed_text_hash": "<sha256>"}``
+— the resolved uid string (never a blank node), the embedding encoded as Dgraph's
+``float32vector`` string literal (see :func:`_vector_literal`), and the sha256 hex
+digest of the *same* text that produced the vector (see
+:func:`compute_embed_text_hash`), and nothing else. Stamping the hash atomically
+with the vector lets a later ``partgraph embed --changed`` run detect a changed
+source text without a full re-embed (issue #11 PR 4). A part without an ``xid`` (so
+it cannot be resolved to an existing node) or whose embedding text is empty
+produces no mutation, so the run never mints new nodes.
+
+Incremental re-embedding write path (ADR-0015)
+----------------------------------------------
+:func:`stamp_hashes` (backfill ``{"uid", "embed_text_hash"}`` only, no encoder) and
+:func:`reembed_write` (re-encode + write the full 3-key object) are the reconcile
+pass's write helpers. They write by an already-resolved uid directly (no xid
+round-trip) and, like :func:`embed_write`, are the *only* place the reconcile
+fingerprint is written — both call :func:`compute_embed_text_hash` so sha256 is
+never re-inlined at a call site.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from collections.abc import Callable, Iterator
@@ -31,9 +45,12 @@ from typing import Any
 __all__ = [
     "EMBED_DIM",
     "build_embed_text",
+    "compute_embed_text_hash",
     "embed_write",
     "generate_embeddings",
     "get_encoder",
+    "reembed_write",
+    "stamp_hashes",
 ]
 
 #: Required embedding dimension. Pinned to all-MiniLM-L6-v2 (ADR-0008). Every
@@ -88,6 +105,20 @@ def build_embed_text(part: Any) -> str:
     )
 
     return " ".join(base_fields + clean_tags)
+
+
+def compute_embed_text_hash(text: str) -> str:
+    """Return the sha256 hex digest of *text* (encoded UTF-8).
+
+    This is the SINGLE source of the embed-text fingerprint (ADR-0015): every
+    writer that stamps ``embed_text_hash`` — :func:`embed_write`,
+    :func:`stamp_hashes`, :func:`reembed_write` — and the client-side comparison
+    in ``partgraph embed --changed`` derive the hash from here, so sha256 is
+    never re-inlined at a call site and the fingerprint can never drift between
+    the write and read sides. The digest is a deterministic 64-char lowercase-hex
+    string.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def generate_embeddings(
@@ -224,20 +255,27 @@ def _build_batch_payload(
 ) -> tuple[list[dict[str, Any]], int]:
     """Return ``(payload, skipped)`` for one batch.
 
-    Each payload object is exactly ``{"uid": <resolved_uid>, "embedding": "[...]"}``
-    — the resolved uid (from the lookup, else the part's own ``uid``) and the
-    embedding encoded as Dgraph's vector string literal (see
-    :func:`_vector_literal`). A part that resolves to no uid is skipped (never
-    minted as a new node).
+    Each payload object is exactly ``{"uid": <resolved_uid>, "embedding": "[...]",
+    "embed_text_hash": "<sha256>"}`` (ADR-0015) — the resolved uid (from the
+    lookup, else the part's own ``uid``), the embedding encoded as Dgraph's vector
+    string literal (see :func:`_vector_literal`), and the sha256 hash of the
+    *same* ``text`` that produced ``vector`` (:func:`compute_embed_text_hash`).
+    Hashing the exact source text here — not a re-derived one — keeps the stamped
+    fingerprint atomic with the vector, so it can never drift. A part that
+    resolves to no uid is skipped (never minted as a new node).
     """
     payload: list[dict[str, Any]] = []
     skipped = 0
-    for (part, _text), vector in zip(window, vectors, strict=False):
+    for (part, text), vector in zip(window, vectors, strict=False):
         resolved = xid_to_uid.get(part.xid) or getattr(part, "uid", None)
         if not isinstance(resolved, str) or not resolved:
             skipped += 1
             continue
-        payload.append({"uid": resolved, "embedding": _vector_literal(vector)})
+        payload.append({
+            "uid": resolved,
+            "embedding": _vector_literal(vector),
+            "embed_text_hash": compute_embed_text_hash(text),
+        })
     return payload, skipped
 
 
@@ -320,13 +358,100 @@ def embed_write(  # noqa: PLR0913 — signature is the frozen AC-EW test contrac
 
 
 def _write_payload(client: Any, payload: list[dict[str, Any]]) -> None:
-    """Write one ``uid+embedding`` payload in a single committed transaction."""
+    """Write one uid-keyed payload in a single committed transaction.
+
+    Used by every embed/reconcile write path; the payload objects carry only the
+    resolved ``uid`` plus the narrow set of predicates that path stamps (never a
+    blank node), so the write can never mint a new node.
+    """
     wtxn = client.txn()
     try:
         wtxn.mutate(set_obj=payload)
         wtxn.commit()
     finally:
         wtxn.discard()
+
+
+def stamp_hashes(client: Any, items: list[tuple[str, str]]) -> int:
+    """Backfill ``embed_text_hash`` for already-embedded parts (ADR-0015 case ii).
+
+    *items* is a list of ``(uid, text)`` pairs — parts that already HAVE an
+    embedding but carry no stored hash. Each is written as *exactly*
+    ``{"uid", "embed_text_hash"}`` (the hash via :func:`compute_embed_text_hash`
+    of *text*): the embedding is left untouched and no encoder is ever consulted,
+    so a first ``--changed`` run over a fully-embedded catalogue costs zero
+    encode work. Rows write by their already-resolved uid directly (no xid
+    round-trip). Returns the number of rows stamped.
+    """
+    payload: list[dict[str, Any]] = [
+        {"uid": uid, "embed_text_hash": compute_embed_text_hash(text)}
+        for uid, text in items
+        if isinstance(uid, str) and uid
+    ]
+    if payload:
+        _write_payload(client, payload)
+    return len(payload)
+
+
+def reembed_write(
+    items: list[tuple[str, str]],
+    client: Any,
+    *,
+    encoder: Callable | None = None,
+    controller: Any | None = None,
+    sleep: Callable | None = None,
+) -> int:
+    """Re-embed and re-stamp parts whose source text changed (ADR-0015 case iv).
+
+    *items* is a list of ``(uid, text)`` pairs already resolved to their node uid
+    (no xid round-trip — the reconcile selection read the uid directly). Each
+    ``text`` is re-encoded (batched via the injected *encoder*, paced by the
+    optional *controller* exactly like :func:`embed_write`) and written as
+    *exactly* ``{"uid", "embedding", "embed_text_hash"}`` — a fresh vector plus
+    the sha256 of the *same* text (:func:`compute_embed_text_hash`). Returns the
+    number of rows written.
+    """
+    if encoder is None:
+        raise ValueError("reembed_write requires an 'encoder' callable.")
+    rows = [
+        (uid, text)
+        for uid, text in items
+        if isinstance(uid, str) and uid and text
+    ]
+    if not rows:
+        return 0
+
+    sleep_fn: Callable[[float], None] = sleep if sleep is not None else time.sleep
+    total = len(rows)
+    written = 0
+    batch_size = max(1, int(getattr(controller, "max_batch", _DEFAULT_BATCH_SIZE)
+                          or _DEFAULT_BATCH_SIZE))
+
+    index = 0
+    while index < total:
+        window = rows[index:index + batch_size]
+        vectors = generate_embeddings(
+            [text for _, text in window],
+            encoder=encoder, batch_size=batch_size, expected_dim=EMBED_DIM,
+        )
+        payload = [
+            {
+                "uid": uid,
+                "embedding": _vector_literal(vector),
+                "embed_text_hash": compute_embed_text_hash(text),
+            }
+            for (uid, text), vector in zip(window, vectors, strict=False)
+        ]
+        if payload:
+            _write_payload(client, payload)
+            written += len(payload)
+
+        index += len(window)
+        # Pace the next batch via the adaptive controller, if provided.
+        if controller is not None and index < total:
+            batch_size = _pace_batch(controller, batch_size, sleep_fn)
+
+    return written
 
 
 def _pace_batch(
