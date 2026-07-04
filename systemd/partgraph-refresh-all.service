@@ -1,0 +1,36 @@
+# partgraph-refresh-all.service — one-shot PartGraph refresh (stock/price +
+# datasheet links). Triggered by partgraph-refresh-all.timer.
+#
+# Install this as a PER-USER unit (systemctl --user); it then runs as your own
+# login user — never root — so no `User=` directive is set. See
+# docs/scheduling.md for the install steps.
+#
+# It assumes the database is already up (`partgraph db up`); this unit does NOT
+# start or stop it.
+
+[Unit]
+Description=PartGraph refresh (stock/price + datasheet links), one-shot
+
+[Service]
+Type=oneshot
+
+# Run the wrapper from the per-user bin. %h is the invoking user's home, so no
+# operator-specific path is baked into this unit.
+ExecStart=%h/.local/bin/partgraph-refresh-all.sh
+
+# Optional operator config (e.g. set PARTGRAPH_REFRESH_FETCH=1 to enable the
+# weekly ~1 GB snapshot re-download in phase 1). The leading '-' makes a missing
+# file non-fatal.
+EnvironmentFile=-%h/.config/partgraph/refresh-all.env
+
+# Hardening. The default (no-fetch) run writes nothing to the filesystem — it
+# only talks to the local database over the network — and needs no privileges.
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+
+# NOTE: enabling --fetch (PARTGRAPH_REFRESH_FETCH=1) makes phase 1 write the
+# ~1 GB source snapshot into your PartGraph checkout's data/ directory. Because
+# ProtectSystem=strict mounts the filesystem read-only, you must then grant that
+# one directory back with a drop-in, e.g.:
+#   ReadWritePaths=<path-to-your-partgraph-checkout>/data
