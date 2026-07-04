@@ -77,6 +77,13 @@ is_basic:       bool @index(bool) .
 price_usd:      float @index(float) .
 lcsc_id:        string @index(exact) .
 
+# Freshness timestamp for the commercial fields (stock/is_basic/price_usd).
+# `partgraph refresh` stamps this each time it re-checks a part's LCSC
+# stock/price against the source snapshot (issue #11 PR 2). No @index: the
+# staleness filter uses plain has()/lt(), which Dgraph v25.3.4 evaluates
+# without one (same index-free precedent as `verified_at`).
+stock_checked_at: datetime .
+
 # Provenance markers, e.g. "jlcparts@2026-06-11".
 source_refs:    [string] .
 
@@ -124,6 +131,7 @@ type Part {
     is_basic
     price_usd
     lcsc_id
+    stock_checked_at
     source_refs
     made_by
     in_category

@@ -35,6 +35,10 @@ from partgraph.refresh.links import (
     format_verified_at,
     refresh_links_write,
 )
+from partgraph.refresh.stock import (
+    build_stock_index,
+    refresh_stock_write,
+)
 from partgraph.util.container import ContainerEngineError, compose_command
 
 # ``get_encoder`` is imported at module level (not lazily) ON PURPOSE: the test
@@ -49,6 +53,12 @@ from partgraph.util.container import ContainerEngineError, compose_command
 # rate-limiter construction and the leaf write call. partgraph.refresh.links is a
 # thin leaf (stdlib only; httpx is imported lazily by _build_http_client), so the
 # import stays light and opens no socket at import time.
+#
+# ``build_stock_index``/``refresh_stock_write`` (the stock/price refresh leaf,
+# issue #11 PR 2) are imported eagerly for the same testability reason: the
+# refresh tests patch ``refresh_stock_write`` at ``partgraph.cli`` to prove the
+# stock_index is built once and threaded into every page. partgraph.refresh.stock
+# is a pure-stdlib leaf (no gRPC/HTTP/source deps), so the import stays light.
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1541,6 +1551,375 @@ def refresh_links(
         f"[green]Checked {totals['checked']} datasheet links:[/green] "
         f"{totals['alive']} alive, {totals['dead']} dead, "
         f"{totals['purged']} purged."
+    )
+
+
+# ---------------------------------------------------------------------------
+# refresh command (re-check LCSC stock/price/is_basic, stamp freshness)
+# ---------------------------------------------------------------------------
+
+#: Fixed, path-free error shown when the stock/price refresh run fails against
+#: Dgraph (DB down / selection or write-back mutation error). The raw exception
+#: is never interpolated so no internal path leaks; deliberately TEXTUALLY
+#: DISTINCT from both :data:`_EMBED_DB_ERROR` and :data:`_REFRESH_DB_ERROR` (the
+#: refresh-links error) so the message names the right operation while still
+#: hinting `partgraph db up`.
+_REFRESH_STOCK_DB_ERROR = (
+    "[red]Error:[/red] could not refresh part stock/price. Is the database "
+    "running? Start it with `partgraph db up`."
+)
+
+#: Fixed, path-free error shown when the local source snapshot cannot be read
+#: (a corrupt/unreadable cached SQLite file, or an unrecognized schema). The raw
+#: exception and the absolute file path are never interpolated; --fetch is hinted
+#: as the remedy for a corrupt cache.
+_REFRESH_STOCK_SOURCE_ERROR = (
+    "[red]Error:[/red] could not read the component source database. The "
+    "cached file may be corrupt or incomplete; re-run with --fetch to "
+    "re-download it."
+)
+
+#: Fixed, path-free error shown when a `refresh --fetch` download fails. The raw
+#: exception is never interpolated so no internal path/URL detail leaks.
+_REFRESH_STOCK_FETCH_ERROR = (
+    "[red]Error:[/red] failed to download the component database. Check your "
+    "network connection and try again."
+)
+
+#: Maximum Part nodes selected for a stock/price refresh when no --limit is
+#: given. Bounds a single run; the full catalogue is covered across runs.
+_REFRESH_STOCK_SELECT_DEFAULT = 200_000
+
+#: Maximum Part nodes fetched from Dgraph in a single selection page. Kept
+#: comfortably below the gRPC message ceiling; the run loops over pages. Its own
+#: constant, never an alias of the embed / refresh-links page-size constants.
+_REFRESH_STOCK_SELECT_PAGE_SIZE = 10_000
+
+#: Shape of a real Dgraph uid (``0x`` + hex). COPIED (never imported/aliased)
+#: from the embed / refresh-links sections so the stock-refresh selection path
+#: stays fully decoupled from the pipelines the design forbids modifying. The
+#: keyset cursor is validated against this before it can reach a DQL ``after:``
+#: clause (validate-before-interpolate; ADR-0010 / dql_builder's ADR-INJECT).
+_REFRESH_STOCK_UID_RE = re.compile(r"^0x[0-9a-fA-F]+$")
+
+#: Informational (NOT error) notice printed when the keyset cursor fails to
+#: advance between pages — the defensive guard against re-fetching the same rows
+#: forever. Path-free and distinct from :data:`_REFRESH_STOCK_DB_ERROR` (this is
+#: not a failure; the run keeps whatever it refreshed so far).
+_REFRESH_STOCK_CURSOR_STALL = (
+    "pagination cursor did not advance; stopping early to avoid re-fetching."
+)
+
+#: The summary keys the stock/price refresh run aggregates across pages.
+_REFRESH_STOCK_SUMMARY_KEYS = ("checked", "matched", "absent")
+
+
+def _load_stock_index(dest: Path) -> dict:
+    """Parse the JLC source snapshot at *dest* into an in-memory stock index.
+
+    Opens the SQLite source via the already-shipped
+    :func:`~partgraph.sources.jlcparts.open_jlcparts_db` /
+    :class:`~partgraph.sources.jlcparts.JlcpartsAdapter` (mirroring
+    :func:`_stage_normalize`'s reuse) and joins the adapter's row stream into a
+    ``lcsc_id -> (stock, price_usd, is_basic)`` dict via
+    :func:`partgraph.refresh.stock.build_stock_index`. Built ONCE per run and
+    threaded into every page's write-back.
+
+    Any failure (a corrupt cache raising ``sqlite3.DatabaseError``, an
+    unrecognized schema raising ``ValueError``, etc.) propagates to the caller,
+    which catches BROADLY and renders it as a single path-free error — no raw
+    exception text or absolute path is surfaced.
+    """
+    from partgraph.sources.jlcparts import (  # noqa: PLC0415
+        JlcpartsAdapter,
+        open_jlcparts_db,
+    )
+
+    conn = open_jlcparts_db(dest)
+    adapter = JlcpartsAdapter(conn)
+    return build_stock_index(adapter.iter_parts())
+
+
+def _refresh_stock_page_max_uid(rows: list) -> str | None:
+    """Return the numerically-largest valid uid among *rows*, or ``None``.
+
+    Only uids matching :data:`_REFRESH_STOCK_UID_RE` are considered; a missing or
+    malformed uid is excluded (validate-before-interpolate — it must never become
+    a raw ``after:`` cursor). The maximum is taken NUMERICALLY via ``int(uid,
+    16)``, never lexicographically (``max("0x9", "0x10")`` as strings wrongly
+    yields ``"0x9"``). The winning uid's ORIGINAL string is returned so its exact
+    ``0x...`` form is preserved for the next query's cursor.
+
+    A dedicated copy of the cursor-max logic, kept decoupled from the pipelines
+    the design forbids modifying.
+    """
+    valid = [
+        row.uid
+        for row in rows
+        if isinstance(getattr(row, "uid", None), str)
+        and _REFRESH_STOCK_UID_RE.match(row.uid)
+    ]
+    if not valid:
+        return None
+    return max(valid, key=lambda uid: int(uid, 16))
+
+
+def _select_parts_for_refresh(
+    client,
+    limit: int | None,
+    *,
+    stale_days: int = 7,
+    after: str | None = None,
+) -> list:
+    """Select one page of stale Part nodes (with an lcsc_id) via a READ-ONLY query.
+
+    Roots at ``type(Part)`` and carries the EXACT parenthesized filter
+    ``@filter(has(lcsc_id) AND (NOT has(stock_checked_at) OR
+    lt(stock_checked_at, "<T>")))`` where ``T = _utcnow() - stale_days`` — a Part
+    is (re)checked only when it carries an lcsc_id AND was either never checked or
+    checked before the cutoff. The inner parentheses bind ``has(lcsc_id)`` to the
+    whole staleness OR, so an lcsc_id-less Part is never selected via the OR's
+    second arm. This is an INDEPENDENT selection: it never roots at
+    ``type(Datasheet)``, never carries ``NOT has(embedding)``, and never calls the
+    embed or link-refresh selection helpers.
+
+    When *after* is a valid uid it is emitted as a keyset cursor (``after:
+    <uid>``) so the next page starts strictly past the previous page's max uid;
+    the first page OMITS the clause. An *after* value that fails
+    :data:`_REFRESH_STOCK_UID_RE` is dropped rather than interpolated raw. The
+    transaction is ``read_only=True`` and always discarded.
+    """
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    first = limit if limit is not None else _REFRESH_STOCK_SELECT_PAGE_SIZE
+    first = max(1, min(int(first), _REFRESH_STOCK_SELECT_PAGE_SIZE))
+    cutoff = format_verified_at(_utcnow() - timedelta(days=stale_days))
+    # Validate-before-interpolate: only a well-formed uid may reach query text.
+    after_clause = (
+        f", after: {after}"
+        if after is not None and _REFRESH_STOCK_UID_RE.match(after)
+        else ""
+    )
+    query = (
+        f"{{ q(func: type(Part), first: {first}{after_clause}) "
+        f'@filter(has(lcsc_id) AND (NOT has(stock_checked_at) OR '
+        f'lt(stock_checked_at, "{cutoff}"))) {{ '
+        "uid lcsc_id "
+        "} }"
+    )
+    data = _run_block_query(client, query, {})
+    rows = []
+    for raw in data.get("q", []) or []:
+        if not isinstance(raw, dict):
+            continue
+        rows.append(
+            SimpleNamespace(
+                uid=raw.get("uid"),
+                lcsc_id=raw.get("lcsc_id"),
+            )
+        )
+    return rows
+
+
+def _refresh_stock_all_pages(
+    client,
+    *,
+    stock_index: dict,
+    stale_days: int,
+    remaining: int,
+    progress_bar,
+) -> dict:
+    """Refresh every stale Part's stock/price across cursor-paged selection queries.
+
+    Loops selection pages under a uid keyset cursor (``after:``), terminating on
+    (a) a zero-row page, (b) a short page, (c) a cursor that fails to strictly
+    advance (emits a path-free stall notice), or (d) ``remaining`` reaching 0 —
+    the same termination shape as the sibling paging loops, but with its own
+    copied helpers so the stock-refresh path never touches the pipelines the
+    design forbids modifying. The SAME pre-built *stock_index* object is threaded
+    into every page's write-back (built once, never per page). A
+    :class:`~partgraph.util.resources.ResourceController` paces local load between
+    pages. Returns the aggregated ``{"checked","matched","absent"}`` summary.
+    """
+    import time  # noqa: PLC0415 — monotonic sleep for inter-page pacing.
+
+    from partgraph.util.resources import (  # noqa: PLC0415
+        ResourceController,
+        get_system_reader,
+    )
+
+    totals = dict.fromkeys(_REFRESH_STOCK_SUMMARY_KEYS, 0)
+    task = progress_bar.add_task("Refreshing part stock/price", total=remaining)
+
+    controller = ResourceController()
+    # Attach a live reader so the controller paces the run off real system load.
+    controller.reader = get_system_reader()  # type: ignore[attr-defined]
+
+    selected_total = 0
+    last_uid: str | None = None  # uid keyset cursor; None on page 1.
+    while remaining > 0:
+        page_limit = min(remaining, _REFRESH_STOCK_SELECT_PAGE_SIZE)
+        rows = _select_parts_for_refresh(
+            client, page_limit, stale_days=stale_days, after=last_uid
+        )
+        if not rows:
+            break  # (a) no more stale parts.
+
+        page_size = len(rows)
+        page_max_uid = _refresh_stock_page_max_uid(rows)
+
+        # (c) Defensive guard: the cursor MUST strictly advance after page 1. A
+        # max uid that does not exceed the previous cursor means the server
+        # re-served processed rows — stop rather than re-fetch them forever.
+        if last_uid is not None and (
+            page_max_uid is None or int(page_max_uid, 16) <= int(last_uid, 16)
+        ):
+            _console.print(_REFRESH_STOCK_CURSOR_STALL)
+            break
+
+        summary = refresh_stock_write(
+            iter(rows),
+            client,
+            stock_index=stock_index,
+            clock=_utcnow,
+        )
+        for key, value in summary.items():
+            if key in totals:
+                totals[key] += int(value or 0)
+
+        selected_total += page_size
+        progress_bar.update(task, completed=selected_total)
+        remaining -= page_size  # (d) count each returned row exactly once.
+        if page_size < page_limit:
+            break  # (b) short page: fewer rows than asked means no more.
+
+        # Advance the cursor only when this page yielded a valid max uid. A real
+        # Dgraph page always does; keeping the previous cursor on the (test-only)
+        # all-malformed-uid case cannot lose real progress, and the stall guard
+        # above still fires on the next page if the cursor fails to advance — so
+        # a full page whose uids cannot form a cursor continues rather than
+        # ending the run one page early.
+        if page_max_uid is not None:
+            last_uid = page_max_uid
+        # Pace local resources before the next page (healthy box -> no-op).
+        controller.wait_until_healthy(reader=controller.reader, sleep=time.sleep)
+
+    return totals
+
+
+@app.command("refresh")
+def refresh(
+    stale_days: int = typer.Option(
+        7,
+        "--stale-days",
+        help=(
+            "Only re-check parts whose stock_checked_at is missing or older "
+            "than N days."
+        ),
+    ),
+    limit: str | None = typer.Option(
+        None,
+        "--limit",
+        help=(
+            "Limit to the first N parts (development/testing; the full run "
+            "covers the whole catalogue across runs). Must be a positive integer."
+        ),
+    ),
+    fetch: bool = typer.Option(
+        False,
+        "--fetch",
+        help="Download the JLCPCB/LCSC component database (~1 GB) before refreshing.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Re-download even if a matching cached file already exists (with --fetch).",
+    ),
+) -> None:
+    """Refresh each part's LCSC stock/price/basic status and stamp freshness.
+
+    Pages Part nodes carrying an lcsc_id (uid keyset cursor + a stock_checked_at
+    staleness filter), looks each up in the source snapshot's stock/price index
+    and writes a narrow stock/price_usd/is_basic/stock_checked_at update back by
+    uid — a part absent from the snapshot this run is stamp-only, leaving its
+    volatile fields untouched. The source snapshot is loaded once up front
+    (optionally re-downloaded with --fetch) and reused across every page.
+
+    This is a one-shot command bounded per run (schedule it via cron/systemd; see
+    PR 3). Errors are path-free: a missing source file, a corrupt cache or a
+    stopped database each exit 1 with a clear, path-free hint.
+    """
+    from rich.progress import (  # noqa: PLC0415
+        BarColumn,
+        Progress,
+        TaskProgressColumn,
+        TextColumn,
+    )
+
+    parsed_limit = _validate_limit(limit)
+    if stale_days < 0:
+        _err_console.print("[red]Error:[/red] --stale-days must not be negative.")
+        raise typer.Exit(code=1)
+
+    dest = RAW_DB_PATH
+    if fetch:
+        try:
+            _stage_fetch(dest, force=force)
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            # Path-free download-failure handling for this NEW call site: the raw
+            # exception is never interpolated, so no URL/path detail can leak.
+            _err_console.print(_REFRESH_STOCK_FETCH_ERROR)
+            raise typer.Exit(code=1) from exc
+    _require_source_file(dest, fetched=fetch)
+
+    try:
+        stock_index = _load_stock_index(dest)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        # Broad catch: a corrupt cache (sqlite3.DatabaseError), an unrecognized
+        # schema (ValueError) or any other parse failure is rendered path-free —
+        # never a raw exception or an absolute file path.
+        _err_console.print(_REFRESH_STOCK_SOURCE_ERROR)
+        raise typer.Exit(code=1) from exc
+
+    stub = None
+    totals = dict.fromkeys(_REFRESH_STOCK_SUMMARY_KEYS, 0)
+    try:
+        client, stub = _build_dgraph_client()
+        remaining = (
+            parsed_limit if parsed_limit is not None else _REFRESH_STOCK_SELECT_DEFAULT
+        )
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=_console,
+            transient=True,
+        ) as progress_bar:
+            totals = _refresh_stock_all_pages(
+                client,
+                stock_index=stock_index,
+                stale_days=stale_days,
+                remaining=remaining,
+                progress_bar=progress_bar,
+            )
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        # Any DB/runtime failure (selection read or write-back mutation): never
+        # interpolate the exception, so no internal path can leak.
+        _err_console.print(_REFRESH_STOCK_DB_ERROR)
+        raise typer.Exit(code=1) from exc
+    finally:
+        if stub is not None:
+            stub.close()
+
+    _console.print(
+        f"[green]Refreshed stock/price for {totals['checked']} parts:[/green] "
+        f"{totals['matched']} matched, {totals['absent']} absent."
     )
 
 
