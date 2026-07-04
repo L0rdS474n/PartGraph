@@ -19,11 +19,12 @@ import time
 import pytest
 import requests
 
+from partgraph.util.health import DGRAPH_HTTP_HEALTH_URL
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-DGRAPH_HTTP_HEALTH_URL = "http://127.0.0.1:8081/health"
 DGRAPH_GRPC_ADDR = "127.0.0.1:9081"
 
 # Bounded retry configuration for health polling (no fixed sleeps in tests).

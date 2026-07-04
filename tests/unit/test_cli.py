@@ -159,7 +159,9 @@ def _repo_docker_compose_path(repo_root: pathlib.Path | None = None) -> str:
     return str(repo_root / "docker" / "docker-compose.yml")
 
 
-@pytest.mark.parametrize("sub_cmd", ["up", "down", "status"])
+# `status` no longer delegates to Compose — it is engine-independent via an
+# HTTP health probe (see partgraph.util.health.probe_health / ADR-0018).
+@pytest.mark.parametrize("sub_cmd", ["up", "down"])
 def test_db_command_calls_subprocess_run_with_list_argv_no_shell(
     sub_cmd: str,
     repo_root: pathlib.Path,
@@ -242,14 +244,17 @@ def test_db_down_argv_does_not_contain_v_flag(
 # Security: -f path passed to docker compose must be absolute
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("sub_cmd", ["up", "down", "status"])
+# `status` no longer delegates to Compose — it is engine-independent via an
+# HTTP health probe (see partgraph.util.health.probe_health / ADR-0018).
+@pytest.mark.parametrize("sub_cmd", ["up", "down"])
 def test_db_command_compose_path_is_absolute(
     sub_cmd: str,
     repo_root: pathlib.Path,
     stub_compose_command: list[str],
 ) -> None:
     """Given the db sub-command invokes docker compose with compose_command() stubbed.
-    When we capture the subprocess.run argv for db up/down/status.
+    When we capture the subprocess.run argv for db up/down (status no longer
+    delegates to Compose — ADR-0018).
     Then the path element immediately following the '-f' flag must be an
     absolute path (starts with '/'), preventing CWD-relative file injection.
 

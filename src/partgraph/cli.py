@@ -41,6 +41,7 @@ from partgraph.refresh.stock import (
     refresh_stock_write,
 )
 from partgraph.util.container import ContainerEngineError, compose_command
+from partgraph.util.health import DGRAPH_HTTP_HEALTH_URL, probe_health
 
 # ``get_encoder`` is imported at module level (not lazily) ON PURPOSE: the test
 # suite patches it as ``patch.object(cli, "get_encoder", ...)`` for both the
@@ -218,8 +219,9 @@ def _run_compose(compose_args: list[str], *, action: str) -> None:
 def up() -> None:
     """Start the local Dgraph database in the background (compose up -d)."""
     _run_compose(["up", "-d"], action="start")
-    _console.print("[green]Dgraph is starting.[/green] "
-                   "Health: http://127.0.0.1:8081/health")
+    _console.print(
+        f"[green]Dgraph is starting.[/green] Health: {DGRAPH_HTTP_HEALTH_URL}"
+    )
 
 
 @db_app.command("down")
@@ -235,8 +237,37 @@ def down() -> None:
 
 @db_app.command("status")
 def status() -> None:
-    """Show the status of the local Dgraph container (compose ps)."""
-    _run_compose(["ps"], action="query the status of")
+    """Report whether the local Dgraph database is running and healthy.
+
+    Probes Dgraph's OWN HTTP /health endpoint (:data:`DGRAPH_HTTP_HEALTH_URL`)
+    rather than delegating to ``compose ps``, so the reported state reflects the
+    DATABASE's true liveness regardless of how it was started — compose, a
+    systemd timer, or a bare ``podman run`` / ``docker run`` — and needs no
+    container engine at all (ADR-0018). Exits 0 iff Dgraph is healthy, else 1.
+    """
+    try:
+        result = probe_health()
+    except Exception as exc:
+        # Defense-in-depth: probe_health already maps every EXPECTED network
+        # outcome (timeout / connection failure / non-200) to a HealthResult; the
+        # specific handled cases never reach here. Any UNEXPECTED error is turned
+        # into a fixed, path-free message and a clean exit so no raw traceback
+        # (which could leak an internal path) reaches the user's terminal —
+        # consistent with apply_schema/stats/search. Re-raised via ``from exc``,
+        # so this is not a blind, swallowing except (ruff BLE001 is satisfied).
+        _err_console.print(
+            "[red]Error:[/red] could not probe the Dgraph health endpoint."
+        )
+        raise typer.Exit(code=1) from exc
+
+    # ``markup=False``: the probe-derived message is untrusted for Rich markup
+    # (a version string or future body value could contain '[...]' and be
+    # misread as a style tag), so it is printed literally.
+    if result.healthy:
+        _console.print(result.message, markup=False)
+    else:
+        _err_console.print(result.message, markup=False)
+    raise typer.Exit(code=0 if result.healthy else 1)
 
 
 @db_app.command("apply-schema")
