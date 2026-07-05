@@ -27,12 +27,12 @@ import pytest
 import requests
 
 from partgraph.util import compose_command, engine_command
+from partgraph.util.health import DGRAPH_HTTP_HEALTH_URL
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-DGRAPH_HTTP_HEALTH_URL = "http://127.0.0.1:8081/health"
 DGRAPH_GRPC_ADDR = "127.0.0.1:9081"
 DGRAPH_ALPHA_PORTS_HOST = [8081, 9081, 8001]
 DGRAPH_ALPHA_PORTS_FORBIDDEN_ON_HOST = [8080, 9080]
