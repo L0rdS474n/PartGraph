@@ -240,7 +240,13 @@ def test_ac_eg_1_fake_encoder_returns_n_times_384_no_sentence_transformers() -> 
     Then:
     - Returns a list of 3 vectors, each of length 384.
     - sentence_transformers is NOT in sys.modules (lazy import contract).
+
+    Pops sentence_transformers from sys.modules first for collection-order
+    robustness: tests/integration/test_gate_pr4.py's module-level
+    importorskip can pollute sys.modules at collection time.
     """
+    # Before the call — placing this after would make the assertion vacuous.
+    sys.modules.pop("sentence_transformers", None)
     texts = ["rs232 transceiver", "capacitor 100nF", "resistor 10k"]
     result = generate_embeddings(texts, encoder=_fake_encoder, batch_size=10)
 
