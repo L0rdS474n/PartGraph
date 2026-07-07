@@ -42,6 +42,7 @@ from partgraph.refresh.stock import (
 )
 from partgraph.util.container import ContainerEngineError, compose_command
 from partgraph.util.health import DGRAPH_HTTP_HEALTH_URL, probe_health
+from partgraph.util.index_health import check_index_integrity
 
 # ``get_encoder`` is imported at module level (not lazily) ON PURPOSE: the test
 # suite patches it as ``patch.object(cli, "get_encoder", ...)`` for both the
@@ -305,6 +306,57 @@ def apply_schema() -> None:
         f"[green]Schema applied[/green] to Dgraph at {DGRAPH_GRPC_ADDR} "
         f"from {SCHEMA_FILE}."
     )
+
+
+@db_app.command("check-index")
+def check_index() -> None:
+    """Check the live vector-index integrity against the schema file (ADR-0019).
+
+    Calls :func:`partgraph.util.index_health.check_index_integrity`, which asks
+    Dgraph's OWN HTTP ``/query`` endpoint whether the live ``hnsw`` options on the
+    ``embedding`` predicate match ``schema/partgraph.dql`` and whether an embedded
+    part's stored vector, replayed through ``similar_to``, still finds itself.
+    Like ``db status`` (ADR-0018) this is engine-independent — it never calls a
+    container engine. Exits 0 iff the database is reachable, the schema matches,
+    and the self-similarity probe passed (or there is nothing embedded yet to
+    check); otherwise 1.
+    """
+    try:
+        result = check_index_integrity(schema_text=schema_module.load_schema(SCHEMA_FILE))
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        # Defense-in-depth (security Finding 2, mirroring status()): the leaf maps
+        # every EXPECTED network outcome to an IndexIntegrityResult and lets only
+        # UNEXPECTED errors propagate. Turn any such error into a fixed, path-free
+        # message and a clean exit so no raw traceback (which could leak an
+        # internal path) reaches the user's terminal. Re-raised via ``from exc``,
+        # so this is not a blind, swallowing except (ruff BLE001 is satisfied).
+        _err_console.print(
+            "[red]Error:[/red] could not run the index integrity check."
+        )
+        raise typer.Exit(code=1) from exc
+
+    # Exit formula (ADR-0019): healthy iff reachable AND the schema matches AND the
+    # self-similarity probe passed or was skipped for want of embedded parts
+    # (None). ``markup=False``: the probe-derived message is untrusted for Rich
+    # markup (an option value could contain '[...]'), so it is printed literally —
+    # the healthy line to stdout, any not-healthy line to stderr (mirrors status()).
+    exit_ok = bool(
+        result.reachable
+        and result.schema_ok
+        and result.self_similarity_ok in (True, None)
+    )
+    # ``soft_wrap=True``: the message is a single line by contract, but it can
+    # exceed the console width — without this Rich would soft-wrap it and insert a
+    # newline mid-message, splitting the verbatim status text. Soft-wrap prints it
+    # as one line. ``markup=False`` keeps a literal '[...]' in an option value from
+    # being misread as a Rich style tag (same discipline as status()).
+    if exit_ok:
+        _console.print(result.message, markup=False, soft_wrap=True)
+    else:
+        _err_console.print(result.message, markup=False, soft_wrap=True)
+    raise typer.Exit(code=0 if exit_ok else 1)
 
 
 # ---------------------------------------------------------------------------

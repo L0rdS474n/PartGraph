@@ -243,6 +243,34 @@ class TestPredicateDeclarations:
             f"'embedding' hnsw index must specify metric:cosine. Found:\n{line_window}"
         )
 
+    def test_embedding_hnsw_exponent_is_6(self, schema_text: str) -> None:
+        """AC-IDX-3: Given partgraph.dql defines the embedding predicate's hnsw
+        index (index-integrity PR C; ADR-0019).
+        When we scan for its declaration.
+        Then the hnsw index options must include exponent: "6" — raising the
+        HNSW graph's per-node neighbour count above the driver default to
+        improve ANN recall for `partgraph search --semantic`, and giving
+        `partgraph db check-index` (partgraph.util.index_health) a live,
+        non-default value to verify against schema/partgraph.dql's own
+        declared intent (a schema that only ever asserted the driver default
+        could never distinguish "correctly configured" from "never
+        configured").
+
+        EXPECTED RED until Gate 4 edits schema/partgraph.dql to add this
+        option: the CURRENT line only declares metric:"cosine" (no exponent),
+        which is the correct test-first red state before implementation.
+        """
+        line_window = ""
+        for i, line in enumerate(schema_text.splitlines()):
+            if line.lstrip().startswith("embedding:"):
+                line_window = "\n".join(schema_text.splitlines()[i : i + 5])
+                break
+        assert line_window, "Predicate 'embedding' not found in schema/partgraph.dql"
+        assert 'exponent: "6"' in line_window, (
+            "'embedding' hnsw index must specify exponent: \"6\" (AC-IDX-3). "
+            f"Found:\n{line_window}"
+        )
+
     def test_stock_with_int_index(self, schema_text: str) -> None:
         """Given partgraph.dql defines the stock predicate.
         When we scan for its declaration.

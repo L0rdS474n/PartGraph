@@ -1,31 +1,55 @@
 """
-Tests: GATE-PR4-1..2 — PR4 Semantic search acceptance gates.
+Tests: GATE-PR4-1..3 — PR4 Semantic search acceptance gates (READ-ONLY rework;
+ADR-0019, index-integrity PR C, regression vector 2).
 
 @pytest.mark.integration — all tests require:
   - A running Dgraph instance (dgraph_available fixture).
-  - The JLCPCB catalogue to have been ingested (PR2 ingest complete).
+  - The JLCPCB catalogue to have been ingested AND already embedded (PR2
+    ingest + a prior `partgraph embed` run).
   - sentence_transformers installed (pytest.importorskip("sentence_transformers")).
-  - Tests SKIP cleanly when DB is down or sentence_transformers is absent.
+  - Tests SKIP cleanly when DB is down, sentence_transformers is absent, or
+    (GATE-PR4-1 only) no MAX232-family part has been embedded yet.
 
-GATE-PR4-1: Embed ≤2000 parts including the MAX232 family via REAL model through
-            the adaptive controller. Write embedding by uid. Then
-            build_semantic_dql(encode("rs232 transceiver"), 10) — MAX232 NOT in
-            query text — and assert a MAX232-family row (mpn_norm contains "232")
-            is in the TOP-10. Print top-10. TEARDOWN: delete ONLY the embedding
-            predicate on the embedded uids. Assert Part count unchanged.
+STRICTLY READ-ONLY CONTRACT (this is the fix for regression vector 2 — the
+original version of this file embedded up to 2000 parts through the real
+model, wrote their `embedding` predicate by uid, and then removed it again via
+a raw graph-deletion teardown call, run as a plain "acceptance gate" against
+what may be a live/shared Dgraph instance. That write-then-remove cycle could
+race concurrent readers and, per the project's own `embedding` predicate
+teardown notes (see tests/conftest.py's `cleanup_marker_nodes`), a
+remove-then-reinsert cycle on an indexed `float32vector` predicate risks
+leaving a stale vector lingering in the hnsw index):
+  - GATE-PR4-1 no longer embeds anything. It queries for MAX232-family parts
+    (`mpn_norm` contains "232") that are ALREADY embedded (a precondition on
+    prior `partgraph embed` runs, not something this test performs), embeds
+    ONLY the query text "rs232 transceiver", and asserts a MAX232-family row
+    is in the semantic search TOP-10 against Dgraph's EXISTING production
+    vectors.
+  - There is no embedding-write call, no predicate-deletion helper (removed
+    entirely), and no graph-mutation construct of any kind anywhere in this
+    file. Every transaction is `client.txn(read_only=True)`, always
+    `.discard()`-ed — never committed.
+  - GATE-PR4-3 is an "edge-aware" bookend: a module-scoped, autouse fixture
+    captures BOTH the `type(Part)` count AND the `has(embedding)` count once,
+    UNCONDITIONALLY, before any test body runs (independent of whether
+    GATE-PR4-1 itself executes its assertion body or `pytest.skip()`s on its
+    own precondition) — GATE-PR4-3 then asserts both counts are unchanged and
+    strictly positive at the end.
 
 GATE-PR4-2: get_system_reader() real snapshot: cpu_count >= 1, fractions in
-            [0,1] (or None), regulate returns bounded directive.
+            [0,1] (or None), regulate returns bounded directive. UNCHANGED by
+            this rework (it never touched Dgraph or the embedding predicate).
 
-Part count bookend: uses the same { q(func: type(Part)) { count(uid) } } form
-as GATE-PR3 (safe in Dgraph v25, never root-level count(func:...)).
+Part/embedding count bookend: uses the same
+{ q(func: type(Part)) { count(uid) } } / { q(func: has(embedding)) { count(uid) } }
+named-block aggregation form as GATE-PR3 / GATE-PR4's original bookend (safe
+in Dgraph v25, never root-level count(func:...)).
 """
 
 from __future__ import annotations
 
 import json
 import sys
-import time
 
 import pytest
 
@@ -38,26 +62,30 @@ sentence_transformers = pytest.importorskip(
     ),
 )
 
-from partgraph.embed import build_embed_text, embed_write, generate_embeddings  # noqa: E402, F401
-from partgraph.query.dql_builder import build_semantic_dql  # noqa: E402, F401
-from partgraph.util.resources import ResourceController, SystemSnapshot, get_system_reader  # noqa: E402, F401
+from partgraph.query.dql_builder import build_semantic_dql  # noqa: E402
+from partgraph.util.resources import ResourceController, SystemSnapshot, get_system_reader  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Suite-level state (part count bookend, mirrors GATE-PR3 pattern)
+# Suite-level state (part/embedding count bookend, mirrors the GATE-PR3
+# pattern; extended with an embedding_count_before slot — ADR-0019).
 # ---------------------------------------------------------------------------
 
-_suite_state: dict[str, int | None] = {"part_count_before": None}
-
-# Maximum parts to embed in the gate test (bounded to keep CI tractable).
-_MAX_EMBED_PARTS = 2000
+_suite_state: dict[str, int | None] = {
+    "part_count_before": None,
+    "embedding_count_before": None,
+}
 
 # The embed dimension required by all PR4 components.
 _EMBED_DIM = 384
 
+# MAX232-family regexp match on mpn_norm, reused from the original gate.
+_MAX232_REGEXP = "/232/"
+
 
 # ---------------------------------------------------------------------------
-# Helpers (read-only, mirrors test_gate_pr3.py pattern)
+# Helpers (ALL read-only, mirrors test_gate_pr3.py pattern — no graph-mutation
+# call of any kind anywhere in this file)
 # ---------------------------------------------------------------------------
 
 def _dgraph_part_count(client) -> int:
@@ -73,58 +101,41 @@ def _dgraph_part_count(client) -> int:
         txn.discard()
 
 
-def _select_parts_for_embed(client, max_parts: int) -> list[dict]:
-    """Select up to max_parts Part nodes including the MAX232 family.
+def _dgraph_embedding_count(client) -> int:
+    """Return the number of parts carrying an `embedding` (has(embedding))."""
+    query = "{ q(func: has(embedding)) { count(uid) } }"
+    txn = client.txn(read_only=True)
+    try:
+        resp = txn.query(query)
+        data = json.loads(resp.json)
+        block = data.get("q", [])
+        return block[0]["count"] if block else 0
+    finally:
+        txn.discard()
 
-    Strategy:
-    1. Query MAX232-family parts (mpn_norm contains '232') first.
-    2. Fill remaining slots deterministically from the full catalogue.
 
-    Returns a list of raw part dicts with uid, xid, description, category, etc.
+def _select_embedded_max232_parts(client, limit: int = 50) -> list[dict]:
+    """Return up to *limit* MAX232-family parts that ALREADY carry an embedding.
+
+    Read-only precondition query for GATE-PR4-1 (ADR-0019): roots on the same
+    `regexp(mpn_norm, $rx)` MAX232-family match the original gate used, now
+    narrowed with `@filter(has(embedding))` so ONLY already-embedded parts are
+    returned — this test never embeds anything itself. A single
+    `txn(read_only=True)`, always discarded.
     """
-    # Step 1: fetch MAX232-family parts.
-    max232_query = (
+    query = (
         'query search($rx: string) { '
-        'q(func: regexp(mpn_norm, $rx), first: 50) { '
-        'uid xid mpn_norm description in_package { name } '
+        'q(func: regexp(mpn_norm, $rx)) @filter(has(embedding)) { '
+        'uid mpn_norm '
         '} }'
     )
     txn = client.txn(read_only=True)
     try:
-        resp = txn.query(max232_query, variables={"$rx": "/232/"})
+        resp = txn.query(query, variables={"$rx": _MAX232_REGEXP})
         data = json.loads(resp.json)
-        max232_parts = data.get("q", [])
+        return data.get("q", [])[:limit]
     finally:
         txn.discard()
-
-    # Step 2: fill up to max_parts from the full catalogue.
-    remaining_slots = max_parts - len(max232_parts)
-    max232_uids = {p["uid"] for p in max232_parts}
-
-    if remaining_slots > 0:
-        fill_query = (
-            f"{{ q(func: type(Part), first: {max_parts}) "
-            "{ uid xid mpn_norm description in_package { name } } }"
-        )
-        txn2 = client.txn(read_only=True)
-        try:
-            resp2 = txn2.query(fill_query)
-            data2 = json.loads(resp2.json)
-            all_parts = data2.get("q", [])
-        finally:
-            txn2.discard()
-
-        # Add non-MAX232 parts deterministically (sorted by uid for reproducibility).
-        fill_parts = sorted(
-            [p for p in all_parts if p.get("uid") not in max232_uids],
-            key=lambda p: p.get("uid", ""),
-        )[:remaining_slots]
-
-        combined = max232_parts + fill_parts
-    else:
-        combined = max232_parts[:max_parts]
-
-    return combined[:max_parts]
 
 
 def _encode_text(model, text: str) -> list[float]:
@@ -134,85 +145,74 @@ def _encode_text(model, text: str) -> list[float]:
     return result[0].tolist()
 
 
-def _delete_embedding_predicates(client, uids: list[str]) -> None:
-    """Delete ONLY the <uid> <embedding> * . triples for the given uids.
+# ---------------------------------------------------------------------------
+# Module-start baseline (edge-aware bookend, ADR-0019). autouse + module-
+# scoped: runs exactly once, BEFORE the first test in this module, regardless
+# of which test triggers fixture setup first, and regardless of whether
+# GATE-PR4-1 later pytest.skip()s on its own precondition — so GATE-PR4-3's
+# comparison is never starved of a baseline.
+# ---------------------------------------------------------------------------
 
-    This teardown leaves all other Part predicates intact.
-    """
-    if not uids:
-        return
+@pytest.fixture(scope="module", autouse=True)
+def _gate_pr4_baseline(dgraph_available, dgraph_pydgraph_client) -> None:
+    """Capture the Part count and has(embedding) count ONCE, unconditionally,
+    before any GATE-PR4 test body runs.
 
-    # Build del_nquads: one line per uid.
-    nquads = "\n".join(f"<{uid}> <embedding> * ." for uid in uids)
-
-    txn = client.txn()
-    try:
-        import pydgraph  # noqa: PLC0415
-        mutation = pydgraph.Mutation(del_nquads=nquads.encode("utf-8"))
-        txn.mutate(mutation=mutation)
-        txn.commit()
-    except Exception:  # noqa: BLE001 — best-effort teardown
-        pass
-    finally:
-        txn.discard()
-
-
-# ===========================================================================
-# GATE-PR4-1: end-to-end embed + semantic search
-# ===========================================================================
-
-@pytest.mark.integration
-def test_gate_pr4_1_embed_and_semantic_search_finds_max232(
-    dgraph_available,
-    dgraph_pydgraph_client,
-) -> None:
-    """GATE-PR4-1: Embed ≤2000 parts, write embeddings, then semantic search for
-    "rs232 transceiver" must return a MAX232-family part in the TOP-10.
-
-    Given: Dgraph contains the ingested JLCPCB catalogue including MAX232 parts.
-    When:
-      1. Select ≤2000 parts including MAX232 family.
-      2. Embed via real sentence-transformers model through adaptive controller.
-      3. Write embedding predicate by uid (uid+embedding payload only).
-      4. Build semantic DQL for "rs232 transceiver" with k=10.
-      5. Execute the DQL against Dgraph.
-      6. Assert a MAX232-family row (mpn_norm contains "232") is in the TOP-10.
-    Then:
-      - Wall seconds measured and printed.
-      - TOP-10 results printed.
-    Teardown:
-      - Delete ONLY the embedding predicate on embedded uids.
-      - Assert Part count unchanged (bookend).
+    Given: Dgraph is reachable.
+    When: this module is collected and set up.
+    Then: `_suite_state["part_count_before"]` and
+        `_suite_state["embedding_count_before"]` are populated exactly once.
     """
     client = dgraph_pydgraph_client
     _suite_state["part_count_before"] = _dgraph_part_count(client)
+    _suite_state["embedding_count_before"] = _dgraph_embedding_count(client)
 
-    # --- Step 1: Select parts ---
-    parts_raw = _select_parts_for_embed(client, _MAX_EMBED_PARTS)
-    assert parts_raw, "GATE-PR4-1: No parts found in Dgraph. Verify ingest completed."
+
+# ===========================================================================
+# GATE-PR4-1: read-only semantic search against EXISTING production vectors
+# ===========================================================================
+
+@pytest.mark.integration
+def test_gate_pr4_1_semantic_search_finds_already_embedded_max232(
+    dgraph_available,
+    dgraph_pydgraph_client,
+) -> None:
+    """GATE-PR4-1 (READ-ONLY, ADR-0019): semantic search for "rs232
+    transceiver" must surface an ALREADY-embedded MAX232-family part in the
+    TOP-10. This gate no longer embeds anything itself (the fix for
+    regression vector 2 — see the module docstring for why the original
+    embed-then-delete version was unsafe against a live/shared instance).
+
+    Given: Dgraph contains the ingested JLCPCB catalogue AND at least one
+        MAX232-family part (mpn_norm contains "232") has ALREADY been
+        embedded by a prior `partgraph embed` run.
+    When:
+      1. Query (read-only) for MAX232-family parts that already carry
+         `embedding`. If none exist, SKIP with an actionable message rather
+         than embedding anything ourselves.
+      2. Encode ONLY the query text "rs232 transceiver" (never any part's
+         text) with the real sentence-transformers model.
+      3. Build the semantic DQL (`build_semantic_dql`, k=10) and execute it
+         READ-ONLY against Dgraph's EXISTING production vectors.
+    Then:
+      - A MAX232-family row (mpn_norm contains "232") appears in the TOP-10.
+      - The transaction used is `read_only=True` and `.discard()`-ed; there is
+        no mutation, no embedding write, and no teardown step in this test.
+    """
+    client = dgraph_pydgraph_client
+
+    # --- Precondition (read-only): at least one ALREADY-embedded MAX232 part ---
+    max232_embedded = _select_embedded_max232_parts(client)
+    if not max232_embedded:
+        pytest.skip("no embedded MAX232-family parts; run `partgraph embed` first")
 
     print(
-        f"\n[GATE-PR4-1] Selected {len(parts_raw)} parts for embedding "
-        f"(including MAX232 family).",
+        f"\n[GATE-PR4-1] Found {len(max232_embedded)} already-embedded "
+        "MAX232-family part(s) (read-only precondition).",
         file=sys.stderr,
     )
 
-    # Convert raw dicts to namespace-like objects for build_embed_text.
-    from types import SimpleNamespace  # noqa: PLC0415
-    parts = []
-    for raw in parts_raw:
-        p = SimpleNamespace(
-            uid=raw.get("uid"),
-            xid=raw.get("xid"),
-            description=raw.get("description"),
-            category=None,  # not in selection for brevity
-            package=(raw.get("in_package") or [{}])[0].get("name"),
-            tags=[],
-            mpn_norm=raw.get("mpn_norm", ""),
-        )
-        parts.append(p)
-
-    # --- Step 2: Load real model and embed ---
+    # --- Load the real model and encode ONLY the query text ---
     from sentence_transformers import SentenceTransformer  # noqa: PLC0415
     model = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -223,38 +223,15 @@ def test_gate_pr4_1_embed_and_semantic_search_finds_max232(
         f"got {test_vec.shape[1]}. Choose a 384-dim model."
     )
 
-    # Build an adaptive controller.
-    controller = ResourceController(min_batch=8, max_batch=64, max_pause=5.0)
-
-    # Time the embedding + write.
-    t_start = time.monotonic()
-
-    # We use embed_write which handles batching, controller, and uid-only writes.
-    embed_write(
-        iter(parts),
-        client,
-        encoder=lambda texts: model.encode(texts).tolist(),
-        controller=controller,
-        sleep=time.sleep,
-        progress=lambda done, total: print(
-            f"[GATE-PR4-1] Embedded {done}/{total}", file=sys.stderr, end="\r"
-        ) if done % 100 == 0 else None,
-    )
-
-    wall_seconds = time.monotonic() - t_start
-    print(
-        f"\n[GATE-PR4-1] Embedding + write completed in {wall_seconds:.1f}s",
-        file=sys.stderr,
-    )
-
-    # --- Step 3: Semantic search for "rs232 transceiver" ---
     query_text_embed = "rs232 transceiver"
     query_vector = _encode_text(model, query_text_embed)
     assert len(query_vector) == _EMBED_DIM, (
         f"GATE-PR4-1: query vector must be {_EMBED_DIM}-dim; got {len(query_vector)}"
     )
 
-    # build_semantic_dql uses inline literal; "rs232" must NOT appear in query text.
+    # --- Semantic search against Dgraph's EXISTING production vectors ---
+    # build_semantic_dql uses an inline literal; "rs232" must NOT appear in
+    # the query text (the vector is inline; no text injection).
     dql, variables = build_semantic_dql(query_vector, k=10)
 
     assert "rs232" not in dql.lower(), (
@@ -262,7 +239,6 @@ def test_gate_pr4_1_embed_and_semantic_search_finds_max232(
         f"(vector is inline; no text injection). Got query:\n{dql}"
     )
 
-    # Execute.
     txn = client.txn(read_only=True)
     try:
         resp = txn.query(dql, variables=variables if variables else None)
@@ -274,7 +250,8 @@ def test_gate_pr4_1_embed_and_semantic_search_finds_max232(
     semantic_rows = data.get("semantic", data.get("similar", []))
 
     print(
-        f"[GATE-PR4-1] Semantic search 'rs232 transceiver' returned {len(semantic_rows)} rows.",
+        f"[GATE-PR4-1] Semantic search 'rs232 transceiver' returned "
+        f"{len(semantic_rows)} rows.",
         file=sys.stderr,
     )
     for i, row in enumerate(semantic_rows[:10]):
@@ -291,22 +268,14 @@ def test_gate_pr4_1_embed_and_semantic_search_finds_max232(
         f"GATE-PR4-1 FAILED: No MAX232-family row (mpn_norm contains '232') "
         f"found in TOP-10 semantic results for 'rs232 transceiver'. "
         f"Top-10 mpn_norms: {top10_mpn_norms}. "
-        "Verify: (1) MAX232 parts were embedded, (2) model produces useful embeddings, "
-        "(3) Dgraph vector index is active."
+        "Verify: (1) `partgraph embed` has embedded MAX232-family parts, "
+        "(2) the model produces useful embeddings, "
+        "(3) the Dgraph vector index is active."
     )
-
-    # --- Teardown: delete embedding predicates ---
-    embedded_uids = [p.uid for p in parts if p.uid is not None]
-    print(
-        f"[GATE-PR4-1] Teardown: deleting embedding predicate on "
-        f"{len(embedded_uids)} uids.",
-        file=sys.stderr,
-    )
-    _delete_embedding_predicates(client, embedded_uids)
 
 
 # ===========================================================================
-# GATE-PR4-2: real SystemSnapshot from get_system_reader
+# GATE-PR4-2: real SystemSnapshot from get_system_reader (UNCHANGED)
 # ===========================================================================
 
 @pytest.mark.integration
@@ -376,43 +345,57 @@ def test_gate_pr4_2_get_system_reader_real_snapshot_bounded(
 
 
 # ===========================================================================
-# GATE-PR4-3: Part count unchanged after the suite (read-only proof + teardown)
+# GATE-PR4-3: edge-aware bookend — Part count AND embedding count unchanged
 # ===========================================================================
 
 @pytest.mark.integration
-def test_gate_pr4_3_part_count_unchanged_after_suite(
+def test_gate_pr4_3_part_and_embedding_counts_unchanged_after_suite(
     dgraph_available,
     dgraph_pydgraph_client,
 ) -> None:
-    """GATE-PR4-3: The Part count in Dgraph is identical before and after the
-    GATE-PR4 suite, proving teardown (embedding predicate deletion) did not
-    remove any Part nodes.
+    """GATE-PR4-3 (edge-aware bookend, ADR-0019): both the Part count and the
+    has(embedding) count are identical before and after the GATE-PR4 suite —
+    proving this READ-ONLY suite never wrote, deleted, or otherwise mutated
+    ANY Part node or ANY embedding, regardless of whether GATE-PR4-1 itself
+    ran its assertion body or SKIPPED on its own precondition.
 
-    Given: part_count_before was recorded in GATE-PR4-1.
-    When:  we count Part nodes again after teardown.
-    Then:  both counts are equal and > 0.
+    Given: `_gate_pr4_baseline` captured both counts, UNCONDITIONALLY, at
+        module start (before GATE-PR4-1/2 ran).
+    When: we re-count both after the suite.
+    Then: both counts are identical AND strictly greater than zero (an empty
+        DB, or a catalogue with zero embedded parts, would make this bookend
+        meaningless rather than a genuine no-op proof).
     """
     count_before = _suite_state["part_count_before"]
+    embedding_before = _suite_state["embedding_count_before"]
+    assert count_before is not None and embedding_before is not None, (
+        "GATE-PR4-3: baseline was not captured. The _gate_pr4_baseline "
+        "fixture (autouse, module-scoped) must run before any test in this "
+        "module."
+    )
+
     count_after = _dgraph_part_count(dgraph_pydgraph_client)
+    embedding_after = _dgraph_embedding_count(dgraph_pydgraph_client)
 
     print(
-        f"\n[GATE-PR4-3] Part count before={count_before}  after={count_after:,}",
+        f"\n[GATE-PR4-3] Part count before={count_before:,} after={count_after:,}; "
+        f"embedding count before={embedding_before:,} after={embedding_after:,}",
         file=sys.stderr,
     )
 
     assert count_after > 0, (
         "GATE-PR4-3 FAILED: No Part nodes found after suite. Has the DB been reset?"
     )
-
-    if count_before is None:
-        pytest.skip(
-            "GATE-PR4-1 did not run (DB unavailable or sentence_transformers absent); "
-            "cannot compare before/after counts."
-        )
-
+    assert embedding_after > 0, (
+        "GATE-PR4-3 FAILED: No embedded parts found after suite. Has "
+        "`partgraph embed` never been run against this DB?"
+    )
     assert count_before == count_after, (
         f"GATE-PR4-3 FAILED: Part count changed from {count_before:,} to "
-        f"{count_after:,} after GATE-PR4 suite. "
-        "The embedding teardown must delete ONLY the embedding predicate, "
-        "not the Part nodes themselves."
+        f"{count_after:,} after the READ-ONLY GATE-PR4 suite."
+    )
+    assert embedding_before == embedding_after, (
+        f"GATE-PR4-3 FAILED: has(embedding) count changed from "
+        f"{embedding_before:,} to {embedding_after:,} after the READ-ONLY "
+        "GATE-PR4 suite."
     )
