@@ -1,93 +1,177 @@
 """
-Tests: AC-IDX-4..22 — partgraph.util.index_health (leaf module) +
-`partgraph db check-index` vector-index integrity gate (ADR-0019).
+Tests: AC-IDX-4..36 — partgraph.util.index_health (leaf module) +
+`partgraph db check-index` vector-index integrity gate (ADR-0019 and the
+multi-sample-probe rewrite that hardens it).
 
-Specifies the behaviour of the NEW leaf module ``partgraph.util.index_health``,
+Specifies the behaviour of the leaf module ``partgraph.util.index_health``,
 which lets `partgraph db check-index` answer a question `db status` cannot:
 not just "is Dgraph alive" but "does the LIVE hnsw vector-index configuration
 on the `embedding` predicate actually match what schema/partgraph.dql
-declares, and does a self-similarity probe (re-issuing an already-embedded
-part's own stored vector through `similar_to`) still find that same part" —
-catching a schema/live drift (e.g. `apply-schema` never re-run after an
-exponent bump) or a corrupted/rebuilding vector index that a bare `/health`
-200 would never reveal.
+declares, and does a SAMPLE of already-embedded parts' own stored vectors,
+replayed through `similar_to`, still find themselves" — catching a
+schema/live drift (e.g. `apply-schema` never re-run after an exponent bump)
+or a corrupted/rebuilding vector index that a bare `/health` 200 would never
+reveal.
 
-Pinned contract (leaf module ``partgraph.util.index_health`` — NOT YET
-IMPLEMENTED; collection of THIS file is expected to ERROR with
-ModuleNotFoundError until it exists, and that is the correct test-first red
-state, mirroring tests/unit/test_health.py's own documented red state):
+MULTI-SAMPLE-PROBE REWRITE (this file, AC-IDX-28..36 plus amendments to
+AC-IDX-12/14/15/16/17 and the two SECURITY tests): the ORIGINAL ADR-0019
+single-sample probe (`first: 1`, `similar_to(embedding, 5, ...)`) measured
+only 4-of-1000 self-similarity recall in production — a single sample was too
+weak a canary; one lucky/unlucky draw could flip the whole verdict either
+way. The probe now samples UP TO 30 embedded parts (`first: 30`) and replays
+EACH through a much wider `similar_to(embedding, 1000, ...)` (K raised from 5
+to 1000 — K=5 was itself too narrow to reliably re-find a part in a large
+HNSW graph even when the index is healthy), reporting a PASS RATE across the
+sample rather than one hit/miss.
+
+Ratified contract (leaf module ``partgraph.util.index_health`` — the module
+ALREADY EXISTS from the earlier ADR-0019 single-sample PR, so importing it
+succeeds; this file's NEW/AMENDED assertions below are the correct
+test-first RED state for an EXISTING module gaining new behaviour — expect
+runtime failures, not a collection-time ModuleNotFoundError: AssertionError
+where a query still says "first: 1" / "similar_to(embedding, 5," instead of
+"first: 30" / "similar_to(embedding, 1000,"; TypeError where
+``IndexIntegrityResult`` does not yet accept a ``self_similarity_rate=``
+keyword; AttributeError where a result built by the not-yet-rewritten
+``check_index_integrity`` has no ``.self_similarity_rate`` attribute — until
+Gate 3 implements it):
   - ``DGRAPH_QUERY_URL: str`` = "http://127.0.0.1:8081/query" — Dgraph's HTTP
     DQL query endpoint (documented in docs/connecting.md section 2.2:
     ``POST``, ``Content-Type: application/dql``), distinct from
-    ``partgraph.util.health.DGRAPH_HTTP_HEALTH_URL``.
-  - ``INDEX_PROBE_TIMEOUT_S: float`` = 2.0 — a finite, named, bounded timeout
-    (mirrors ``HEALTH_PROBE_TIMEOUT_S`` / ADR-0007's bounded-constant
-    precedent).
+    ``partgraph.util.health.DGRAPH_HTTP_HEALTH_URL``. UNCHANGED by this
+    rewrite.
+  - ``INDEX_PROBE_TIMEOUT_S: float`` = 2.0 — a finite, named, bounded
+    timeout (mirrors ``HEALTH_PROBE_TIMEOUT_S`` / ADR-0007's bounded-constant
+    precedent). UNCHANGED.
   - ``DEFAULT_EXPONENT: str`` = "3" — the Dgraph hnsw driver default applied
     when neither the schema file nor a live predicate's index_specs carries
     an explicit ``exponent`` key, so "not configured" and "configured to the
     documented default" compare equal rather than spuriously drifting.
+    UNCHANGED.
   - ``parse_file_hnsw_options(schema_text: str) -> tuple[tuple[str, str],
     ...]`` — PURE: extracts the ``hnsw(...)`` options for the ``embedding:``
     predicate line out of schema-FILE text, normalizes a missing
     ``exponent`` to ``("exponent", DEFAULT_EXPONENT)``, and returns a SORTED
-    tuple of ``(key, value)`` pairs.
+    tuple of ``(key, value)`` pairs. UNCHANGED (AC-IDX-4/5).
   - ``parse_live_hnsw_options(schema_json: dict) -> tuple[tuple[str, str],
     ...] | None`` — PURE: takes the FULL parsed JSON body of a live DQL
     ``schema(pred: [embedding]) {}`` response (i.e. exactly what
     ``response.json()`` returns — ``{"data": {"schema": [...]}}``), applies
     the SAME default-exponent normalization, and returns ``None`` when the
     ``embedding`` predicate is absent (including an empty ``schema`` array)
-    OR its ``index_specs`` carries no ``hnsw`` entry.
-  - ``@dataclass(frozen=True) class IndexIntegrityResult`` with EXACTLY six
-    fields: ``reachable: bool``, ``schema_ok: bool | None``,
+    OR its ``index_specs`` carries no ``hnsw`` entry. UNCHANGED (AC-IDX-6/7).
+  - Three internal, NON-EXPORTED constants size the probe. They are never
+    imported by this file (mirrors this file's existing convention of
+    asserting the literal query text rather than importing a private
+    constant); their effect is asserted via the outgoing query text and the
+    computed rate instead:
+      - ``_SELF_SIMILARITY_SAMPLE = 30`` — the selection query becomes
+        ``{ q(func: has(embedding), first: 30) { uid embedding } }`` (always
+        REQUESTS 30, regardless of how many rows the response actually
+        returns).
+      - ``_SELF_SIMILARITY_K = 1000`` (raised from 5) — every per-sample
+        replay becomes ``similar_to(embedding, 1000, "[...]")``.
+      - ``_SELF_SIMILARITY_THRESHOLD = 0.5`` — INCLUSIVE: a computed
+        ``rate >= 0.5`` PASSES.
+  - ``@dataclass(frozen=True) class IndexIntegrityResult`` with EXACTLY
+    SEVEN fields: ``reachable: bool``, ``schema_ok: bool | None``,
     ``file_options: tuple[tuple[str, str], ...]``,
     ``live_options: tuple[tuple[str, str], ...] | None``,
-    ``self_similarity_ok: bool | None``, ``message: str``.
+    ``self_similarity_ok: bool | None``, ``self_similarity_rate: float |
+    None`` (NEW — inserted between ``self_similarity_ok`` and ``message``),
+    ``message: str``. NO field carries a default: every RETURN PATH inside
+    ``check_index_integrity`` must set all seven explicitly, so an
+    incomplete construction is a loud ``TypeError`` at that call site, never
+    a silently-defaulted ``None``.
   - ``def check_index_integrity(*, schema_text: str,
     url=DGRAPH_QUERY_URL, timeout=INDEX_PROBE_TIMEOUT_S, http_post=None) ->
     IndexIntegrityResult`` — ALL FOUR parameters are keyword-only (mirrors
-    ``probe_health``'s discipline). ``http_post`` is the INJECTABLE SEAM
-    (defaults to a LAZILY-imported ``requests.post`` so this leaf never
-    imports ``requests`` eagerly just by being imported), invoked EXACTLY as
-    ``http_post(url, data=..., headers=..., timeout=timeout)`` and must
-    return an object exposing ``.status_code`` and ``.json()``. Flow:
+    ``probe_health``'s discipline; UNCHANGED). ``http_post`` is the
+    INJECTABLE SEAM (defaults to a LAZILY-imported ``requests.post`` so this
+    leaf never imports ``requests`` eagerly just by being imported), invoked
+    EXACTLY as ``http_post(url, data=..., headers=..., timeout=timeout)`` and
+    must return an object exposing ``.status_code`` and ``.json()``. Flow:
       1. Query the live schema (``schema(pred: [embedding]) {}``); a
          connection/timeout failure here short-circuits the WHOLE probe —
          ``reachable=False``, ``schema_ok=None``, ``live_options=None``,
-         ``self_similarity_ok=None`` — and NO further HTTP call is made.
+         ``self_similarity_ok=None``, ``self_similarity_rate=None`` — and NO
+         further HTTP call is made. UNCHANGED.
       2. Compare the live options (``parse_live_hnsw_options``) against the
          file options (``parse_file_hnsw_options(schema_text)``) ->
          ``schema_ok`` (``True``/``False`` once the live schema query
          SUCCEEDED, independent of whether it matched; never ``None`` in
-         that case).
-      3. Query the first embedded part (``{ q(func: has(embedding), first:
-         1) { uid embedding } }``); if none exists, ``self_similarity_ok``
-         is ``None`` and NO third call is made. Otherwise its stored vector
-         is re-issued verbatim through ``similar_to(embedding, 5,
-         "[...]")``; ``self_similarity_ok`` is ``True`` iff the part's OWN
-         uid is present in that result set.
-      4. Every returned ``message`` is a fixed, single-line, path-free
+         that case). UNCHANGED.
+      3. ONE selection call, ``{ q(func: has(embedding), first: 30) { uid
+         embedding } }``. Let ``M`` be the number of rows THIS query
+         actually returns (``M`` may be less than 30 — the request always
+         asks for 30; the response controls how many actually come back).
+         If ``M == 0``, ``self_similarity_ok`` and ``self_similarity_rate``
+         are both ``None`` and NO further call is made.
+      4. For EACH of the ``M`` returned rows, IN ORDER: validate its stored
+         vector via the SAME ``_safe_vector_literal`` security gate as
+         before (element-by-element ``repr(float(x))`` + strict-charset
+         ``fullmatch``).
+           - VALID: issue ONE ``similar_to(embedding, 1000, "[...]")`` call
+             replaying THAT row's own vector; count a HIT iff that row's own
+             uid appears in the result set, else a MISS. (Exactly one HTTP
+             call per valid row.)
+           - INVALID (not a list, or any element fails the float-literal
+             gate): count a MISS and issue NO ``similar_to`` call for that
+             row — CONTINUE to the next row. The row still counts toward the
+             ``M`` denominator; it contributes zero HTTP calls and an
+             automatic miss (it is never excluded from ``M`` altogether).
+         Total HTTP calls for a fully-completed probe = 2 (schema +
+         selection) plus the number of VALID rows among the ``M`` returned.
+      5. ``self_similarity_rate = hits / M`` (a ``float``) and
+         ``self_similarity_ok = (self_similarity_rate >= 0.5)`` — the
+         threshold comparison is INCLUSIVE, so a rate of EXACTLY 0.5 passes.
+      6. A ``requests.exceptions.Timeout`` / any other
+         ``requests.exceptions.RequestException`` on ANY call — schema,
+         selection, OR any mid-loop ``similar_to`` replay — aborts the WHOLE
+         probe exactly like a first-call failure: ``reachable=False``,
+         ``schema_ok=None``, ``live_options=None``, ``self_similarity_ok=
+         None``, ``self_similarity_rate=None``, and NO further HTTP call is
+         made (``file_options`` stays populated — it is computed purely from
+         ``schema_text``, no network needed).
+      7. Every returned ``message`` is a fixed, single-line, path-free
          string ('/' never appears; a raw exception string is never
-         interpolated).
+         interpolated). The self-similarity clause now reports the sample
+         and the integer-floor percent (``percent = (100 * hits) // M``),
+         using the phrase "N of M" and NEVER a raw "N/M" fraction:
+           - PASS (rate >= 0.5): "...the self-similarity probe passed (28 of
+             30 sampled parts, 93%, found their own vector at k=1000)." —
+             e.g. hits=28, M=30 (floor(100*28/30) == 93).
+           - FAIL (rate < 0.5): "...the self-similarity probe failed (only 3
+             of 30 sampled parts, 10%, found their own vector at k=1000)." —
+             e.g. hits=3, M=30 (floor(100*3/30) == 10).
+           - NONE (M == 0, UNCHANGED): "...no embedded parts yet, so the
+             self-similarity probe was skipped."
     Any exception that is NOT a ``requests.exceptions.RequestException``
     (e.g. a programming error in an injected seam) PROPAGATES — never a
-    blind ``except Exception`` (ruff BLE001).
+    blind ``except Exception`` (ruff BLE001). UNCHANGED.
   - ``partgraph db check-index`` (Gate 4, tested separately in
-    tests/unit/test_cli_check_index.py) calls
+    tests/unit/test_cli_check_index.py — which duck-types ONLY the four
+    fields it reads, ``reachable``/``schema_ok``/``self_similarity_ok``/
+    ``message``, via ``types.SimpleNamespace``, so it is UNAFFECTED by
+    ``self_similarity_rate`` being added and needs NO change) calls
     ``check_index_integrity(schema_text=load_schema(SCHEMA_FILE))`` with
     ZERO overrides and exits ``0`` iff ``reachable and schema_ok and
-    self_similarity_ok in (True, None)``, else ``1``.
+    self_similarity_ok in (True, None)``, else ``1``. UNCHANGED.
 
 This file mirrors tests/unit/test_health.py's hermetic style throughout:
 Given/When/Then docstrings, an injected-seam ``_FakeHttpPost`` spy (never a
-real socket), and no sleep/real-clock anywhere. Unlike ``probe_health``'s
-single GET, ``check_index_integrity`` issues UP TO THREE sequential POSTs, so
-``_FakeHttpPost`` is SCRIPTED with an ORDERED sequence of outcomes (one per
-call) rather than a single fixed result, and raises a clear ``AssertionError``
-if the leaf calls it more times than were scripted — an unscripted extra call
-is exactly the kind of "keeps hammering an unreachable/exhausted seam" bug
-this suite must catch, not silently tolerate by recycling the last outcome.
+real socket), and no sleep/real-clock/randomness anywhere.
+``check_index_integrity`` now issues UP TO 32 sequential POSTs (2 + up to 30
+per-sample replays), so ``_FakeHttpPost`` is SCRIPTED with an ORDERED
+sequence of outcomes (one per call) rather than a single fixed result, and
+raises a clear ``AssertionError`` if the leaf calls it more times than were
+scripted — an unscripted extra call is exactly the kind of "keeps hammering
+an unreachable/exhausted seam" bug this suite must catch, not silently
+tolerate by recycling the last outcome. The multi-sample fixture builders
+below (``_build_n_row_selection``, ``_build_k_of_n_replay``) generate
+DETERMINISTIC, distinct per-row uids/vectors from a plain integer index — no
+``random`` module, no real clock — so a scripted "K of N hit" pattern is
+exactly reproducible run to run.
 
 Determinism / IO discipline: every HTTP outcome below is injected; nothing in
 this file opens a socket, sleeps, or reads the wall clock. The pure parser
@@ -370,15 +454,123 @@ def _assert_message_clean(message: object) -> None:
 def _extract_similar_to_literal(query_text: str) -> str:
     """Return the inner comma-separated contents of the similar_to vector literal.
 
-    Extracts ``0.1, 0.2, 0.3`` from ``similar_to(embedding, 5, "[0.1, 0.2, 0.3]")``
-    so a test can assert EVERY element (not just a chosen fixture component) is
-    strictly numeric — a stronger guarantee than ``str(x) in text``.
+    Extracts ``0.1, 0.2, 0.3`` from ``similar_to(embedding, 1000, "[0.1, 0.2,
+    0.3]")`` so a test can assert EVERY element (not just a chosen fixture
+    component) is strictly numeric — a stronger guarantee than ``str(x) in
+    text``. The regex itself is K-agnostic (``\\d+``), so it works unchanged
+    for both this file's legacy K=5 fixtures (now unused after the AC-IDX-12
+    amendment below) and the current K=1000 multi-sample fixtures.
     """
     match = re.search(
         r'similar_to\(embedding,\s*\d+,\s*"\[(.*?)\]"\)', query_text
     )
     assert match, f"could not locate the similar_to vector literal in {query_text!r}"
     return match.group(1)
+
+
+# ---------------------------------------------------------------------------
+# Multi-sample fixture builders (AC-IDX-28..36) — an "N-row" selection-
+# response builder (optionally "poison-at-index-i"), and a "K-of-N-hit"
+# scripted-replay builder. Both are PURE and DETERMINISTIC: every uid/vector
+# is derived from a plain integer index, never from `random` or the real
+# clock, so a scripted "15 of 30 hit" pattern is byte-for-byte reproducible.
+# ---------------------------------------------------------------------------
+
+def _uid(index: int) -> str:
+    """Return a distinct, deterministic fake uid for sample *index* (0-based).
+
+    A DIFFERENT numeric range (0x2000+) than the module-level _OWN_UID
+    (0x15e80) / _OTHER_UID (0x15e99) fixtures above, so a multi-sample test
+    can never accidentally collide with those single-sample fixtures.
+    """
+    return f"0x{0x2000 + index:x}"
+
+
+def _vector(index: int) -> list[float]:
+    """Return a distinct, deterministic, VALID stored vector for sample
+    *index*.
+
+    Three simple decimals (mirrors the module-level ``_STORED_VECTOR``
+    convention above) so ``repr()`` formatting stays predictable for the
+    literal-content assertions, while still being unique per *index* so a
+    per-sample similar_to call can be matched back to "its own" row's
+    vector.
+    """
+    return [
+        round(0.01 * (index + 1), 4),
+        round(0.02 * (index + 1), 4),
+        round(0.03 * (index + 1), 4),
+    ]
+
+
+def _build_n_row_selection(n: int, *, poison_at: int | None = None) -> dict:
+    """Build an N-row ``has(embedding), first: 30``-style selection response.
+
+    Row *i* (``0 <= i < n``) gets ``uid=_uid(i)`` and a distinct, VALID
+    stored vector ``_vector(i)`` — UNLESS ``i == poison_at``, in which case
+    that ONE row's stored ``embedding`` is instead the same hostile-string-
+    in-a-list DQL-injection shape as the single-sample
+    ``_HAS_EMBEDDING_POISONED_LIST`` fixture above (a poisoned/invalid
+    vector at a caller-chosen index; every OTHER row stays valid).
+    ``poison_at=None`` (the default) means every row is valid.
+    """
+    rows = []
+    for i in range(n):
+        embedding = [0.1, _POISON_VECTOR_ELEMENT, 0.3] if i == poison_at else _vector(i)
+        rows.append({"uid": _uid(i), "embedding": embedding})
+    return {"data": {"q": rows}}
+
+
+def _similar_to_outcome_for(index: int, *, hit: bool) -> _FakeIndexResponse:
+    """A similar_to outcome for sample *index*: HIT includes ``_uid(index)``
+    in the result set; MISS excludes it (mirrors ``_SIMILAR_TO_INCLUDES_OWN_
+    UID`` / ``_SIMILAR_TO_EXCLUDES_OWN_UID`` above, generalized to an
+    arbitrary sample index).
+    """
+    rows = [{"uid": _uid(index)}, {"uid": _OTHER_UID}] if hit else [{"uid": _OTHER_UID}]
+    return _resp({"data": {"q": rows}})
+
+
+def _build_k_of_n_replay(
+    n: int, hits: int, *, skip: frozenset[int] = frozenset()
+) -> list[_FakeIndexResponse]:
+    """Build a scripted "K of N hit" similar_to outcome sequence.
+
+    Iterates sample indices ``0..n-1`` in order; any index in *skip* (a
+    poisoned/invalid row from ``_build_n_row_selection``) is OMITTED
+    entirely — no HTTP call, hence no outcome, is issued for it. Of the
+    REMAINING (non-skipped) indices, the FIRST *hits* (in index order) are
+    scripted as HITS and the rest as MISSES — a deterministic, unambiguous
+    pattern shared by the threshold (AC-IDX-29), mid-loop-failure
+    (AC-IDX-33), message-wording (AC-IDX-34), and recall-collapse
+    (AC-IDX-36) tests. Raises ``AssertionError`` immediately (a
+    fixture-authoring bug, not a production-code bug) if *hits* exceeds the
+    number of non-skipped rows.
+    """
+    outcomes: list[_FakeIndexResponse] = []
+    hit_budget = hits
+    for i in range(n):
+        if i in skip:
+            continue
+        is_hit = hit_budget > 0
+        if is_hit:
+            hit_budget -= 1
+        outcomes.append(_similar_to_outcome_for(i, hit=is_hit))
+    assert hit_budget == 0, (
+        f"_build_k_of_n_replay: hits={hits} exceeds the {len(outcomes)} "
+        f"non-skipped row(s) available for n={n}, skip={skip!r}."
+    )
+    return outcomes
+
+
+def _floor_percent(hits: int, total: int) -> int:
+    """Return the integer floor percent ``(100 * hits) // total``.
+
+    Mirrors the leaf's own message-formatting formula exactly (integer floor
+    division, never a float ``round()``), so a test's expected percent is
+    computed the SAME way the production message text is.
+    """
+    return (100 * hits) // total
 
 
 # ===========================================================================
@@ -424,9 +616,15 @@ def test_index_integrity_result_dataclass_has_exact_contract_fields_and_is_froze
     """CONTRACT: Given IndexIntegrityResult is the DTO returned by
     check_index_integrity().
     When it is instantiated.
-    Then it exposes EXACTLY the six pinned fields (reachable, schema_ok,
-    file_options, live_options, self_similarity_ok, message) and is frozen —
-    a consumer (e.g. cli.py's `check-index` command) cannot mutate a result.
+    Then it exposes EXACTLY the SEVEN pinned fields (reachable, schema_ok,
+    file_options, live_options, self_similarity_ok, self_similarity_rate,
+    message) and is frozen — a consumer (e.g. cli.py's `check-index` command)
+    cannot mutate a result. self_similarity_rate (float | None) was added by
+    the multi-sample-probe rewrite; the field SET is asserted here (every
+    construction site in this suite and in cli.py uses keyword arguments
+    exclusively, so declaration ORDER is not itself a behavioural contract —
+    see test_index_integrity_result_every_field_is_mandatory_no_defaults
+    below for the "no defaults" guarantee).
     """
     result = IndexIntegrityResult(
         reachable=True,
@@ -434,6 +632,7 @@ def test_index_integrity_result_dataclass_has_exact_contract_fields_and_is_froze
         file_options=(("exponent", "6"), ("metric", "cosine")),
         live_options=(("exponent", "6"), ("metric", "cosine")),
         self_similarity_ok=True,
+        self_similarity_rate=1.0,
         message="ok",
     )
     field_names = {f.name for f in dataclasses.fields(result)}
@@ -443,10 +642,42 @@ def test_index_integrity_result_dataclass_has_exact_contract_fields_and_is_froze
         "file_options",
         "live_options",
         "self_similarity_ok",
+        "self_similarity_rate",
         "message",
     }
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.schema_ok = False  # type: ignore[misc]
+
+
+#: Every IndexIntegrityResult field, with a representative value each — the
+#: complete kwargs dict test_index_integrity_result_every_field_is_mandatory_
+#: no_defaults below omits ONE key at a time from.
+_ALL_RESULT_KWARGS: dict[str, object] = {
+    "reachable": True,
+    "schema_ok": True,
+    "file_options": (("exponent", "6"), ("metric", "cosine")),
+    "live_options": (("exponent", "6"), ("metric", "cosine")),
+    "self_similarity_ok": True,
+    "self_similarity_rate": 1.0,
+    "message": "ok",
+}
+
+
+@pytest.mark.parametrize("omitted_field", sorted(_ALL_RESULT_KWARGS))
+def test_index_integrity_result_every_field_is_mandatory_no_defaults(omitted_field) -> None:
+    """CONTRACT: Given the ratified multi-sample-probe contract's "no field
+    defaults — every construction site sets all seven" rule.
+    When IndexIntegrityResult is constructed with exactly ONE required
+    keyword omitted (parametrized over each of the seven fields in turn,
+    including the new self_similarity_rate).
+    Then construction raises TypeError for EVERY field — proving none of the
+    seven carries a silently-applied default that could mask an incomplete
+    construction site (e.g. a code path that forgets to set the new
+    self_similarity_rate field on some return branch).
+    """
+    kwargs = {k: v for k, v in _ALL_RESULT_KWARGS.items() if k != omitted_field}
+    with pytest.raises(TypeError):
+        IndexIntegrityResult(**kwargs)
 
 
 def test_check_index_integrity_parameters_are_keyword_only() -> None:
@@ -762,16 +993,19 @@ def test_ac_idx_11_schema_ok_true_when_file_and_live_options_are_equal(
 # ===========================================================================
 
 def test_ac_idx_12_healthy_end_to_end_schema_ok_and_self_similarity_ok() -> None:
-    """AC-IDX-12: Given (1) the live schema matches the file (exponent "6"
-    both sides), (2) exactly one embedded part exists, and (3) re-issuing its
-    stored vector through similar_to returns a result set CONTAINING its own
-    uid.
+    """AC-IDX-12 (M=1 degenerate case of the multi-sample probe): Given (1)
+    the live schema matches the file (exponent "6" both sides), (2) the
+    `first: 30` selection query happens to return exactly ONE embedded part
+    (M=1 — fewer than 30 embedded parts exist), and (3) re-issuing its stored
+    vector through similar_to returns a result set CONTAINING its own uid.
     When check_index_integrity() is called.
-    Then reachable/schema_ok/self_similarity_ok are all True, and the message
+    Then reachable/schema_ok/self_similarity_ok are all True,
+    self_similarity_rate is exactly 1.0 (1 hit / 1 sampled), and the message
     is a non-empty, single-line, path-free string. Also pins the exact DQL
     text of all three calls (API boundary stability): the schema
-    introspection query, the `has(embedding), first: 1` selection, and a
-    `similar_to(embedding, 5, ...)` call whose vector components are the
+    introspection query, the `has(embedding), first: 30` selection (the
+    REQUEST always asks for 30 regardless of how many rows come back), and a
+    `similar_to(embedding, 1000, ...)` call whose vector components are the
     part's OWN stored vector.
     """
     fake_post = _FakeHttpPost(
@@ -788,6 +1022,7 @@ def test_ac_idx_12_healthy_end_to_end_schema_ok_and_self_similarity_ok() -> None
     assert result.reachable is True
     assert result.schema_ok is True
     assert result.self_similarity_ok is True
+    assert result.self_similarity_rate == 1.0
     assert isinstance(result.message, str) and result.message
     assert "\n" not in result.message
     assert "/" not in result.message
@@ -798,10 +1033,10 @@ def test_ac_idx_12_healthy_end_to_end_schema_ok_and_self_similarity_ok() -> None
         f"Expected the exact live-schema introspection query text. Got: {texts[0]!r}"
     )
     assert "has(embedding)" in texts[1]
-    assert "first: 1" in texts[1]
+    assert "first: 30" in texts[1]
     assert "uid" in texts[1]
     assert "embedding" in texts[1]
-    assert "similar_to(embedding, 5," in texts[2]
+    assert "similar_to(embedding, 1000," in texts[2]
     for component in _STORED_VECTOR:
         assert str(component) in texts[2], (
             f"Expected the part's own stored vector component {component!r} "
@@ -847,12 +1082,14 @@ def test_ac_idx_13_drift_does_not_prevent_self_similarity_check() -> None:
 
 
 def test_ac_idx_14_self_similarity_fails_when_own_uid_absent_from_results() -> None:
-    """AC-IDX-14: Given the schema matches, an embedded part exists, but
-    re-issuing its OWN stored vector through similar_to returns a result set
-    that does NOT contain that part's own uid (a corrupted/stale vector
-    index — the part cannot even find itself).
+    """AC-IDX-14 (M=1 degenerate case of the multi-sample probe): Given the
+    schema matches, the `first: 30` selection returns exactly ONE embedded
+    part (M=1), but re-issuing its OWN stored vector through similar_to
+    returns a result set that does NOT contain that part's own uid (a
+    corrupted/stale vector index — the part cannot even find itself).
     When check_index_integrity() is called.
-    Then self_similarity_ok is False.
+    Then self_similarity_ok is False and self_similarity_rate is exactly 0.0
+    (0 hits / 1 sampled).
     """
     fake_post = _FakeHttpPost(
         [
@@ -866,6 +1103,7 @@ def test_ac_idx_14_self_similarity_fails_when_own_uid_absent_from_results() -> N
     )
     assert result.schema_ok is True
     assert result.self_similarity_ok is False
+    assert result.self_similarity_rate == 0.0
     _assert_message_clean(result.message)
 
 
@@ -874,10 +1112,10 @@ def test_ac_idx_15_no_embedded_parts_yields_self_similarity_none_and_no_third_ca
     at all (`has(embedding)` returns an empty row set — e.g. `partgraph
     embed` has never been run).
     When check_index_integrity() is called.
-    Then self_similarity_ok is None (there is nothing to self-check) and
-    EXACTLY TWO HTTP calls were made — the leaf never issues a third,
-    meaningless similar_to("[]"...) call when there is no stored vector to
-    replay.
+    Then self_similarity_ok AND self_similarity_rate are both None (there is
+    nothing to self-check) and EXACTLY TWO HTTP calls were made — the leaf
+    never issues a third, meaningless similar_to("[]"...) call when there is
+    no stored vector to replay.
     """
     fake_post = _FakeHttpPost([_resp(_LIVE_SCHEMA_AFTER), _resp(_HAS_EMBEDDING_NONE)])
     result = check_index_integrity(
@@ -885,6 +1123,7 @@ def test_ac_idx_15_no_embedded_parts_yields_self_similarity_none_and_no_third_ca
     )
     assert result.schema_ok is True
     assert result.self_similarity_ok is None
+    assert result.self_similarity_rate is None
     assert len(fake_post.calls) == 2, (
         "check_index_integrity must not issue a similar_to call when "
         f"has(embedding) found nothing. Calls made: {len(fake_post.calls)}"
@@ -895,12 +1134,12 @@ def test_ac_idx_16_connection_error_on_first_call_is_unreachable() -> None:
     """AC-IDX-16: Given the injected http_post raises requests.ConnectionError
     on the VERY FIRST call (the live schema query).
     When check_index_integrity() is called.
-    Then reachable is False, schema_ok/live_options/self_similarity_ok are
-    all None, EXACTLY ONE HTTP call was attempted (no further calls after the
-    first failure), and the message is a fixed, path-free string naming
-    `partgraph db up` that contains NEITHER the raw exception text NOR a '/'.
-    file_options is still populated (it is computed PURELY from schema_text,
-    no network needed).
+    Then reachable is False, schema_ok/live_options/self_similarity_ok/
+    self_similarity_rate are all None, EXACTLY ONE HTTP call was attempted
+    (no further calls after the first failure), and the message is a fixed,
+    path-free string naming `partgraph db up` that contains NEITHER the raw
+    exception text NOR a '/'. file_options is still populated (it is
+    computed PURELY from schema_text, no network needed).
     """
     exc = requests.ConnectionError(
         "HTTPConnectionPool(host='127.0.0.1', port=8081): "
@@ -914,6 +1153,7 @@ def test_ac_idx_16_connection_error_on_first_call_is_unreachable() -> None:
     assert result.schema_ok is None
     assert result.live_options is None
     assert result.self_similarity_ok is None
+    assert result.self_similarity_rate is None
     assert result.file_options == (("exponent", "6"), ("metric", "cosine"))
     assert len(fake_post.calls) == 1
     assert "partgraph db up" in result.message
@@ -945,6 +1185,8 @@ def test_ac_idx_17_timeout_message_is_dedicated_not_generic() -> None:
     )
 
     assert timeout_result.reachable is False
+    assert timeout_result.self_similarity_rate is None
+    assert conn_result.self_similarity_rate is None
     assert timeout_result.message != conn_result.message, (
         "The timeout message must be dedicated, not the generic unreachable "
         f"message. Both were: {timeout_result.message!r}"
@@ -1061,6 +1303,384 @@ def test_ac_idx_22_signature_and_dataclass_discipline_recap() -> None:
 
 
 # ===========================================================================
+# AC-IDX-28..36 — multi-sample self-similarity probe (recall-collapse
+# hardening). The single-sample AC-IDX-12/13/14 tests above still exercise
+# the SAME code path as an M=1 degenerate case (see their amended docstrings)
+# — this section adds genuinely MULTI-row (M>1) coverage: the sampled pass
+# RATE, the inclusive 0.5 threshold, per-sample invalid-row miss+continue, a
+# denominator smaller than the requested sample of 30, mid-loop network
+# failure, the pinned N-of-M message wording, an all-invalid edge, and a
+# recall-collapse regression canary (mirrors the ADR-0019 production
+# incident this rewrite responds to).
+# ===========================================================================
+
+def test_ac_idx_28_multi_sample_healthy_all_thirty_samples_hit() -> None:
+    """AC-IDX-28: Given the live schema matches the file, the `first: 30`
+    selection returns exactly 30 embedded parts (M=N=30), and EVERY one of
+    their replayed similar_to calls finds its own uid.
+    When check_index_integrity() is called.
+    Then self_similarity_ok is True, self_similarity_rate is exactly 1.0,
+    EXACTLY 32 (= 30 + 2) HTTP calls were made, the selection request body
+    contains "first: 30", and EVERY one of the 30 similar_to call bodies (a)
+    contains "similar_to(embedding, 1000," and (b) replays THAT sample's own
+    vector — proving samples are not accidentally cross-wired to each
+    other's stored vectors.
+    """
+    n = 30
+    selection_body = _build_n_row_selection(n)
+    replay = _build_k_of_n_replay(n, hits=n)
+    fake_post = _FakeHttpPost([_resp(_LIVE_SCHEMA_AFTER), _resp(selection_body), *replay])
+
+    result = check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    assert result.reachable is True
+    assert result.schema_ok is True
+    assert result.self_similarity_ok is True
+    assert result.self_similarity_rate == 1.0
+    assert len(fake_post.calls) == n + 2
+
+    texts = _payload_texts(fake_post)
+    assert "has(embedding)" in texts[1]
+    assert "first: 30" in texts[1]
+
+    for i in range(n):
+        call_text = texts[2 + i]
+        assert "similar_to(embedding, 1000," in call_text, (
+            f"sample {i}: expected K=1000 in the similar_to call. Got: {call_text!r}"
+        )
+        literal_body = _extract_similar_to_literal(call_text)
+        elements = [piece.strip() for piece in literal_body.split(",")]
+        expected = [repr(float(component)) for component in _vector(i)]
+        assert elements == expected, (
+            f"sample {i}: expected its OWN vector {expected!r} to be replayed "
+            f"verbatim, got {elements!r} — samples must not be cross-wired."
+        )
+
+
+@pytest.mark.parametrize(
+    ("hits", "expected_ok", "case_id"),
+    [
+        pytest.param(15, True, "fifteen_of_thirty_is_exactly_half_and_passes"),
+        pytest.param(14, False, "fourteen_of_thirty_is_just_below_half_and_fails"),
+    ],
+)
+def test_ac_idx_29_threshold_of_one_half_is_inclusive(hits, expected_ok, case_id) -> None:
+    """AC-IDX-29 (inclusive threshold boundary): Given 30 samples of which
+    EXACTLY 15 (one half) hit in one case, and 14 (just below one half) hit
+    in the other.
+    When check_index_integrity() is called.
+    Then a rate of EXACTLY 0.5 PASSES (self_similarity_ok True) — the
+    threshold comparison is `rate >= 0.5`, not `rate > 0.5` — while a rate
+    just below 0.5 FAILS, proving the boundary is inclusive on the passing
+    side, not the failing side.
+    """
+    n = 30
+    selection_body = _build_n_row_selection(n)
+    replay = _build_k_of_n_replay(n, hits=hits)
+    fake_post = _FakeHttpPost([_resp(_LIVE_SCHEMA_AFTER), _resp(selection_body), *replay])
+
+    result = check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    assert result.self_similarity_rate == hits / n, f"case={case_id}"
+    assert result.self_similarity_ok is expected_ok, f"case={case_id}"
+    assert len(fake_post.calls) == n + 2, f"case={case_id}"
+
+
+def test_ac_idx_30_per_sample_invalid_mid_sequence_counts_as_a_miss_and_continues() -> None:
+    """AC-IDX-30: Given 5 samples where ONE (index 2 of 0..4 — neither first
+    nor last) has an INVALID stored vector (a poisoned, hostile-string-in-a-
+    list shape) and the OTHER FOUR are valid and all hit.
+    When check_index_integrity() is called.
+    Then:
+      - EXACTLY 2 + (5 - 1) = 6 HTTP calls are made — the leaf issues NO
+        similar_to call for the poisoned row but keeps going (does not abort
+        the whole probe, unlike a NETWORK failure).
+      - the poisoned text never reaches ANY outgoing request body.
+      - self_similarity_rate is (5 - 1) / 5 = 0.8 — the poisoned row COUNTS
+        toward the M=5 denominator as an automatic miss; it is not silently
+        excluded from M (which would wrongly give a rate of 4/4 = 1.0).
+      - self_similarity_ok is True (0.8 >= 0.5), no exception escapes, and
+        the message stays clean.
+    """
+    n = 5
+    poison_at = 2
+    selection_body = _build_n_row_selection(n, poison_at=poison_at)
+    replay = _build_k_of_n_replay(n, hits=n - 1, skip=frozenset({poison_at}))
+    fake_post = _FakeHttpPost([_resp(_LIVE_SCHEMA_AFTER), _resp(selection_body), *replay])
+
+    result = check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    assert len(fake_post.calls) == 2 + (n - 1), (
+        "expected NO similar_to call for the poisoned row (2 + 4 valid calls), "
+        f"got {len(fake_post.calls)} calls."
+    )
+    assert _POISON_VECTOR_ELEMENT not in "".join(_payload_texts(fake_post)), (
+        "the poisoned stored-vector text must never reach an outgoing request body."
+    )
+    assert result.self_similarity_rate == (n - 1) / n, (
+        "a poisoned/invalid row must count as a MISS in the M denominator, "
+        "not be excluded from it entirely."
+    )
+    assert result.self_similarity_ok is True
+    _assert_message_clean(result.message)
+
+
+@pytest.mark.parametrize(
+    ("m", "hits", "case_id"),
+    [
+        pytest.param(1, 1, "m_equals_one"),
+        pytest.param(3, 2, "m_equals_three"),
+    ],
+)
+def test_ac_idx_31_rate_denominator_is_the_actual_row_count_m_not_the_requested_thirty(
+    m, hits, case_id,
+) -> None:
+    """AC-IDX-31: Given the selection query always REQUESTS `first: 30`, but
+    Dgraph has fewer than 30 embedded parts total, so the response actually
+    returns only M rows (M=1 and M=3, tested separately).
+    When check_index_integrity() is called.
+    Then self_similarity_rate is computed as hits / M (the ACTUAL row count),
+    NOT hits / 30 — a rate of hits/30 here would be a materially different
+    (and, for these small M, much smaller) number, so this is a sharp
+    differentiator against a "wrong denominator" bug — and exactly 2 + M
+    HTTP calls are made (2 + valid(M), and every row here is valid).
+    """
+    selection_body = _build_n_row_selection(m)
+    replay = _build_k_of_n_replay(m, hits=hits)
+    fake_post = _FakeHttpPost([_resp(_LIVE_SCHEMA_AFTER), _resp(selection_body), *replay])
+
+    result = check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    expected_rate = hits / m
+    assert result.self_similarity_rate == expected_rate, (
+        f"case={case_id}: rate must be computed over the ACTUAL row count "
+        f"M={m}, not the requested sample size 30. Got "
+        f"{result.self_similarity_rate!r}, expected {expected_rate!r} (would "
+        f"be {hits / 30!r} if wrongly divided by 30)."
+    )
+    assert result.self_similarity_ok is (expected_rate >= 0.5), f"case={case_id}"
+    assert len(fake_post.calls) == 2 + m, f"case={case_id}"
+    texts = _payload_texts(fake_post)
+    assert "first: 30" in texts[1], (
+        "the SELECTION request must still ask for first: 30 regardless of "
+        "how many rows the (faked) response actually returns."
+    )
+
+
+# --- AC-IDX-32: self_similarity_rate is None/None/float across the three
+# reachability outcomes (mirrors self_similarity_ok's own None/None/bool
+# split — one dedicated test per outcome for a clear, independent failure
+# signal per scenario). ---
+
+def test_ac_idx_32_self_similarity_rate_is_none_when_unreachable() -> None:
+    """AC-IDX-32a: Given the very first HTTP call (schema introspection)
+    fails with a connection error.
+    When check_index_integrity() is called.
+    Then self_similarity_rate is None (there is nothing to compute a rate
+    over — the whole probe aborted before any sampling happened).
+    """
+    fake_post = _FakeHttpPost([requests.ConnectionError("c")])
+
+    result = check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    assert result.reachable is False
+    assert result.self_similarity_rate is None
+
+
+def test_ac_idx_32_self_similarity_rate_is_none_when_no_embedded_parts() -> None:
+    """AC-IDX-32b: Given the schema matches but the `first: 30` selection
+    returns ZERO rows (M=0 — no embedded parts at all).
+    When check_index_integrity() is called.
+    Then self_similarity_ok AND self_similarity_rate are both None (there is
+    nothing to sample), and exactly 2 HTTP calls were made.
+    """
+    fake_post = _FakeHttpPost([_resp(_LIVE_SCHEMA_AFTER), _resp(_HAS_EMBEDDING_NONE)])
+
+    result = check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    assert result.self_similarity_ok is None
+    assert result.self_similarity_rate is None
+    assert len(fake_post.calls) == 2
+
+
+def test_ac_idx_32_self_similarity_rate_is_a_float_when_probed() -> None:
+    """AC-IDX-32c: Given a normal, completed multi-sample probe (M=5, 3 hits).
+    When check_index_integrity() is called.
+    Then self_similarity_rate is a `float` instance (never an `int`, a
+    `Fraction`, or any other numeric type) equal to hits / M exactly.
+    """
+    n = 5
+    selection_body = _build_n_row_selection(n)
+    replay = _build_k_of_n_replay(n, hits=3)
+    fake_post = _FakeHttpPost([_resp(_LIVE_SCHEMA_AFTER), _resp(selection_body), *replay])
+
+    result = check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    assert isinstance(result.self_similarity_rate, float)
+    assert result.self_similarity_rate == 3 / 5
+
+
+@pytest.mark.parametrize(
+    "injected_exception",
+    [
+        pytest.param(requests.exceptions.Timeout("t"), id="timeout"),
+        pytest.param(requests.ConnectionError("c"), id="connection_error"),
+    ],
+)
+def test_ac_idx_33_mid_loop_network_failure_aborts_the_whole_probe(injected_exception) -> None:
+    """AC-IDX-33: Given the schema and selection calls both succeed (M=5, all
+    valid rows), TWO per-sample similar_to replays complete successfully, and
+    THEN the third per-sample replay call raises a network exception
+    (Timeout and ConnectionError tested separately) — genuinely MID-LOOP, not
+    the first call ever made.
+    When check_index_integrity() is called.
+    Then the WHOLE probe aborts exactly as a first-call failure would:
+    reachable=False, schema_ok=None, live_options=None,
+    self_similarity_ok=None, self_similarity_rate=None, file_options is still
+    populated (pure, no network needed), NO further HTTP call is made beyond
+    the failing one, and the message stays clean. The call count pins exactly
+    WHERE the failure happened: 2 (schema + selection) + 2 (the two
+    successful replays) + 1 (the failing call itself) = 5.
+    """
+    n = 5
+    fail_at = 2  # 0-based sample index: two successful replays precede it.
+    selection_body = _build_n_row_selection(n)
+    successful_replays = _build_k_of_n_replay(fail_at, hits=fail_at)
+    fake_post = _FakeHttpPost(
+        [
+            _resp(_LIVE_SCHEMA_AFTER),
+            _resp(selection_body),
+            *successful_replays,
+            injected_exception,
+        ]
+    )
+
+    result = check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    assert result.reachable is False
+    assert result.schema_ok is None
+    assert result.live_options is None
+    assert result.self_similarity_ok is None
+    assert result.self_similarity_rate is None
+    assert result.file_options == (("exponent", "6"), ("metric", "cosine"))
+    assert len(fake_post.calls) == 2 + fail_at + 1
+
+    texts = _payload_texts(fake_post)
+    assert texts[0].strip() == "schema(pred: [embedding]) {}"
+    assert "first: 30" in texts[1]
+    for i in range(fail_at):
+        assert "similar_to(embedding, 1000," in texts[2 + i], (
+            f"expected a successful similar_to call for sample {i} BEFORE "
+            "the mid-loop failure."
+        )
+    _assert_message_clean(result.message)
+
+
+def test_ac_idx_34_message_wording_is_pinned_with_floor_percent_and_n_of_m_phrasing() -> None:
+    """AC-IDX-34 (pinned wording): Given a PASS scenario (28 of 30 samples
+    hit — 93%, since floor(100*28/30) == 93) and, separately, a FAIL scenario
+    (3 of 30 samples hit — 10%, since floor(100*3/30) == 10).
+    When check_index_integrity() is called for each.
+    Then the message contains the EXACT pinned self-similarity clause for
+    that outcome — "the self-similarity probe passed (28 of 30 sampled
+    parts, 93%, found their own vector at k=1000)." for the PASS case, "the
+    self-similarity probe failed (only 3 of 30 sampled parts, 10%, found
+    their own vector at k=1000)." for the FAIL case (mirroring the existing
+    _SELF_PASS_CLAUSE/_SELF_FAIL_CLAUSE naming split — only the parenthetical
+    detail changed, the leading "passed"/"failed" verb did not) — and NEVER
+    the raw fraction form "28/30" or "3/30" (the message must say "N of M",
+    never "N/M"), staying single-line and path-free throughout.
+    """
+    n = 30
+
+    # --- PASS: 28 of 30 hit -> floor(100*28/30) == 93 ---
+    pass_selection = _build_n_row_selection(n)
+    pass_replay = _build_k_of_n_replay(n, hits=28)
+    pass_fake_post = _FakeHttpPost(
+        [_resp(_LIVE_SCHEMA_AFTER), _resp(pass_selection), *pass_replay]
+    )
+    pass_result = check_index_integrity(
+        schema_text=_FILE_TEXT_EXPONENT_6, http_post=pass_fake_post
+    )
+    assert pass_result.self_similarity_ok is True
+    assert _floor_percent(28, n) == 93
+    assert (
+        "the self-similarity probe passed "
+        "(28 of 30 sampled parts, 93%, found their own vector at k=1000)."
+    ) in pass_result.message, pass_result.message
+    assert "28/30" not in pass_result.message
+    _assert_message_clean(pass_result.message)
+
+    # --- FAIL: 3 of 30 hit -> floor(100*3/30) == 10 ---
+    fail_selection = _build_n_row_selection(n)
+    fail_replay = _build_k_of_n_replay(n, hits=3)
+    fail_fake_post = _FakeHttpPost(
+        [_resp(_LIVE_SCHEMA_AFTER), _resp(fail_selection), *fail_replay]
+    )
+    fail_result = check_index_integrity(
+        schema_text=_FILE_TEXT_EXPONENT_6, http_post=fail_fake_post
+    )
+    assert fail_result.self_similarity_ok is False
+    assert _floor_percent(3, n) == 10
+    assert (
+        "the self-similarity probe failed "
+        "(only 3 of 30 sampled parts, 10%, found their own vector at k=1000)."
+    ) in fail_result.message, fail_result.message
+    assert "3/30" not in fail_result.message
+    _assert_message_clean(fail_result.message)
+
+
+def test_ac_idx_35_all_stored_vectors_invalid_yields_zero_rate_and_no_similar_to_call() -> None:
+    """AC-IDX-35 (all-invalid edge): Given the `first: 30` selection returns
+    30 rows, and EVERY single one carries an invalid (non-list) stored
+    vector.
+    When check_index_integrity() is called.
+    Then self_similarity_rate is exactly 0.0, self_similarity_ok is False,
+    and EXACTLY 2 HTTP calls were made — NO similar_to call at all (the
+    scripted fake provides only 2 outcomes, so a 3rd call would raise
+    AssertionError from _FakeHttpPost itself).
+    """
+    n = 30
+    selection_body = {
+        "data": {"q": [{"uid": _uid(i), "embedding": "not-a-vector"} for i in range(n)]}
+    }
+    fake_post = _FakeHttpPost([_resp(_LIVE_SCHEMA_AFTER), _resp(selection_body)])
+
+    result = check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    assert result.self_similarity_rate == 0.0
+    assert result.self_similarity_ok is False
+    assert len(fake_post.calls) == 2, (
+        "no similar_to call may be issued when EVERY stored vector is invalid."
+    )
+    _assert_message_clean(result.message)
+
+
+def test_ac_idx_36_recall_collapse_regression_every_sample_misses_the_canary_fires() -> None:
+    """AC-IDX-36 (regression canary — mirrors the ADR-0019 measured "4 of
+    1000" production recall collapse this rewrite responds to): Given 30
+    valid, distinct embedded-part samples, but EVERY SINGLE one of their
+    similar_to replays EXCLUDES its own uid (a totally collapsed index).
+    When check_index_integrity() is called.
+    Then self_similarity_ok is False and self_similarity_rate is exactly
+    0.0 — the canary correctly reports total failure rather than any
+    rate-computation bug (e.g. an `any()`/`all()` mixup) accidentally
+    reporting a false pass when NOTHING found itself.
+    """
+    n = 30
+    selection_body = _build_n_row_selection(n)
+    replay = _build_k_of_n_replay(n, hits=0)
+    fake_post = _FakeHttpPost([_resp(_LIVE_SCHEMA_AFTER), _resp(selection_body), *replay])
+
+    result = check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    assert result.self_similarity_ok is False
+    assert result.self_similarity_rate == 0.0
+    assert len(fake_post.calls) == n + 2
+    _assert_message_clean(result.message)
+
+
+# ===========================================================================
 # EDGE CASES (probe level) — schema reachable but unparseable; oversized/
 # undersized stored vector.
 # ===========================================================================
@@ -1137,18 +1757,19 @@ def test_edge_stored_vector_of_unexpected_length_does_not_crash() -> None:
 # ===========================================================================
 
 def test_security_poisoned_stored_vector_element_blocks_third_call() -> None:
-    """SECURITY: Given the has(embedding) query returns a part whose stored
-    `embedding` is a LIST containing a hostile string element (a DQL-injection
-    attempt that, inlined raw, would close the literal and smuggle in a second
-    query block).
+    """SECURITY (M=1 case): Given the `first: 30` selection returns exactly
+    ONE row (M=1) whose stored `embedding` is a LIST containing a hostile
+    string element (a DQL-injection attempt that, inlined raw, would close
+    the literal and smuggle in a second query block).
     When check_index_integrity() is called (schema matches; one "embedded" part).
     Then:
       - EXACTLY TWO HTTP calls are made — the leaf issues NO third (similar_to)
         call (the scripted fake would raise AssertionError on a third call).
       - the poisoned text never appears in ANY outgoing request body.
       - the result is a clean IndexIntegrityResult with self_similarity_ok=False
-        (a handled failure), reachable=True, schema_ok=True, and a path-free,
-        single-line message — no exception escapes.
+        (a handled failure) and self_similarity_rate=0.0 (0 hits / 1 sampled),
+        reachable=True, schema_ok=True, and a path-free, single-line message —
+        no exception escapes.
     """
     fake_post = _FakeHttpPost(
         [_resp(_LIVE_SCHEMA_AFTER), _resp(_HAS_EMBEDDING_POISONED_LIST)]
@@ -1166,6 +1787,7 @@ def test_security_poisoned_stored_vector_element_blocks_third_call() -> None:
     assert result.reachable is True
     assert result.schema_ok is True
     assert result.self_similarity_ok is False
+    assert result.self_similarity_rate == 0.0
     assert all(
         _POISON_VECTOR_ELEMENT not in text for text in _payload_texts(fake_post)
     ), "the poisoned stored-vector text must never reach an outgoing request body."
@@ -1173,12 +1795,14 @@ def test_security_poisoned_stored_vector_element_blocks_third_call() -> None:
 
 
 def test_security_non_list_stored_vector_blocks_third_call() -> None:
-    """SECURITY: Given the has(embedding) query returns a part whose stored
-    `embedding` is not a list at all (a bare string — a corrupt/unexpected shape).
+    """SECURITY (M=1 case): Given the `first: 30` selection returns exactly
+    ONE row (M=1) whose stored `embedding` is not a list at all (a bare
+    string — a corrupt/unexpected shape).
     When check_index_integrity() is called.
     Then it is the SAME clean, handled failure as the poisoned-list case: EXACTLY
-    TWO HTTP calls (no similar_to replay), self_similarity_ok=False, no exception,
-    and a path-free, single-line message.
+    TWO HTTP calls (no similar_to replay), self_similarity_ok=False,
+    self_similarity_rate=0.0 (0 hits / 1 sampled), no exception, and a
+    path-free, single-line message.
     """
     fake_post = _FakeHttpPost(
         [_resp(_LIVE_SCHEMA_AFTER), _resp(_HAS_EMBEDDING_NON_LIST_VECTOR)]
@@ -1195,4 +1819,77 @@ def test_security_non_list_stored_vector_blocks_third_call() -> None:
     assert result.reachable is True
     assert result.schema_ok is True
     assert result.self_similarity_ok is False
+    assert result.self_similarity_rate == 0.0
     _assert_message_clean(result.message)
+
+
+# ===========================================================================
+# SECURITY (Gate 3a) — variable-denominator message content, M=0 message
+# hygiene, and bounded per-call timeout across ALL 32 calls of a healthy N=30
+# probe. Add-only hardening: none of these existed in the single-sample suite,
+# and each guards a distinct multi-sample failure mode (misreported recall on a
+# small catalogue, an un-cleaned skip message, an unbounded per-replay wait).
+# ===========================================================================
+
+def test_security_message_denominator_tracks_actual_m_not_the_requested_thirty() -> None:
+    """SECURITY (variable-denominator message content): Given the `first: 30`
+    selection returns only M=3 rows (fewer than 30 embedded parts exist), of
+    which 2 hit.
+    When check_index_integrity() is called.
+    Then the summary reports the ACTUAL denominator M=3 — "2 of 3 sampled
+    parts" and the floored percent floor(100*2/3)=66% — and NEVER the requested
+    sample size 30 as the denominator (a message that hard-coded "30" would
+    misreport recall on any DB holding fewer than 30 embedded parts). The
+    message stays single-line and path-free.
+    """
+    m, hits = 3, 2
+    selection_body = _build_n_row_selection(m)
+    replay = _build_k_of_n_replay(m, hits=hits)
+    fake_post = _FakeHttpPost([_resp(_LIVE_SCHEMA_AFTER), _resp(selection_body), *replay])
+
+    result = check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    assert result.self_similarity_rate == hits / m
+    assert "2 of 3 sampled parts" in result.message, result.message
+    assert f"{_floor_percent(hits, m)}%" in result.message, result.message  # 66%
+    assert "30" not in result.message, (
+        "the message must report the ACTUAL denominator M=3, never the requested "
+        f"sample size 30. Got: {result.message!r}"
+    )
+    _assert_message_clean(result.message)
+
+
+def test_security_no_embedded_parts_message_is_clean() -> None:
+    """SECURITY (M=0 message hygiene): Given the schema matches but no embedded
+    parts exist (the skip case, M=0).
+    When check_index_integrity() is called.
+    Then the "skipped" summary is held to the SAME message-hygiene contract as
+    the pass/fail branches: non-empty, single-line, and path-free.
+    """
+    fake_post = _FakeHttpPost([_resp(_LIVE_SCHEMA_AFTER), _resp(_HAS_EMBEDDING_NONE)])
+
+    result = check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    assert result.self_similarity_ok is None
+    assert result.self_similarity_rate is None
+    _assert_message_clean(result.message)
+
+
+def test_security_timeout_forwarded_on_all_thirty_two_calls_in_healthy_probe() -> None:
+    """SECURITY/robustness (bounded per-call timeout): Given a fully healthy
+    N=30 probe that issues all 32 (= 30 + 2) calls.
+    When the injected http_post spy records every call.
+    Then the finite INDEX_PROBE_TIMEOUT_S is forwarded as the `timeout=` kwarg
+    on EVERY one of the 32 calls — not just the first two — so no single wedged
+    per-sample replay can hang the probe on an unbounded wait.
+    """
+    n = 30
+    selection_body = _build_n_row_selection(n)
+    replay = _build_k_of_n_replay(n, hits=n)
+    fake_post = _FakeHttpPost([_resp(_LIVE_SCHEMA_AFTER), _resp(selection_body), *replay])
+
+    check_index_integrity(schema_text=_FILE_TEXT_EXPONENT_6, http_post=fake_post)
+
+    assert len(fake_post.calls) == n + 2
+    for call in fake_post.calls:
+        assert call["kwargs"].get("timeout") == INDEX_PROBE_TIMEOUT_S
