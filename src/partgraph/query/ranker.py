@@ -17,6 +17,20 @@ block has rows, ``nearest_match`` is ``True`` and the rows are sorted ascending
 by the summed absolute parameter distance to the parsed target quantities
 (closest first); each row's ``_distance`` records that sum.
 
+Semantic re-rank (ADR-0020): when :func:`rank_results` is given a
+``query_vector`` (the semantic path only), each semantic-tier row's scalar
+``similarity`` is set to ``cosine(query_vector, raw["embedding"])`` — computed
+with stdlib :mod:`math` ONLY (ranker sits on the lexical path and must stay
+importable with the optional ``[embed]`` extra — numpy/torch — ABSENT). The raw
+384-float vector is read from the DQL dict, used, and DISCARDED; it is never
+stored on :class:`RankedRow`. Semantic rows are ordered by cosine DESCENDING
+(tie-break ``mpn_norm`` then ``uid``); the ordered list is truncated to the
+``result_limit`` (clamped to :data:`_MAX_RESULT_ROWS`) BY COSINE first, so the
+survivors are always the top-cosine rows; a ``sort="stock"/"price"`` value then
+only re-orders the DISPLAY of those survivors. ``query_vector=None`` (the lexical
+default) leaves behaviour byte-identical to the pre-semantic contract and every
+``similarity`` stays ``None``.
+
 Every render field present on the raw DQL dict is propagated onto the
 :class:`RankedRow` (architecture BLOCK-1) so downstream gate/CLI code can read
 ``row.manufacturer`` / ``row.package_name`` / ``row.datasheet_urls`` / the
@@ -25,6 +39,7 @@ promoted floats directly instead of digging into nested dicts.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from partgraph.query.parser import ParsedQuery
@@ -50,6 +65,14 @@ _TIER_SCORE: dict[str, int] = {
     "semantic": 1,
     "nearest": 0,
 }
+
+#: Result-row ceiling for the semantic cosine re-rank truncation. Deliberately a
+#: DUPLICATE of :data:`partgraph.query.dql_builder.MAX_RESULT_LIMIT` (200), NOT
+#: an import of it: ranker sits on the lexical search path and importing its
+#: sibling ``dql_builder`` here would create a module-import cycle. The two are
+#: kept in lockstep by an explicit drift-guard test (ADR-0007 result bound;
+#: ADR-0020 ranker result-ceiling duplicate-not-import rationale).
+_MAX_RESULT_ROWS = 200
 
 #: Promoted numeric predicates copied verbatim onto each RankedRow.
 _PROMOTED_PREDICATES: tuple[str, ...] = (
@@ -96,6 +119,13 @@ class RankedRow:
     frequency_max: float | None = None
     power: float | None = None
     tolerance_pct: float | None = None
+
+    #: Scalar cosine similarity to the query vector (semantic re-rank only;
+    #: ADR-0020). ``None`` on every non-semantic row and whenever no
+    #: ``query_vector`` was supplied. The raw 384-float embedding is NEVER stored
+    #: here (or on any other field): it is read from the DQL dict, reduced to this
+    #: scalar, and discarded.
+    similarity: float | None = None
 
     #: Summed parameter distance to the target (nearest pass only); None on the
     #: hard path.
@@ -253,11 +283,78 @@ _SORT_KEYS = {
 }
 
 
+def _cosine_similarity(
+    query_vector: list[float], query_norm: float, embedding: object
+) -> float | None:
+    """Return the cosine similarity of *query_vector* and a raw *embedding*.
+
+    Stdlib :mod:`math` ONLY (no numpy/torch, at module scope or lazily) so the
+    ranker stays importable with the optional ``[embed]`` extra absent (ADR-0020).
+
+    *query_norm* is the pre-computed magnitude of *query_vector* (computed once by
+    the caller so the per-row cost is a single dot product plus the row's own
+    norm). Returns:
+
+    - ``None`` when *embedding* is missing / not a non-empty list / carries a
+      non-numeric element — the row could not be scored at all, so it sorts LAST
+      and is never conflated with a genuine zero cosine.
+    - ``0.0`` when either vector has zero magnitude (a degenerate all-zero
+      vector) — never raises :class:`ZeroDivisionError`.
+    - the cosine in ``[-1.0, 1.0]`` otherwise.
+    """
+    if not isinstance(embedding, list) or not embedding:
+        return None
+    try:
+        # strict=True: a wrong-length embedding is unscoreable (raises
+        # ValueError -> None below), never a silently-partial cosine.
+        dot = math.fsum(q * e for q, e in zip(query_vector, embedding, strict=True))
+        embedding_norm = math.sqrt(math.fsum(e * e for e in embedding))
+    except (TypeError, ValueError):
+        # A malformed (non-numeric or wrong-length) embedding: unscoreable ->
+        # similarity None -> sorts last (never raises into the caller).
+        return None
+    if query_norm == 0.0 or embedding_norm == 0.0:
+        return 0.0
+    return dot / (query_norm * embedding_norm)
+
+
+def _cosine_sort_key(row: RankedRow) -> tuple:
+    """Semantic re-rank order: cosine DESC, unscoreable (None) last, tie-break.
+
+    An unscoreable row (``similarity is None`` — a missing/malformed raw
+    embedding) sorts strictly after every scored row; scored rows sort by cosine
+    DESCENDING, then ``mpn_norm`` ascending, then ``uid`` ascending (fully
+    deterministic).
+    """
+    missing = row.similarity is None
+    return (
+        1 if missing else 0,
+        0.0 if missing else -row.similarity,
+        row.mpn_norm,
+        row.uid,
+    )
+
+
+def _resolve_result_limit(result_limit: int | None) -> int:
+    """Clamp *result_limit* into ``[0, _MAX_RESULT_ROWS]`` for the final slice.
+
+    ``None`` (no caller limit) -> the :data:`_MAX_RESULT_ROWS` result ceiling. A
+    negative or zero value clamps to ``0`` — a clean empty result, never a
+    negative-index slice artifact (security F3). An oversized value clamps to
+    :data:`_MAX_RESULT_ROWS` so the RESULT bound is never bypassed.
+    """
+    if result_limit is None:
+        return _MAX_RESULT_ROWS
+    return max(0, min(result_limit, _MAX_RESULT_ROWS))
+
+
 def rank_results(
     blocks: dict[str, list[dict]],
     parsed: ParsedQuery,
     *,
     sort: str = "relevance",
+    query_vector: list[float] | None = None,
+    result_limit: int | None = None,
 ) -> RankedResults:
     """Rank, deduplicate and order multi-block DQL results.
 
@@ -269,6 +366,18 @@ def rank_results(
             tier/stock/is_basic/mpn_norm/uid order), ``"stock"`` (stock DESC) or
             ``"price"`` (price_usd ASC, missing last). Ignored entirely in
             nearest-match mode, where the parameter-distance order always wins.
+        query_vector: The semantic query embedding (semantic path only;
+            ADR-0020). When supplied, each semantic-tier row's ``similarity`` is
+            set to ``cosine(query_vector, raw["embedding"])`` (stdlib), semantic
+            rows are ordered by cosine DESCENDING, and the ordered list is
+            truncated to ``result_limit`` BY COSINE before any ``stock``/``price``
+            re-order of the survivors. ``None`` (the lexical default) leaves
+            behaviour byte-identical and every ``similarity`` ``None``.
+        result_limit: The maximum number of rows to return AFTER the cosine
+            re-rank (semantic path only). Clamped to ``[0, _MAX_RESULT_ROWS]``:
+            ``None`` -> the result ceiling; a negative/zero value -> a clean empty
+            result (never a negative-index slice); an oversized value -> the
+            ceiling. Ignored when ``query_vector`` is ``None``.
 
     Returns:
         A :class:`RankedResults` with deduplicated, deterministically ordered
@@ -283,6 +392,14 @@ def rank_results(
         isinstance(blocks.get(_NEAREST_TIER), list) and bool(blocks.get(_NEAREST_TIER))
     )
     nearest_match = (not hard_has_rows) and nearest_rows_present
+
+    # Pre-compute the query vector's magnitude ONCE (stdlib; ADR-0020) so each
+    # per-row cosine costs a single dot product plus the row's own norm.
+    query_norm = (
+        math.sqrt(math.fsum(component * component for component in query_vector))
+        if query_vector is not None
+        else None
+    )
 
     # Build rows, deduplicating by uid. The strongest tier seen for a uid wins.
     # Every block (including ``nearest``) is iterated: when a hard tier already
@@ -299,6 +416,14 @@ def rank_results(
             if not isinstance(raw, dict):
                 continue
             row = _make_row(raw, tier)
+            if query_vector is not None and tier == "semantic":
+                # Read the raw 384-float embedding, reduce it to a scalar cosine
+                # and DISCARD the vector — it is never stored on RankedRow
+                # (ADR-0020). A missing/malformed embedding yields None (the row
+                # sorts last), never a raised error.
+                row.similarity = _cosine_similarity(
+                    query_vector, query_norm, raw.get("embedding")
+                )
             existing = by_uid.get(row.uid)
             # Keep the strongest tier seen for each uid (first occurrence wins on
             # ties because tiers are visited in descending priority order).
@@ -314,10 +439,21 @@ def rank_results(
         for row in rows:
             row._distance = _distance_to_target(row, parsed)
         rows.sort(key=lambda r: (r._distance, r.mpn_norm, r.uid))
+    elif query_vector is not None:
+        # Semantic cosine re-rank (ADR-0020): order by cosine DESC, then truncate
+        # the ORDERED list to the (clamped) result limit so the survivors are
+        # always the top-cosine rows. Only AFTER that do stock/price re-order the
+        # survivors for display — this never changes WHICH rows survived.
+        rows.sort(key=_cosine_sort_key)
+        rows = rows[: _resolve_result_limit(result_limit)]
+        if sort in ("stock", "price"):
+            rows.sort(key=_SORT_KEYS[sort])
     else:
-        # Hard path: order by the selected ``sort`` key. ``relevance`` is the
-        # byte-identical historical order; ``stock``/``price`` are in-memory
-        # re-orders only (no DQL change).
+        # Hard (lexical) path: order by the selected ``sort`` key. ``relevance``
+        # is the byte-identical historical order; ``stock``/``price`` are
+        # in-memory re-orders only (no DQL change). ``result_limit`` is ignored
+        # here so the lexical path stays byte-identical to the pre-semantic
+        # contract.
         rows.sort(key=_SORT_KEYS.get(sort, _relevance_key))
 
     return RankedResults(rows=rows, nearest_match=nearest_match)
