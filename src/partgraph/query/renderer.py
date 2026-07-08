@@ -171,13 +171,17 @@ def _json_row(row: RankedRow) -> dict:
     """Return the machine-safe allowlist dict for a single ranked *row*.
 
     HAND-BUILT (never ``dataclasses.asdict`` and never the raw Dgraph dict, both
-    of which carry ``uid``/edge data) so the output is exactly the 11 documented
+    of which carry ``uid``/edge data) so the output is exactly the 12 documented
     keys and no ``uid``/``0x…`` value can ever leak. Null policy: the seven
     scalars are present-but-``None`` when absent; ``mpn_norm`` is always the
     non-null identity string; ``datasheets`` is the raw URL-string list (``[]``
     when none); ``params`` is the sparse present-predicates map sourced from the
     PUBLIC ranker surface (``[]``/``{}`` never ``None``); ``match_type`` is the
     machine-safe tier name (never the human, bracketed ``_MATCH_LABELS``).
+    ``similarity`` is the scalar cosine float on a semantic-tier row and ``None``
+    on every other row (the raw 384-float vector is never carried; ADR-0020) — an
+    ADDITIVE key, so the envelope ``version`` stays 1 (ADR-0017). It is JSON-only:
+    the human table (:func:`render_search_results`) never shows it.
     """
     return {
         "mpn": row.mpn,
@@ -189,6 +193,7 @@ def _json_row(row: RankedRow) -> dict:
         "is_basic": row.is_basic,
         "price_usd": row.price_usd,
         "match_type": _MATCH_TYPE_JSON.get(row.tier, row.tier),
+        "similarity": row.similarity,
         "datasheets": list(row.datasheet_urls or []),
         "params": row.params_dict(),
     }

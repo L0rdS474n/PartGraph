@@ -503,12 +503,15 @@ def test_dql_builder_float_format_locale_safe() -> None:
 # Pinned contracts:
 #   - vector is embedded INLINE as a literal string (NOT as a $var).
 #   - The literal is built via repr(float) validated by _FLOAT_LITERAL_RE.
-#   - k is clamped to MAX_RESULT_LIMIT=200 and min 1.
+#   - k is clamped to SEMANTIC_CANDIDATE_CAP=1500 and min 1 (UPDATED —
+#     hybrid semantic search PR: was MAX_RESULT_LIMIT=200; see AC-HY-2).
 #   - vector must be length 384; otherwise ValueError naming 384.
 #   - hostile non-float elements -> ValueError (literal can't break out).
 #   - variables dict has NO "vector" key (inline literal, not $var).
 #   - selects: uid mpn mpn_norm stock is_basic promoted made_by{name}
-#     in_package{name} datasheet{url}.
+#     in_package{name} datasheet{url} embedding (UPDATED — hybrid semantic
+#     search PR adds the bare 'embedding' field so the ranker can compute
+#     cosine similarity; see AC-HY-3).
 #   - hybrid: parsed with quantities/package -> filter carried into similar_to block.
 # ===========================================================================
 
@@ -584,14 +587,24 @@ def test_ac_sd_2_hostile_non_float_raises_value_error() -> None:
 # ---------------------------------------------------------------------------
 
 def test_ac_sd_3_k_clamped_to_max_result_limit() -> None:
-    """AC-SD-3: Given k=99999 (above MAX_RESULT_LIMIT=200).
+    """AC-SD-3 (REWRITTEN — hybrid semantic search PR, AC-HY-2): Given
+    k=99999 (above the NEW SEMANTIC_CANDIDATE_CAP=1500).
     When build_semantic_dql(vector, 99999) is called.
-    Then the effective k in the query text is <= 200 (not 99999).
+    Then the effective k in the query text is EXACTLY 1500 (not 99999, and
+    not silently clamped further down to the old MAX_RESULT_LIMIT=200 —
+    build_semantic_dql's internal clamp bound moved from MAX_RESULT_LIMIT to
+    SEMANTIC_CANDIDATE_CAP so an oversampled candidate_k up to 1500 can pass
+    straight through).
+
+    CHANGED FROM PRE-HYBRID (documented, not silent): the pre-hybrid version
+    of this test asserted k <= MAX_RESULT_LIMIT (200). MAX_RESULT_LIMIT
+    stays the RESULT bound (unchanged, still 200) but is no longer the bound
+    build_semantic_dql's internal k-clamp uses.
     """
     if build_semantic_dql is None:
         pytest.skip("build_semantic_dql not yet implemented (expected red)")
 
-    from partgraph.query.dql_builder import MAX_RESULT_LIMIT
+    from partgraph.query.dql_builder import SEMANTIC_CANDIDATE_CAP
     vector = _unit_vector()
     query_text, _ = build_semantic_dql(vector, 99999)
 
@@ -600,11 +613,22 @@ def test_ac_sd_3_k_clamped_to_max_result_limit() -> None:
     )
     # Extract k from similar_to(embedding, <k>, ...)
     k_matches = re.findall(r"similar_to\([^,]+,\s*(\d+)", query_text)
+    assert k_matches, (
+        f"AC-SD-3: expected a similar_to(embedding, k, ...) clause. "
+        f"Got:\n{query_text}"
+    )
     for k_val_str in k_matches:
         k_val = int(k_val_str)
-        assert k_val <= MAX_RESULT_LIMIT, (
-            f"AC-SD-3: k in query ({k_val}) must be <= MAX_RESULT_LIMIT={MAX_RESULT_LIMIT}."
+        assert k_val <= SEMANTIC_CANDIDATE_CAP, (
+            f"AC-SD-3: k in query ({k_val}) must be <= "
+            f"SEMANTIC_CANDIDATE_CAP={SEMANTIC_CANDIDATE_CAP}."
         )
+    # k=99999 must clamp EXACTLY to the new cap (not some smaller value, e.g.
+    # not the OLD MAX_RESULT_LIMIT=200 — that would be the pre-hybrid bug).
+    assert int(k_matches[0]) == SEMANTIC_CANDIDATE_CAP, (
+        f"AC-SD-3: k=99999 must clamp EXACTLY to "
+        f"SEMANTIC_CANDIDATE_CAP={SEMANTIC_CANDIDATE_CAP}. Got {k_matches[0]}."
+    )
 
 
 def test_ac_sd_3_k_zero_clamped_to_1() -> None:
@@ -2135,4 +2159,197 @@ def test_ac_sf_36_validate_package_accepts_valid_value_returns_unchanged() -> No
 
     assert validate_package("SOIC-16") == "SOIC-16", (
         "Gate3/AC-SF-36: validate_package('SOIC-16') must return 'SOIC-16' unchanged."
+    )
+
+
+# ===========================================================================
+# AC-HY: hybrid semantic search robustness (Gate-1 ratified contract)
+#
+# New constants (dql_builder.py, added to __all__):
+#   SEMANTIC_CANDIDATE_CAP = 1500   (build_semantic_dql's internal k-clamp
+#                                    ceiling; was MAX_RESULT_LIMIT=200 — see
+#                                    the AC-SD-3 rewrite above)
+#   SEMANTIC_CANDIDATE_FLOOR = 200  (the CLI's oversample floor)
+#   SEMANTIC_OVERSAMPLE_FACTOR = 20 (the CLI's oversample multiplier)
+# MAX_RESULT_LIMIT=200 stays the RESULT bound, unchanged.
+#
+# The CLI computes candidate_k = min(max(limit * 20, 200), 1500) and passes
+# it as build_semantic_dql's `k` argument — see AC-HY-1 in
+# tests/unit/test_cli_search.py for the CLI-level oversample-formula spy
+# test (this file only pins the builder's OWN internal clamp + the new
+# 'embedding' selection field + the constants themselves).
+#
+# NOTE: SEMANTIC_CANDIDATE_CAP/FLOOR/OVERSAMPLE_FACTOR do not exist yet.
+# Every import below is LOCAL to its test function (never at module level)
+# so a missing name only fails THAT test at call time (ImportError) rather
+# than erroring collection of the whole file.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# AC-HY-2: new candidate-pool constants exist, are pinned, and raise the
+# builder's internal cap from 200 to 1500 (without lowering the floor of 1).
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_2_semantic_candidate_constants_exist_and_are_pinned() -> None:
+    """AC-HY-2: Given the dql_builder module.
+    When SEMANTIC_CANDIDATE_CAP / SEMANTIC_CANDIDATE_FLOOR /
+    SEMANTIC_OVERSAMPLE_FACTOR are imported.
+    Then they equal 1500 / 200 / 20 respectively; MAX_RESULT_LIMIT stays 200
+    (the RESULT bound, unaffected by the new candidate-pool constants); and
+    all three new names are listed in __all__ (the public export contract).
+    """
+    import partgraph.query.dql_builder as dql_builder_mod
+    from partgraph.query.dql_builder import (
+        MAX_RESULT_LIMIT,
+        SEMANTIC_CANDIDATE_CAP,
+        SEMANTIC_CANDIDATE_FLOOR,
+        SEMANTIC_OVERSAMPLE_FACTOR,
+    )
+
+    assert SEMANTIC_CANDIDATE_CAP == 1500, (
+        f"AC-HY-2: SEMANTIC_CANDIDATE_CAP must be 1500. Got: {SEMANTIC_CANDIDATE_CAP!r}"
+    )
+    assert SEMANTIC_CANDIDATE_FLOOR == 200, (
+        f"AC-HY-2: SEMANTIC_CANDIDATE_FLOOR must be 200. Got: {SEMANTIC_CANDIDATE_FLOOR!r}"
+    )
+    assert SEMANTIC_OVERSAMPLE_FACTOR == 20, (
+        f"AC-HY-2: SEMANTIC_OVERSAMPLE_FACTOR must be 20. Got: {SEMANTIC_OVERSAMPLE_FACTOR!r}"
+    )
+    assert MAX_RESULT_LIMIT == 200, (
+        "AC-HY-2: MAX_RESULT_LIMIT must stay the RESULT bound (200), "
+        "unaffected by the new candidate-pool constants."
+    )
+    for name in (
+        "SEMANTIC_CANDIDATE_CAP", "SEMANTIC_CANDIDATE_FLOOR",
+        "SEMANTIC_OVERSAMPLE_FACTOR",
+    ):
+        assert name in dql_builder_mod.__all__, (
+            f"AC-HY-2: {name!r} must be exported via __all__. "
+            f"Got: {dql_builder_mod.__all__}"
+        )
+
+
+def test_ac_hy_2_k_between_old_and_new_cap_is_not_clamped_down_to_200() -> None:
+    """AC-HY-2: Given k=1000 (above the OLD MAX_RESULT_LIMIT=200 cap but
+    below the NEW SEMANTIC_CANDIDATE_CAP=1500).
+    When build_semantic_dql(vector, 1000) is called.
+    Then the effective k baked into similar_to(embedding, k, ...) is EXACTLY
+    1000 — NOT silently clamped down to 200 as the pre-hybrid contract did.
+    """
+    vector = _unit_vector()
+    query_text, _ = build_semantic_dql(vector, 1000)
+
+    k_matches = re.findall(r"similar_to\([^,]+,\s*(\d+)", query_text)
+    assert k_matches and int(k_matches[0]) == 1000, (
+        f"AC-HY-2: k=1000 must pass through unclamped (new cap is 1500). "
+        f"Got k={k_matches[0] if k_matches else '<none found>'} in:\n{query_text}"
+    )
+
+
+def test_ac_hy_2_k_1500_at_cap_not_clamped_below() -> None:
+    """AC-HY-2: Given k=1500 (exactly at the new SEMANTIC_CANDIDATE_CAP).
+    When build_semantic_dql(vector, 1500) is called.
+    Then the effective k is exactly 1500 (the cap is inclusive, not a strict
+    upper-exclusive bound).
+    """
+    vector = _unit_vector()
+    query_text, _ = build_semantic_dql(vector, 1500)
+
+    k_matches = re.findall(r"similar_to\([^,]+,\s*(\d+)", query_text)
+    assert k_matches and int(k_matches[0]) == 1500, (
+        f"AC-HY-2: k=1500 (at the cap) must remain 1500. "
+        f"Got k={k_matches[0] if k_matches else '<none found>'} in:\n{query_text}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-HY-3: semantic block selects 'embedding'; lexical build_search_dql does
+# NOT (byte-identical lexical response).
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_3_semantic_selects_embedding_lexical_does_not() -> None:
+    """AC-HY-3: Given a 384-dim vector, k=10 (semantic) and a plain
+    ParsedQuery with text_tokens=["MAX232"] (lexical).
+    When build_semantic_dql(vector, 10) and build_search_dql(parsed) are
+    both called.
+    Then:
+    - The semantic query's selection set includes a bare `embedding` field
+      IN ADDITION to the existing `similar_to(embedding, ...)` root-function
+      reference (>=2 occurrences of the word) — the ranker needs the raw
+      embedding to compute cosine similarity client-side.
+    - The lexical build_search_dql query text contains NO "embedding"
+      substring anywhere (byte-identical lexical response — regression
+      guard: the lexical path must never carry the 384-float vector).
+    """
+    vector = _unit_vector()
+    semantic_text, _ = build_semantic_dql(vector, 10)
+
+    assert semantic_text.count("embedding") >= 2, (
+        f"AC-HY-3: expected 'embedding' selected as a bare field IN "
+        f"ADDITION to the similar_to(embedding, ...) root reference "
+        f"(>=2 occurrences). Got {semantic_text.count('embedding')} "
+        f"occurrence(s) in:\n{semantic_text}"
+    )
+    assert re.search(r"^\s*embedding\s*$", semantic_text, re.MULTILINE), (
+        f"AC-HY-3: expected a bare 'embedding' selected field (its own "
+        f"line). Got:\n{semantic_text}"
+    )
+
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    lexical_text, _ = build_search_dql(parsed)
+    assert "embedding" not in lexical_text, (
+        f"AC-HY-3: lexical build_search_dql must NEVER select 'embedding' "
+        f"(byte-identical lexical response). Got:\n{lexical_text}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-HY-16: adding the 'embedding' selection field introduces no new
+# injection surface; per-element _fmt_float validation of the vector literal
+# is unaffected.
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_16_embedding_selection_adds_no_injection_surface() -> None:
+    """AC-HY-16: Given (a) a hostile vector whose last element is a
+    quote-breaking payload (mirrors AC-SD-2) and (b) a valid vector with
+    EVERY structured filter active (manufacturer/category/min_stock/
+    is_basic/max_price).
+    When build_semantic_dql is called for each.
+    Then:
+    - (a) STILL raises ValueError/TypeError — adding the bare 'embedding'
+      selection field must not weaken or bypass the existing per-element
+      _fmt_float validation of the similar_to(...) vector literal.
+    - (b) the bare 'embedding' selection field is present, is the exact,
+      unmodified literal word 'embedding' on its own line, and is NEVER
+      bound as (or derived from) a $var — it introduces no new injection
+      surface regardless of which/how many structured filters are active.
+    """
+    hostile_vector: list = [0.1] * (_EMBED_DIM - 1) + ['0.5", 1, "evil']
+    with pytest.raises((ValueError, TypeError)):
+        build_semantic_dql(hostile_vector, 10)  # type: ignore[arg-type]
+
+    vector = _unit_vector()
+    query_text, variables = build_semantic_dql(
+        vector,
+        10,
+        manufacturer="Texas Instruments",
+        category="RS232 ICs",
+        min_stock=5,
+        is_basic=True,
+        max_price=0.5,
+    )
+
+    bare_embedding_lines = [
+        line for line in query_text.splitlines() if line.strip() == "embedding"
+    ]
+    assert bare_embedding_lines, (
+        f"AC-HY-16: expected a bare 'embedding' selection line even with "
+        f"every structured filter active. Got:\n{query_text}"
+    )
+    assert not any("embedding" in str(v) for v in variables.values()), (
+        f"AC-HY-16: 'embedding' must never be (part of) a $var value. "
+        f"Got variables: {variables}"
+    )
+    assert not any("embedding" in k for k in variables), (
+        f"AC-HY-16: 'embedding' must never be a $var name. Got: {variables}"
     )

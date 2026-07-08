@@ -30,8 +30,14 @@ Security model (ADR-INJECT):
   rejects empty/whitespace-only values and caps the length at
   :data:`MAX_FILTER_TERM_LEN` (DoS defence-in-depth, ADR-0007 style).
 
-DoS model (ADR-0007): the caller-supplied ``limit`` is clamped to
-``MAX_RESULT_LIMIT`` so a single request can never stream the whole database.
+DoS model (ADR-0007 / ADR-0020): the lexical :func:`build_search_dql` clamps the
+caller-supplied ``limit`` to :data:`MAX_RESULT_LIMIT` (the RESULT bound) so a
+single request can never stream the whole database. The semantic
+:func:`build_semantic_dql` clamps its neighbour count ``k`` to the larger
+:data:`SEMANTIC_CANDIDATE_CAP` (the CANDIDATE bound): the CLI oversamples the
+candidate pool so the client-side cosine re-rank has enough neighbours to
+truncate back down to :data:`MAX_RESULT_LIMIT`, yet a single request still can
+never ask Dgraph for an unbounded neighbour set.
 
 Parametric brackets (ADR-PARAM):
 - resistance ........ +/-1%
@@ -55,14 +61,39 @@ from partgraph.query.parser import ParsedQuery
 __all__ = [
     "MAX_FILTER_TERM_LEN",
     "MAX_RESULT_LIMIT",
+    "SEMANTIC_CANDIDATE_CAP",
+    "SEMANTIC_CANDIDATE_FLOOR",
+    "SEMANTIC_OVERSAMPLE_FACTOR",
     "build_search_dql",
     "build_semantic_dql",
     "build_show_dql",
     "validate_package",
 ]
 
-#: Maximum number of rows any single block may return (ADR-0007 DoS bound).
+#: Maximum number of rows any single block may return, and the number of rows a
+#: search RESULT may ever contain (ADR-0007 DoS bound). Still the RESULT bound
+#: for BOTH the lexical and the semantic path; the ranker truncates a
+#: cosine-reranked semantic result back down to this value (ADR-0020).
 MAX_RESULT_LIMIT = 200
+
+#: Upper bound on the semantic neighbour count ``k`` (the CANDIDATE bound;
+#: ADR-0020). ``build_semantic_dql`` clamps ``k`` to this — NOT to
+#: :data:`MAX_RESULT_LIMIT` — so the CLI's oversampled candidate pool (up to this
+#: many nearest neighbours) can pass straight through to ``similar_to`` while a
+#: single request still can never ask Dgraph for an unbounded neighbour set. The
+#: worst-case response (1500 x 384 float32 ~= 6 MB) stays far under the 256 MiB
+#: gRPC ceiling (cli.py ``_GRPC_MAX_MESSAGE_BYTES``); see ADR-0020.
+SEMANTIC_CANDIDATE_CAP = 1500
+
+#: Floor for the CLI's oversampled candidate count: even a tiny ``--limit`` asks
+#: Dgraph for at least this many neighbours so the client-side cosine re-rank has
+#: a meaningful pool to choose the top results from (ADR-0020).
+SEMANTIC_CANDIDATE_FLOOR = 200
+
+#: Multiplier the CLI applies to ``--limit`` when sizing the semantic candidate
+#: pool: ``candidate_k = min(max(limit * SEMANTIC_OVERSAMPLE_FACTOR,
+#: SEMANTIC_CANDIDATE_FLOOR), SEMANTIC_CANDIDATE_CAP)`` (ADR-0020).
+SEMANTIC_OVERSAMPLE_FACTOR = 20
 
 #: Required embedding dimension (all-MiniLM-L6-v2; ADR-0008). Every vector that
 #: reaches the semantic builder must be exactly this long.
@@ -286,8 +317,16 @@ def _render_fields(  # noqa: PLR0913 — keyword-only selection descriptor; cohe
     manufacturer_var: str = "$mfr",
     has_category: bool = False,
     category_var: str = "$cat",
+    include_embedding: bool = False,
 ) -> str:
     """Return the shared selection set rendered for every search block.
+
+    ``include_embedding`` is set ONLY by the semantic path
+    (:func:`build_semantic_dql`): it appends a bare ``embedding`` field (the raw
+    384-float vector) after ``datasheet`` so the ranker can compute cosine
+    similarity client-side (ADR-0020). It defaults to ``False``, so the lexical
+    :func:`build_search_dql` never selects ``embedding`` and its response stays
+    byte-identical (the 384-float vector never travels the lexical path).
 
     Scalar fields are fixed and always selected, including a bare ``price_usd``
     (positioned immediately after ``is_basic``) so every row carries a price for
@@ -370,6 +409,13 @@ def _render_fields(  # noqa: PLR0913 — keyword-only selection descriptor; cohe
         lines.append(in_package_line())
 
     lines.append(f"{indent}datasheet {{ url }}")
+    if include_embedding:
+        # Semantic path only (ADR-0020): a bare ``embedding`` selection so the
+        # ranker reads the raw 384-float vector, computes cosine similarity and
+        # discards it. It is a HARDCODED bare field, never a ``$``-variable, so
+        # it adds no injection surface (the vector literal's per-element
+        # _fmt_float validation is unchanged; AC-HY-16).
+        lines.append(f"{indent}embedding")
     return "\n".join(lines)
 
 
@@ -626,7 +672,10 @@ def build_semantic_dql(  # noqa: PLR0913 — keyword-only structured-filter kwar
     Returns ``(query_text, variables)`` for a single ``semantic`` block rooted on
     ``similar_to(embedding, k, "[...]")``. The query selects the same render
     fields as :func:`build_search_dql` so the ranker/renderer treat semantic rows
-    uniformly.
+    uniformly, PLUS a bare ``embedding`` field (the raw 384-float vector) so the
+    ranker can compute cosine similarity client-side (ADR-0020).
+    :func:`build_search_dql` never selects ``embedding``, so the lexical response
+    stays byte-identical (the vector never travels the lexical path).
 
     Security (ADR-INJECT / ADR-0008):
     - The query vector is embedded as an **inline quoted literal**, never as a
@@ -640,8 +689,14 @@ def build_semantic_dql(  # noqa: PLR0913 — keyword-only structured-filter kwar
       *parsed* are added via the same injection-safe helpers PR3 uses
       (``_param_filter_terms`` float literals; the package bound as ``$pkg``).
 
-    DoS (ADR-0007): ``k`` is clamped to ``[1, MAX_RESULT_LIMIT]`` so a single
-    request can never ask Dgraph for an unbounded neighbour set.
+    DoS (ADR-0007 / ADR-0020): ``k`` is clamped to
+    ``[1, SEMANTIC_CANDIDATE_CAP]`` (the CANDIDATE bound, 1500) so a single
+    request can never ask Dgraph for an unbounded neighbour set. This is the
+    candidate pool the CLI oversamples into; the smaller
+    :data:`MAX_RESULT_LIMIT` (the RESULT bound, 200) is applied later by the
+    ranker AFTER the client-side cosine re-rank — the builder deliberately does
+    NOT use :data:`MAX_RESULT_LIMIT` for this clamp, and is the DoS backstop that
+    never trusts the caller's ``k``.
 
     The structured-filter keyword arguments (``manufacturer``/``category``/
     ``min_stock``/``is_basic``/``max_price``) compose EXACTLY as they do for
@@ -684,8 +739,12 @@ def build_semantic_dql(  # noqa: PLR0913 — keyword-only structured-filter kwar
     literal_parts = [_fmt_float(component) for component in vector]
     vector_literal = "[" + ", ".join(literal_parts) + "]"
 
-    # Clamp k into [1, MAX_RESULT_LIMIT] (DoS bound; never 0/negative/huge).
-    clamped_k = max(1, min(int(k), MAX_RESULT_LIMIT))
+    # Clamp k into [1, SEMANTIC_CANDIDATE_CAP] (the CANDIDATE bound; ADR-0020).
+    # The builder is the DoS backstop and never trusts the caller: even an
+    # un-oversampled or hostile k can never ask Dgraph for an unbounded neighbour
+    # set. MAX_RESULT_LIMIT stays the RESULT bound (applied later by the ranker),
+    # NOT this candidate clamp.
+    clamped_k = max(1, min(int(k), SEMANTIC_CANDIDATE_CAP))
 
     variables: dict[str, str] = {}
     var_decls: list[str] = []
@@ -740,6 +799,7 @@ def build_semantic_dql(  # noqa: PLR0913 — keyword-only structured-filter kwar
         manufacturer_var=manufacturer_var,
         has_category=has_category,
         category_var=category_var,
+        include_embedding=True,
     )
 
     header = ""
