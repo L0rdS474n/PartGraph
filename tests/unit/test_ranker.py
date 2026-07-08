@@ -880,39 +880,94 @@ def test_ac_sr_3_semantic_scores_above_nearest_tier() -> None:
 
 
 def test_ac_sr_4_semantic_only_deterministic_order() -> None:
-    """AC-SR-4: Given semantic block only with 3 parts, no other blocks.
-    When rank_results is called twice.
+    """AC-SR-4 (REWRITTEN — hybrid semantic search PR, AC-HY-6/AC-HY-7):
+    Given a semantic block with 5 parts carrying KNOWN 384-d embeddings and
+    a query_vector passed to rank_results, where two of the parts
+    (TIE-APPLE/TIE-ZEBRA) are DELIBERATELY given embeddings pointing in the
+    EXACT SAME direction as the top (HIGH) part — a genuine 3-way cosine tie
+    at 1.0 — so the mpn_norm tie-break is actually exercised, not just
+    assumed.
+    When rank_results(blocks, parsed, query_vector=query_vector) is called
+    twice.
     Then:
-    - All 3 parts appear in the result.
+    - All 5 parts appear in the result.
     - The order is the same on both calls (deterministic).
-    - nearest_match is False.
+    - nearest_match is False (semantic is a HARD tier; a query_vector must
+      never turn a confident embedding hit into the relaxed/nearest path).
+    - Rows are ordered by cosine similarity to query_vector DESCENDING —
+      HAND-COMPUTED: HIGH/TIE-APPLE/TIE-ZEBRA all have cosine=1.0 (tied,
+      tie-broken by mpn_norm ascending: HIGH < TIE-APPLE < TIE-ZEBRA), MID
+      has cosine=1/sqrt(2)~=0.70711, LOW has cosine=1/sqrt(3)~=0.57735. This
+      is NOT plain mpn_norm-alphabetic order (which would put LOW before
+      MID: "HIGH,LOW,MID,TIE-APPLE,TIE-ZEBRA") — proving cosine, not
+      alphabetic order, genuinely drives the ranking.
+
+    CHANGED FROM PRE-HYBRID (documented, not silent): the pre-hybrid version
+    of this test asserted plain mpn_norm-ascending order (no query_vector
+    existed). With the hybrid `query_vector` kwarg, semantic-tier rows are
+    now ordered by cosine similarity DESCENDING (tie-break mpn_norm, then
+    uid) instead.
     """
+    query_vector = [1.0] + [0.0] * 383
+
+    # HIGH: identical direction to the query -> cosine = 1.0.
+    high_embedding = [1.0] + [0.0] * 383
+    # MID: 45-degree-ish direction -> cosine = 1/sqrt(2) ~= 0.70711.
+    mid_embedding = [1.0, 1.0] + [0.0] * 382
+    # LOW: further off-axis -> cosine = 1/sqrt(3) ~= 0.57735.
+    low_embedding = [1.0, 1.0, 1.0] + [0.0] * 381
+    # TIE-APPLE / TIE-ZEBRA: SAME direction as HIGH (cosine = 1.0 for both —
+    # a genuine, deliberate cosine tie), differing only in magnitude (cosine
+    # similarity is magnitude-invariant).
+    tie_apple_embedding = [1.0] + [0.0] * 383
+    tie_zebra_embedding = [5.0] + [0.0] * 383
+
+    def _sem_part(uid: str, mpn_norm: str, embedding: list[float]) -> dict:
+        return {
+            "uid": uid, "mpn": mpn_norm, "mpn_norm": mpn_norm,
+            "embedding": embedding,
+        }
+
     parsed = _make_parsed(text_tokens=["rs232"])
     blocks = {
         "exact":    [],
         "trig":     [],
         "fts":      [],
         "semantic": [
-            _part("0xSA3", "ZZZ232SEM", stock=0),
-            _part("0xSA1", "AAA232SEM", stock=0),
-            _part("0xSA2", "MMM232SEM", stock=0),
+            _sem_part("0xSA1", "LOW", low_embedding),
+            _sem_part("0xSA2", "MID", mid_embedding),
+            _sem_part("0xSA3", "HIGH", high_embedding),
+            _sem_part("0xSA4", "TIE-ZEBRA", tie_zebra_embedding),
+            _sem_part("0xSA5", "TIE-APPLE", tie_apple_embedding),
         ],
     }
 
-    result1 = rank_results(blocks, parsed)
-    result2 = rank_results(blocks, parsed)
+    result1 = rank_results(blocks, parsed, query_vector=query_vector)
+    result2 = rank_results(blocks, parsed, query_vector=query_vector)
 
     mpn1 = [row.mpn_norm for row in result1.rows]
     mpn2 = [row.mpn_norm for row in result2.rows]
 
-    assert len(mpn1) == 3, f"AC-SR-4: must return 3 rows. Got: {mpn1}"
+    assert len(mpn1) == 5, f"AC-SR-4: must return 5 rows. Got: {mpn1}"
     assert mpn1 == mpn2, (
         f"AC-SR-4: semantic-only result must be deterministic. "
         f"Got different orders: {mpn1} vs {mpn2}"
     )
     assert result1.nearest_match is False, (
-        f"AC-SR-4: nearest_match must be False for semantic-only result. "
-        f"Got: {result1.nearest_match}"
+        f"AC-SR-4: nearest_match must be False for semantic-only result, "
+        f"even with query_vector supplied. Got: {result1.nearest_match}"
+    )
+
+    # The three cosine==1.0 rows must tie-break by mpn_norm ascending among
+    # themselves, and rank ahead of MID/LOW.
+    assert mpn1[:3] == ["HIGH", "TIE-APPLE", "TIE-ZEBRA"], (
+        f"AC-SR-4: the three cosine==1.0 rows must tie-break by mpn_norm "
+        f"ascending. Got: {mpn1}"
+    )
+    # MID (cosine ~0.70711) must rank above LOW (cosine ~0.57735).
+    assert mpn1[3:] == ["MID", "LOW"], (
+        f"AC-SR-4: MID (cosine~0.70711) must rank above LOW "
+        f"(cosine~0.57735). Got: {mpn1}"
     )
 
 
@@ -1462,3 +1517,580 @@ def test_ac_sf_32_existing_ranked_row_fields_still_present_regression() -> None:
     assert row.manufacturer == "Texas Instruments"
     assert row.package_name == "PDIP-16"
     assert row.voltage_max == pytest.approx(5.5)
+
+
+# ===========================================================================
+# AC-HY: hybrid semantic search robustness (Gate-1 ratified contract)
+#
+# New rank_results signature:
+#   rank_results(blocks, parsed, *, sort="relevance", query_vector=None,
+#                result_limit=None) -> RankedResults
+#
+# When query_vector is given, semantic-tier rows get a computed
+# `similarity` = cosine(query_vector, raw["embedding"]) (stdlib math only —
+# see AC-HY-10), ordered cosine DESC with an mpn_norm/uid tie-break.
+# RankedRow gains a scalar `similarity: float | None` field (cosine for
+# semantic rows, None otherwise); the raw 384-float vector itself is NEVER
+# copied onto RankedRow (AC-HY-7). result_limit truncates the FINAL ordered
+# row list to min(result_limit, MAX_RESULT_LIMIT) — for a semantic result
+# this truncation happens AFTER the cosine re-rank, so the SURVIVING rows
+# are always the top-cosine ones; a `sort="stock"/"price"` value then only
+# re-orders the DISPLAY of those survivors (AC-HY-12).
+#
+# query_vector=None (the lexical path's default) must be byte-identical to
+# today's behaviour — see test_ac_hy_12_query_vector_none_is_byte_identical_
+# regression below.
+#
+# RED reason: rank_results does not accept query_vector=/result_limit= yet
+# -> TypeError("unexpected keyword argument"), a per-test runtime failure
+# (rank_results itself already exists and imports fine today), never a
+# collection error.
+# ===========================================================================
+
+_EMBED_DIM = 384
+
+
+def _sem_part(uid: str, mpn_norm: str, embedding: list[float], **extra) -> dict:
+    """Build a minimal semantic-tier raw part dict carrying a raw embedding."""
+    row: dict = {"uid": uid, "mpn": mpn_norm, "mpn_norm": mpn_norm, "embedding": embedding}
+    row.update(extra)
+    return row
+
+
+# ---------------------------------------------------------------------------
+# AC-HY-6: cosine DESC order across the full [-1, 1] range.
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_6_semantic_cosine_desc_order_with_negative_and_orthogonal_vectors() -> None:
+    """AC-HY-6: Given a semantic block with parts whose embeddings are
+    PARALLEL (cosine=1.0), ORTHOGONAL (cosine=0.0) and ANTI-PARALLEL
+    (cosine=-1.0) to the query_vector.
+    When rank_results(blocks, parsed, query_vector=query_vector) is called.
+    Then rows are ordered cosine DESCENDING: PARALLEL (1.0), ORTHOGONAL
+    (0.0), ANTI-PARALLEL (-1.0) — proving the full [-1, 1] cosine range
+    sorts correctly, not just the positive-value cases.
+    """
+    query_vector = [1.0] + [0.0] * 383
+    parallel = [2.0] + [0.0] * 383           # cosine = 1.0
+    orthogonal = [0.0, 3.0] + [0.0] * 382    # cosine = 0.0
+    anti_parallel = [-1.0] + [0.0] * 383     # cosine = -1.0
+
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "semantic": [
+            _sem_part("0xC1", "ANTIPART", anti_parallel),
+            _sem_part("0xC2", "ORTHOPART", orthogonal),
+            _sem_part("0xC3", "PARAPART", parallel),
+        ],
+    }
+
+    result = rank_results(blocks, parsed, query_vector=query_vector)
+    mpn_norms = [row.mpn_norm for row in result.rows]
+
+    assert mpn_norms == ["PARAPART", "ORTHOPART", "ANTIPART"], (
+        f"AC-HY-6: rows must be ordered cosine DESC across the full [-1, 1] "
+        f"range (parallel=1.0, orthogonal=0.0, anti-parallel=-1.0). "
+        f"Got: {mpn_norms}"
+    )
+    assert result.rows[0].similarity == pytest.approx(1.0)
+    assert result.rows[1].similarity == pytest.approx(0.0)
+    assert result.rows[2].similarity == pytest.approx(-1.0)
+
+
+# ---------------------------------------------------------------------------
+# AC-HY-7: RankedRow gets a scalar similarity, never the raw vector.
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_7_ranked_row_gets_scalar_similarity_never_the_raw_vector() -> None:
+    """AC-HY-7: Given a semantic-tier raw part dict carrying a 384-element
+    'embedding' list and a query_vector.
+    When rank_results(blocks, parsed, query_vector=query_vector) is called.
+    Then the resulting RankedRow:
+    - exposes a 'similarity' attribute that is a plain float (a SCALAR
+      cosine value, not a list/vector).
+    - has NO attribute named 'embedding' (the 384-float vector is never
+      copied onto RankedRow).
+    - has NO attribute anywhere on the instance holding a list of length
+      384 (defence-in-depth: the raw vector must not leak onto the row
+      under any field name).
+    """
+    query_vector = [1.0] + [0.0] * 383
+    embedding = [1.0] + [0.0] * 383
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {"semantic": [_sem_part("0xV1", "MAX232CPE", embedding)]}
+
+    result = rank_results(blocks, parsed, query_vector=query_vector)
+    assert result.rows, "Expected at least one row."
+    row = result.rows[0]
+
+    assert hasattr(row, "similarity"), (
+        "AC-HY-7: RankedRow must expose a 'similarity' attribute."
+    )
+    assert isinstance(row.similarity, float), (
+        f"AC-HY-7: row.similarity must be a plain float (scalar cosine), "
+        f"not a list/vector. Got: {type(row.similarity)!r} = {row.similarity!r}"
+    )
+    assert row.similarity == pytest.approx(1.0)
+
+    assert not hasattr(row, "embedding"), (
+        "AC-HY-7: RankedRow must NEVER carry an 'embedding' attribute "
+        "(the 384-float vector must not be copied onto the row)."
+    )
+    for field_name, value in vars(row).items():
+        assert not (isinstance(value, list) and len(value) == _EMBED_DIM), (
+            f"AC-HY-7: RankedRow field {field_name!r} unexpectedly holds a "
+            f"{_EMBED_DIM}-length list — the raw embedding vector must "
+            f"never leak onto any RankedRow field."
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC-HY-10: cosine computed with stdlib math only — no numpy/torch import,
+# neither at module scope nor at call time.
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_10_ranker_module_source_has_no_numpy_or_torch_import() -> None:
+    """AC-HY-10: Given the ranker.py source file.
+    When read as text.
+    Then it contains no 'import numpy' / 'import torch' / 'from numpy' /
+    'from torch' statement — ranker.py sits on the lexical search path and
+    must remain importable with the optional [embed] extra (numpy/torch via
+    sentence-transformers) absent. Cosine similarity must be computed with
+    stdlib math only.
+    """
+    import pathlib
+
+    import partgraph.query.ranker as ranker_mod
+
+    source = pathlib.Path(ranker_mod.__file__).read_text(encoding="utf-8")
+    for banned in ("import numpy", "from numpy", "import torch", "from torch"):
+        assert banned not in source, (
+            f"AC-HY-10: ranker.py must not contain {banned!r} — cosine "
+            f"similarity must use stdlib math only (no [embed]-only import "
+            f"at module scope)."
+        )
+
+
+def test_ac_hy_10_fresh_ranker_import_and_call_succeed_with_numpy_torch_hidden() -> None:
+    """AC-HY-10: Given numpy AND torch are made UNIMPORTABLE
+    (patch.dict(sys.modules, {"numpy": None, "torch": None}) — mirrors
+    tests/unit/test_embed.py's AC-IM-1 pattern for sentence_transformers)
+    and partgraph.query.ranker is loaded FRESH from its source file under
+    that condition, via importlib into a PRIVATE sys.modules key so the
+    session-wide cached partgraph.query.ranker module is never touched
+    (avoiding the class-identity pollution a real reload() of the shared
+    module would risk for other test files' isinstance/import checks — the
+    same collection-order sys.modules hygiene fixed in PR #22).
+    When the freshly-loaded module's rank_results(blocks, parsed,
+    query_vector=<vector>) is called on a semantic-tier row carrying a raw
+    'embedding'.
+    Then the fresh import itself succeeds (proving no MODULE-SCOPE numpy/
+    torch import) and the call computes a correct cosine similarity with no
+    ImportError (proving no call-time/lazy numpy/torch import either) —
+    cosine is stdlib math only.
+    """
+    import importlib.util
+    import sys as _sys
+    from unittest.mock import patch as _patch
+
+    import partgraph.query.ranker as _real_ranker_mod
+
+    parsed = _make_parsed(text_tokens=["rs232"])
+    vector = [1.0] + [0.0] * 383
+    blocks = {"semantic": [_sem_part("0xNT1", "MAX232CPE", [1.0] + [0.0] * 383)]}
+
+    private_name = "partgraph_query_ranker_ac_hy_10_isolated_reimport"
+    spec = importlib.util.spec_from_file_location(private_name, _real_ranker_mod.__file__)
+    fresh_module = importlib.util.module_from_spec(spec)
+
+    with _patch.dict(_sys.modules, {"numpy": None, "torch": None, private_name: fresh_module}):
+        spec.loader.exec_module(fresh_module)  # the "fresh import" under numpy/torch-hidden.
+        result = fresh_module.rank_results(blocks, parsed, query_vector=vector)
+
+    assert result.rows, "AC-HY-10: expected at least one row from the semantic block."
+    assert result.rows[0].similarity == pytest.approx(1.0), (
+        f"AC-HY-10: identical vectors must give cosine similarity 1.0 from "
+        f"a fresh, isolated ranker import with numpy/torch hidden. "
+        f"Got: {result.rows[0].similarity!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-HY-11: result_limit truncates AFTER the cosine re-rank.
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_11_result_limit_truncates_after_cosine_rerank() -> None:
+    """AC-HY-11: Given a semantic block with 5 parts carrying DISTINCT,
+    strictly-decreasing cosine similarities to query_vector, and
+    result_limit=3.
+    When rank_results(blocks, parsed, query_vector=query_vector,
+    result_limit=3) is called.
+    Then exactly 3 rows are returned — the TOP 3 by cosine (truncation
+    happens AFTER the cosine re-rank, so the highest-similarity rows
+    survive, not an arbitrary/insertion-order-based subset).
+    """
+    query_vector = [1.0] + [0.0] * 383
+
+    def _emb(scale: float) -> list[float]:
+        # Shared direction with the query plus a per-row-unique off-axis
+        # component -> cosine = 1/sqrt(1+scale**2), strictly decreasing as
+        # scale increases.
+        return [1.0, scale] + [0.0] * 382
+
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "semantic": [
+            _sem_part("0xL0", "R0", _emb(0.0)),
+            _sem_part("0xL1", "R1", _emb(1.0)),
+            _sem_part("0xL2", "R2", _emb(2.0)),
+            _sem_part("0xL3", "R3", _emb(3.0)),
+            _sem_part("0xL4", "R4", _emb(4.0)),
+        ],
+    }
+
+    result = rank_results(blocks, parsed, query_vector=query_vector, result_limit=3)
+
+    mpn_norms = [row.mpn_norm for row in result.rows]
+    assert len(result.rows) == 3, (
+        f"AC-HY-11: result_limit=3 must truncate to exactly 3 rows. "
+        f"Got {len(result.rows)}: {mpn_norms}"
+    )
+    assert mpn_norms == ["R0", "R1", "R2"], (
+        f"AC-HY-11: truncation must keep the TOP 3 rows BY COSINE (highest "
+        f"similarity survives), not an arbitrary subset. Got: {mpn_norms}"
+    )
+
+
+def test_ac_hy_11_result_limit_caps_at_max_result_limit_200_even_when_larger() -> None:
+    """AC-HY-11: Given 250 semantic rows with distinct cosine values and
+    result_limit=99999 (far above MAX_RESULT_LIMIT=200).
+    When rank_results(blocks, parsed, query_vector=query_vector,
+    result_limit=99999) is called.
+    Then AT MOST 200 rows are returned — result_limit itself is clamped to
+    MAX_RESULT_LIMIT (the RESULT bound is never bypassed by an oversized
+    result_limit).
+    """
+    from partgraph.query.dql_builder import MAX_RESULT_LIMIT
+
+    query_vector = [1.0] + [0.0] * 383
+    row_count = MAX_RESULT_LIMIT + 50
+
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "semantic": [
+            _sem_part(f"0xM{idx:04d}", f"R{idx:04d}", [1.0, float(idx)] + [0.0] * 382)
+            for idx in range(row_count)
+        ]
+    }
+
+    result = rank_results(blocks, parsed, query_vector=query_vector, result_limit=99999)
+
+    assert len(result.rows) <= MAX_RESULT_LIMIT, (
+        f"AC-HY-11: result_limit=99999 must still be capped at "
+        f"MAX_RESULT_LIMIT={MAX_RESULT_LIMIT}. Got {len(result.rows)} rows."
+    )
+
+
+def test_ac_hy_11_edge_fewer_survivors_than_result_limit_shows_all() -> None:
+    """AC-HY-11 edge case: Given only 2 semantic rows and result_limit=50
+    (far more than the available rows).
+    When rank_results(blocks, parsed, query_vector=query_vector,
+    result_limit=50) is called.
+    Then BOTH rows are returned — result_limit never pads or errors when
+    there are fewer survivors than the requested limit.
+    """
+    query_vector = [1.0] + [0.0] * 383
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "semantic": [
+            _sem_part("0xF1", "ONLY1", [1.0] + [0.0] * 383),
+            _sem_part("0xF2", "ONLY2", [0.0, 1.0] + [0.0] * 382),
+        ],
+    }
+
+    result = rank_results(blocks, parsed, query_vector=query_vector, result_limit=50)
+
+    assert len(result.rows) == 2, (
+        f"AC-HY-11: fewer survivors than result_limit must show ALL of "
+        f"them (no padding/error). Got {len(result.rows)} rows."
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-HY-12: sort="stock"/"price" re-sorts the cosine-chosen survivors (never
+# changes WHICH rows survive); query_vector=None is a byte-identical
+# regression guard for the lexical path.
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_12_sort_stock_re_sorts_cosine_survivors_not_the_full_pool() -> None:
+    """AC-HY-12: Given 4 semantic rows: two are HIGH-cosine (survive a
+    result_limit=2 truncation) with LOW stock, and two are LOW-cosine
+    (truncated away) with HIGH stock.
+    When rank_results(blocks, parsed, sort="stock", query_vector=query_vector,
+    result_limit=2) is called.
+    Then:
+    - Exactly 2 rows are returned — the two HIGH-cosine rows (the SURVIVOR
+      SET is chosen by cosine rank, never by stock — a highly-stocked but
+      semantically-irrelevant part must NOT displace a more relevant one).
+    - Among those 2 survivors, the DISPLAY order is stock DESCENDING (the
+      requested sort="stock" re-orders the survivors; it does not change
+      WHICH rows survived).
+    """
+    query_vector = [1.0] + [0.0] * 383
+
+    def _stocked(uid: str, mpn_norm: str, *, scale: float, stock: int) -> dict:
+        return _sem_part(uid, mpn_norm, [1.0, scale] + [0.0] * 382, stock=stock)
+
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "semantic": [
+            _stocked("0xS1", "HIGH-LOWSTOCK-A", scale=0.0, stock=1),    # cosine 1.0, survives
+            _stocked("0xS2", "HIGH-LOWSTOCK-B", scale=0.1, stock=2),    # cosine ~0.995, survives
+            _stocked("0xS3", "LOW-HIGHSTOCK-A", scale=9.0, stock=500),  # cosine ~0.11, truncated
+            _stocked("0xS4", "LOW-HIGHSTOCK-B", scale=9.5, stock=999),  # cosine ~0.10, truncated
+        ],
+    }
+
+    result = rank_results(
+        blocks, parsed, sort="stock", query_vector=query_vector, result_limit=2
+    )
+
+    mpn_norms = [row.mpn_norm for row in result.rows]
+    assert len(result.rows) == 2, (
+        f"AC-HY-12: result_limit=2 must keep exactly 2 survivors. Got: {mpn_norms}"
+    )
+    assert set(mpn_norms) == {"HIGH-LOWSTOCK-A", "HIGH-LOWSTOCK-B"}, (
+        f"AC-HY-12: the SURVIVOR SET must be chosen by cosine rank (the two "
+        f"HIGH-cosine rows), regardless of the far-higher stock on the "
+        f"truncated-away rows. Got: {mpn_norms}"
+    )
+    # Among the 2 survivors: stock DESC -> B (stock=2) before A (stock=1).
+    assert mpn_norms == ["HIGH-LOWSTOCK-B", "HIGH-LOWSTOCK-A"], (
+        f"AC-HY-12: sort='stock' must re-order the SURVIVORS by stock DESC "
+        f"(B has stock=2, A has stock=1). Got: {mpn_norms}"
+    )
+
+
+def test_ac_hy_12_query_vector_none_is_byte_identical_regression() -> None:
+    """AC-HY-12 (regression): Given the EXACT AC-SF-19 golden fixture (tier +
+    stock boost + is_basic boost + mpn_norm/uid tie-break).
+    When rank_results is called WITHOUT query_vector (its default, None) —
+    both with query_vector/result_limit entirely omitted, and with both
+    explicitly passed as None.
+    Then the row order is IDENTICAL to today's pinned
+    (-tier, stock>0, is_basic, mpn_norm, uid) order — query_vector=None (the
+    lexical path's default) must never change existing behaviour, and every
+    row's similarity is None.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+    blocks = {
+        "exact": [
+            _part("0xF4", "ZZZ", stock=0, is_basic=False),
+            _part("0xF3", "MMM", stock=0, is_basic=True),
+            _part("0xF2", "AAA", stock=5, is_basic=False),
+        ],
+        "trig": [
+            _part("0xF1", "AAA", stock=100, is_basic=True),
+        ],
+    }
+
+    baseline = rank_results(blocks, parsed)
+    explicit_none = rank_results(blocks, parsed, query_vector=None, result_limit=None)
+
+    baseline_uids = [row.uid for row in baseline.rows]
+    explicit_uids = [row.uid for row in explicit_none.rows]
+
+    assert explicit_uids == baseline_uids == ["0xF2", "0xF3", "0xF4", "0xF1"], (
+        f"AC-HY-12: query_vector=None/result_limit=None must be byte-"
+        f"identical to today's no-kwarg behaviour. "
+        f"baseline={baseline_uids} explicit={explicit_uids}"
+    )
+    assert all(row.similarity is None for row in explicit_none.rows), (
+        "AC-HY-12: without query_vector, every row.similarity must be None."
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-HY edge cases: zero-norm query_vector, zero-norm stored embedding,
+# missing raw embedding, and a genuine cosine tie broken by uid.
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_edge_zero_norm_query_vector_gives_cosine_zero_no_crash() -> None:
+    """AC-HY edge case: Given a ZERO-NORM query_vector (all zeros).
+    When rank_results(blocks, parsed, query_vector=zero_vector) is called on
+    a semantic row with a normal, non-zero embedding.
+    Then no ZeroDivisionError is raised; row.similarity == 0.0 and the row
+    is still returned.
+    """
+    zero_vector = [0.0] * _EMBED_DIM
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {"semantic": [_sem_part("0xZ1", "NORMALEMB", [1.0] + [0.0] * 383)]}
+
+    result = rank_results(blocks, parsed, query_vector=zero_vector)
+
+    assert result.rows, "Expected the row to still be present."
+    assert result.rows[0].similarity == 0.0, (
+        f"AC-HY edge: a zero-norm query_vector must give cosine=0.0 (never "
+        f"raise ZeroDivisionError). Got: {result.rows[0].similarity!r}"
+    )
+
+
+def test_ac_hy_edge_zero_norm_embedding_gives_cosine_zero_sorts_last() -> None:
+    """AC-HY edge case: Given a semantic block with one NORMAL-embedding row
+    and one ZERO-VECTOR-embedding row (embedding=[0.0]*384 — a degenerate,
+    all-zero stored embedding).
+    When rank_results(blocks, parsed, query_vector=query_vector) is called.
+    Then no ZeroDivisionError is raised; the zero-embedding row's similarity
+    is 0.0 and it sorts AFTER the normal (positive-cosine) row.
+    """
+    query_vector = [1.0] + [0.0] * 383
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "semantic": [
+            _sem_part("0xZ2", "ZEROEMB", [0.0] * _EMBED_DIM),
+            _sem_part("0xZ3", "NORMALEMB", [1.0] + [0.0] * 383),
+        ],
+    }
+
+    result = rank_results(blocks, parsed, query_vector=query_vector)
+
+    mpn_norms = [row.mpn_norm for row in result.rows]
+    assert mpn_norms == ["NORMALEMB", "ZEROEMB"], (
+        f"AC-HY edge: a zero-norm stored embedding must sort LAST (cosine "
+        f"0.0), behind the normal positive-cosine row. Got: {mpn_norms}"
+    )
+    zero_row = next(row for row in result.rows if row.mpn_norm == "ZEROEMB")
+    assert zero_row.similarity == 0.0, (
+        f"AC-HY edge: zero-norm embedding must give similarity=0.0 (never "
+        f"raise). Got: {zero_row.similarity!r}"
+    )
+
+
+def test_ac_hy_edge_missing_raw_embedding_similarity_none_sorts_last() -> None:
+    """AC-HY edge case: Given a semantic-tier raw part dict with NO
+    'embedding' key at all (e.g. a defensive/malformed response).
+    When rank_results(blocks, parsed, query_vector=query_vector) is called
+    alongside a normal row that DOES carry an embedding.
+    Then the row missing 'embedding':
+    - has row.similarity is None (never 0.0 — 0.0 is reserved for a
+      genuine, computed zero-norm cosine; None means "could not compute at
+      all").
+    - sorts LAST, after the row with a real (positive) cosine.
+    """
+    query_vector = [1.0] + [0.0] * 383
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "semantic": [
+            {"uid": "0xN1", "mpn_norm": "NOEMBED"},  # no 'embedding' key.
+            _sem_part("0xN2", "HASEMBED", [1.0] + [0.0] * 383),
+        ],
+    }
+
+    result = rank_results(blocks, parsed, query_vector=query_vector)
+
+    mpn_norms = [row.mpn_norm for row in result.rows]
+    assert mpn_norms == ["HASEMBED", "NOEMBED"], (
+        f"AC-HY edge: a row with NO raw 'embedding' must sort LAST. "
+        f"Got: {mpn_norms}"
+    )
+    missing_row = next(row for row in result.rows if row.mpn_norm == "NOEMBED")
+    assert missing_row.similarity is None, (
+        f"AC-HY edge: missing raw embedding must give similarity=None (not "
+        f"0.0 — 0.0 is reserved for a genuinely-computed zero-norm cosine). "
+        f"Got: {missing_row.similarity!r}"
+    )
+
+
+def test_ac_hy_edge_cosine_tie_breaks_by_mpn_norm_then_uid() -> None:
+    """AC-HY edge case: Given two semantic rows with IDENTICAL cosine
+    similarity (embeddings pointing in the same direction) and IDENTICAL
+    mpn_norm, differing only by uid.
+    When rank_results(blocks, parsed, query_vector=query_vector) is called.
+    Then the row with the lexicographically SMALLER uid sorts first
+    (deterministic secondary/tertiary tie-break: mpn_norm then uid).
+    """
+    query_vector = [1.0] + [0.0] * 383
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "semantic": [
+            _sem_part("0xTB2", "SAMEDIR", [1.0] + [0.0] * 383),
+            _sem_part("0xTB1", "SAMEDIR", [2.0] + [0.0] * 383),
+        ],
+    }
+
+    result = rank_results(blocks, parsed, query_vector=query_vector)
+    uids = [row.uid for row in result.rows]
+
+    assert uids == ["0xTB1", "0xTB2"], (
+        f"AC-HY edge: equal cosine + equal mpn_norm must tie-break by uid "
+        f"ascending. Got: {uids}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Drift-guard (architecture; Gate-3 MUST-fix): the ranker's PRIVATE result
+# ceiling is a deliberate DUPLICATE of dql_builder.MAX_RESULT_LIMIT — NOT an
+# import of it, to avoid a sibling module-import cycle (ADR-0020). This guard
+# keeps the two in lockstep so the duplicate can never silently drift from the
+# canonical source of truth.
+# ---------------------------------------------------------------------------
+
+def test_drift_guard_ranker_result_ceiling_equals_dql_builder_max_result_limit() -> None:
+    """Drift-guard (ADR-0020): Given the ranker's private ``_MAX_RESULT_ROWS``
+    and ``dql_builder.MAX_RESULT_LIMIT``.
+    When both are read.
+    Then they are EQUAL — the ranker duplicates (never imports) the RESULT
+    bound to avoid a sibling import cycle, and this guard fails loudly if the
+    duplicate ever drifts from the canonical dql_builder value.
+    """
+    from partgraph.query.dql_builder import MAX_RESULT_LIMIT
+    from partgraph.query.ranker import _MAX_RESULT_ROWS
+
+    assert _MAX_RESULT_ROWS == MAX_RESULT_LIMIT, (
+        f"Drift-guard: ranker._MAX_RESULT_ROWS ({_MAX_RESULT_ROWS}) must equal "
+        f"dql_builder.MAX_RESULT_LIMIT ({MAX_RESULT_LIMIT}) — the ranker "
+        f"duplicates (not imports) the RESULT bound (ADR-0020); the two must be "
+        f"updated together."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Security F3 (Gate-3 MUST-fix): result_limit=0 / negative must yield a clean
+# empty result, never a negative-index slice artifact (e.g. rows[:-5] silently
+# returning the first N-5 rows instead of []).
+# ---------------------------------------------------------------------------
+
+def test_security_f3_result_limit_zero_and_negative_give_clean_empty_never_negative_slice() -> None:
+    """Security F3: Given 4 semantic rows with distinct cosine similarities and
+    a query_vector.
+    When rank_results is called with result_limit=0 and again with
+    result_limit=-5.
+    Then BOTH return an empty list — the clamp is
+    ``max(0, min(result_limit, _MAX_RESULT_ROWS))``, so a zero/negative --limit
+    can never become a negative Python slice (``rows[:-5]`` would wrongly return
+    the first N-5 rows instead of []).
+    """
+    query_vector = [1.0] + [0.0] * 383
+    parsed = _make_parsed(text_tokens=["rs232"])
+    blocks = {
+        "semantic": [
+            _sem_part("0xF30", "R0", [1.0, 0.0] + [0.0] * 382),
+            _sem_part("0xF31", "R1", [1.0, 1.0] + [0.0] * 382),
+            _sem_part("0xF32", "R2", [1.0, 2.0] + [0.0] * 382),
+            _sem_part("0xF33", "R3", [1.0, 3.0] + [0.0] * 382),
+        ],
+    }
+
+    zero = rank_results(blocks, parsed, query_vector=query_vector, result_limit=0)
+    assert zero.rows == [], (
+        f"Security F3: result_limit=0 must give an empty result, never a "
+        f"negative-slice artifact. Got {len(zero.rows)} rows: "
+        f"{[r.mpn_norm for r in zero.rows]}"
+    )
+
+    negative = rank_results(blocks, parsed, query_vector=query_vector, result_limit=-5)
+    assert negative.rows == [], (
+        f"Security F3: result_limit=-5 must clamp to 0 (empty), never slice "
+        f"rows[:-5] (which would wrongly return the first N-5 rows). Got "
+        f"{len(negative.rows)} rows: {[r.mpn_norm for r in negative.rows]}"
+    )

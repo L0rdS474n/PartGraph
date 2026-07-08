@@ -1355,14 +1355,30 @@ def test_ac_ce_1_semantic_search_exit_0_and_semantic_label() -> None:
 # ---------------------------------------------------------------------------
 
 def test_ac_ce_2_empty_semantic_block_exit_0_embed_hint() -> None:
-    """AC-CE-2: Given mocked encoder and mocked client returning empty semantic block.
+    """AC-CE-2 (REWRITTEN — hybrid semantic search PR, AC-HY-13/14: the
+    empty-semantic-result path now issues a has(embedding) PROBE before
+    deciding which hint to print): Given mocked encoder and mocked client
+    where BOTH the semantic search query AND the follow-up has(embedding)
+    probe return EMPTY.
     When `partgraph search --semantic "rs232 transceiver"` is invoked.
     Then:
     - Exit code is 0 (no results is not an error).
-    - Output contains "partgraph embed" hint (guides user to run embed first).
+    - Output contains "partgraph embed" hint (guides user to run embed
+      first) — the genuine-empty-index case (the probe finds nothing
+      either).
+
+    CHANGED FROM PRE-HYBRID (documented, not silent): the pre-hybrid CLI
+    printed the embed hint unconditionally on any empty semantic result. The
+    hybrid CLI now probes `{ probe(func: has(embedding), first: 1) { uid } }`
+    first; only an EMPTY probe (0 rows — genuinely no embeddings at all)
+    still prints this hint. The mock client's second canned response
+    ({"probe": []}) supplies that empty probe result so this still-valid
+    scenario keeps passing; AC-HY-13 covers the NEW populated-probe
+    ("starvation", not "run embed") branch.
     """
     empty_resp = {"exact": [], "trig": [], "fts": [], "semantic": []}
-    mock_txn = _make_mock_txn([empty_resp])
+    empty_probe_resp = {"probe": []}
+    mock_txn = _make_mock_txn([empty_resp, empty_probe_resp])
     mock_client = _make_mock_client(mock_txn)
 
     with _patch_dgraph(mock_client), _patch_get_encoder():
@@ -3198,11 +3214,20 @@ def test_ac_sf_24_json_flag_no_truncate_is_a_no_op() -> None:
 # ---------------------------------------------------------------------------
 
 def test_ac_sf_25_json_row_has_exact_key_set() -> None:
-    """AC-SF-25: Given one richly-populated result row.
+    """AC-SF-25 (UPDATED — hybrid semantic search PR, AC-HY-9: 12-key set incl.
+    the additive 'similarity'): Given one richly-populated result row from a
+    LEXICAL search.
     When `partgraph search MAX232 --json` is invoked.
-    Then each row in results has EXACTLY the keys: mpn, mpn_norm,
+    Then each row in results has EXACTLY the 12 keys: mpn, mpn_norm,
     manufacturer, package, category, stock, is_basic, price_usd, match_type,
-    datasheets, params (no more, no less — in particular no 'uid').
+    similarity, datasheets, params (no more, no less — in particular no 'uid').
+
+    CHANGED FROM PRE-HYBRID (documented, not silent): the pre-hybrid version
+    pinned an 11-key set. The hybrid PR adds a 12th key, 'similarity' (JSON
+    null on a non-semantic/lexical row — present-but-null per AC-HY-9's
+    same-key-set-for-every-row contract; the envelope version stays 1 as it is
+    an additive key). Mirrors the rewritten renderer-level AC-SF-25 in
+    tests/unit/test_renderer.py.
     """
     mock_txn = _make_mock_txn([_make_json_search_response()])
     mock_client = _make_mock_client(mock_txn)
@@ -3218,11 +3243,16 @@ def test_ac_sf_25_json_row_has_exact_key_set() -> None:
     row = envelope["results"][0]
     expected_keys = {
         "mpn", "mpn_norm", "manufacturer", "package", "category", "stock",
-        "is_basic", "price_usd", "match_type", "datasheets", "params",
+        "is_basic", "price_usd", "match_type", "similarity", "datasheets", "params",
     }
     assert set(row) == expected_keys, (
-        f"AC-SF-25: row must have exactly these keys: {sorted(expected_keys)}. "
-        f"Got: {sorted(row)}"
+        f"AC-SF-25/AC-HY-9: row must have exactly these 12 keys: "
+        f"{sorted(expected_keys)}. Got: {sorted(row)}"
+    )
+    # A lexical (non-semantic) row's similarity is JSON null (present-but-null).
+    assert row["similarity"] is None, (
+        f"AC-HY-9: a lexical row's 'similarity' must be JSON null. "
+        f"Got: {row['similarity']!r}"
     )
 
 
@@ -3814,4 +3844,452 @@ def test_gate3_human_table_never_shows_price_value_option_b() -> None:
     assert "1.2345" not in result.output and "1.23" not in result.output, (
         f"Gate3/ADR-0016 Option B: the human table must NOT show a price "
         f"value. Got:\n{result.output}"
+    )
+
+
+# ===========================================================================
+# AC-HY: hybrid semantic search robustness (Gate-1 ratified contract)
+#
+# cli.py's --semantic path (_run_semantic_search):
+#   - computes candidate_k = min(max(limit * 20, 200), 1500) and passes it
+#     (not the raw --limit) as build_semantic_dql's k argument (AC-HY-1);
+#   - threads query_vector= and result_limit= into rank_results (see
+#     tests/unit/test_ranker.py AC-HY-6..12);
+#   - on an EMPTY human-path result, issues ONE probe
+#     `{ probe(func: has(embedding), first: 1) { uid } }` on the same
+#     client: probe>=1 rows -> a "starvation" message (loosen filters/raise
+#     --limit; NEVER "partgraph embed" — AC-HY-13); probe==0 rows -> the
+#     existing embed-run hint (AC-HY-14, and the AC-CE-2 rewrite above);
+#     the probe raising falls back to the embed-run hint (AC-HY-14);
+#   - a NON-EMPTY result NEVER issues the probe (AC-HY-15); --json NEVER
+#     issues the probe and NEVER prints either hint, even when empty
+#     (AC-HY-15, preserving AC-SF-27's empty-envelope contract);
+#   - --help documents that --sort's relevance == cosine similarity for a
+#     semantic search, and that --limit is internally oversampled and still
+#     capped at 200 results (AC-HY-17).
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# AC-HY-1: candidate_k = min(max(limit * 20, 200), 1500), not the raw limit.
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_1_semantic_candidate_k_is_oversampled_from_limit() -> None:
+    """AC-HY-1: Given --semantic and several --limit values (5, 20, 50, 200,
+    99999), with the actual Dgraph query captured.
+    When `partgraph search --semantic "rs232 transceiver" --limit L` is
+    invoked for each L.
+    Then the k argument baked into similar_to(embedding, k, ...) is the
+    OVERSAMPLED candidate_k = min(max(L * 20, 200), 1500), NOT the raw
+    --limit value:
+      L=5     -> k=200    (floor)
+      L=20    -> k=400
+      L=50    -> k=1000
+      L=200   -> k=1500   (cap)
+      L=99999 -> k=1500   (cap)
+    """
+    cases = {5: 200, 20: 400, 50: 1000, 200: 1500, 99999: 1500}
+    for limit_value, expected_k in cases.items():
+        mock_txn, captured = _make_capturing_txn(_make_semantic_response_with_max232())
+        mock_client = _make_mock_client(mock_txn)
+
+        with _patch_dgraph(mock_client), _patch_get_encoder():
+            result = _invoke(
+                ["search", "--semantic", "rs232 transceiver", "--limit", str(limit_value)]
+            )
+
+        assert result.exit_code == 0, (
+            f"AC-HY-1: semantic search with --limit {limit_value} must exit "
+            f"0. Got {result.exit_code}.\n{result.output}"
+        )
+        assert captured, f"AC-HY-1: expected a Dgraph query for --limit {limit_value}."
+        dql, _variables = captured[0]
+        k_matches = re.findall(r"similar_to\([^,]+,\s*(\d+)", dql)
+        assert k_matches, f"AC-HY-1: expected similar_to(embedding, k, ...) in DQL:\n{dql}"
+        assert int(k_matches[0]) == expected_k, (
+            f"AC-HY-1: --limit {limit_value} must oversample to candidate_k="
+            f"{expected_k} (min(max(limit*20,200),1500)). "
+            f"Got k={k_matches[0]} in DQL:\n{dql}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC-HY-13: probe finds >=1 embedded part -> starvation message, NEVER
+# "partgraph embed".
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_13_probe_finds_embeddings_prints_starvation_message_not_embed_hint() -> None:
+    """AC-HY-13: Given mocked encoder and mocked client where the semantic
+    search itself returns ZERO rows, but the follow-up has(embedding) probe
+    DOES find at least one embedded part (the index is populated; the empty
+    result is caused by an over-narrow filter/limit combination, not a
+    missing embed run).
+    When `partgraph search --semantic "rs232 transceiver" --category
+    "NoSuchCategory"` is invoked (human/non-JSON path).
+    Then:
+    - Exit code is 0.
+    - Output advises loosening filters AND raising --limit (a "starvation"
+      message, distinct from the embed-run hint).
+    - Output NEVER contains the substring "partgraph embed" anywhere.
+    """
+    empty_resp = {"exact": [], "trig": [], "fts": [], "semantic": []}
+    probe_found = {"probe": [{"uid": "0xPROBE1"}]}
+    mock_txn = _make_mock_txn([empty_resp, probe_found])
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(
+            ["search", "--semantic", "rs232 transceiver", "--category", "NoSuchCategory"]
+        )
+
+    assert result.exit_code == 0, (
+        f"AC-HY-13: empty semantic result with a populated index must "
+        f"still exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert "partgraph embed" not in result.output, (
+        f"AC-HY-13: a populated embedding index (probe found >=1) must "
+        f"NEVER advise re-running 'partgraph embed'. Got:\n{result.output}"
+    )
+    lowered = result.output.lower()
+    assert "loosen" in lowered and "filter" in lowered, (
+        f"AC-HY-13: expected the starvation message to advise loosening "
+        f"filters. Got:\n{result.output}"
+    )
+    assert "limit" in lowered, (
+        f"AC-HY-13: expected the starvation message to mention raising "
+        f"--limit. Got:\n{result.output}"
+    )
+    # Security F5 (Gate-3 MUST-fix): the starvation hint is PATH-FREE — no
+    # filesystem path (e.g. a leaked internal "/home/..." path) may ever appear.
+    assert "/home/" not in result.output, (
+        f"Security F5: the starvation hint must be path-free (no '/home/' "
+        f"leak). Got:\n{result.output!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-HY-14: probe DQL shape (has(embedding), first: 1); probe raising falls
+# back to the embed hint.
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_14_probe_dql_has_embedding_first_1_when_result_empty() -> None:
+    """AC-HY-14: Given an empty semantic search result (triggering the
+    probe) and a spy capturing every DQL sent to Dgraph.
+    When `partgraph search --semantic "rs232 transceiver"` is invoked.
+    Then a SECOND query is sent whose DQL text contains 'has(embedding)' and
+    'first: 1' (the probe's exact contract:
+    `{ probe(func: has(embedding), first: 1) { uid } }`).
+    """
+    captured: list[tuple[str, dict]] = []
+    responses = [
+        {"exact": [], "trig": [], "fts": [], "semantic": []},
+        {"probe": []},
+    ]
+
+    def _spy_query(dql: str, variables: dict | None = None, *args, **kwargs):
+        captured.append((dql, variables or {}))
+        idx = min(len(captured) - 1, len(responses) - 1)
+        resp = MagicMock()
+        resp.json = json.dumps(responses[idx]).encode()
+        return resp
+
+    mock_txn = MagicMock()
+    mock_txn.query.side_effect = _spy_query
+    mock_txn.discard.return_value = None
+    mock_txn.__enter__ = MagicMock(return_value=mock_txn)
+    mock_txn.__exit__ = MagicMock(return_value=False)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232 transceiver"])
+
+    assert result.exit_code == 0, (
+        f"AC-HY-14: must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert len(captured) == 2, (
+        f"AC-HY-14: expected exactly 2 Dgraph queries (search + probe) for "
+        f"an empty result. Got {len(captured)}: {[c[0] for c in captured]}"
+    )
+    probe_dql, _probe_vars = captured[1]
+    assert "has(embedding)" in probe_dql, (
+        f"AC-HY-14: probe DQL must use has(embedding). Got:\n{probe_dql}"
+    )
+    assert re.search(r"first\s*:\s*1\b", probe_dql), (
+        f"AC-HY-14: probe DQL must request first: 1. Got:\n{probe_dql}"
+    )
+
+
+def test_ac_hy_14_probe_raises_exception_falls_back_to_embed_hint() -> None:
+    """AC-HY-14: Given an empty semantic search result, where the FOLLOW-UP
+    probe query itself raises (e.g. a transient Dgraph error on the second
+    round-trip).
+    When `partgraph search --semantic "rs232 transceiver"` is invoked.
+    Then the CLI falls back to the embed-run hint (never crashes, never
+    leaks the raw exception) and still exits 0.
+    """
+    call_counter = [0]
+
+    def _flaky_query(dql: str, variables: dict | None = None, *args, **kwargs):
+        call_counter[0] += 1
+        if call_counter[0] == 1:
+            resp = MagicMock()
+            resp.json = json.dumps(
+                {"exact": [], "trig": [], "fts": [], "semantic": []}
+            ).encode()
+            return resp
+        raise RuntimeError("transient probe failure")
+
+    mock_txn = MagicMock()
+    mock_txn.query.side_effect = _flaky_query
+    mock_txn.discard.return_value = None
+    mock_txn.__enter__ = MagicMock(return_value=mock_txn)
+    mock_txn.__exit__ = MagicMock(return_value=False)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232 transceiver"])
+
+    assert result.exit_code == 0, (
+        f"AC-HY-14: a probe failure must still exit 0 (fallback to the "
+        f"embed hint, never crash). Got {result.exit_code}.\n{result.output}"
+    )
+    assert "embed" in result.output.lower(), (
+        f"AC-HY-14: probe failure must fall back to the embed-run hint. "
+        f"Got:\n{result.output}"
+    )
+    assert "transient probe failure" not in result.output, (
+        f"AC-HY-14: the raw probe exception must never leak. "
+        f"Got:\n{result.output!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-HY-15: a non-empty result never issues the probe; --json never issues
+# the probe and never prints either hint, even when empty.
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_15_non_empty_semantic_result_never_issues_probe() -> None:
+    """AC-HY-15: Given a semantic search that returns a NON-EMPTY result.
+    When `partgraph search --semantic "rs232 transceiver"` is invoked.
+    Then exactly ONE Dgraph query is sent (the search itself) — the
+    has(embedding) probe must NEVER be issued when there is already at
+    least one row to show.
+    """
+    mock_txn, captured = _make_capturing_txn(_make_semantic_response_with_max232())
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232 transceiver"])
+
+    assert result.exit_code == 0, (
+        f"AC-HY-15: must exit 0. Got {result.exit_code}.\n{result.output}"
+    )
+    assert len(captured) == 1, (
+        f"AC-HY-15: a non-empty semantic result must issue EXACTLY ONE "
+        f"Dgraph query (no probe). Got {len(captured)}: {[c[0] for c in captured]}"
+    )
+    assert "probe(" not in captured[0][0], (
+        f"AC-HY-15: the single query sent must not itself be the probe. "
+        f"Got:\n{captured[0][0]}"
+    )
+
+
+def test_ac_hy_15_json_empty_semantic_result_no_probe_no_hint_preserves_ac_sf_27() -> None:
+    """AC-HY-15: Given an empty semantic result under --json.
+    When `partgraph search --semantic "rs232 transceiver" --json` is
+    invoked.
+    Then:
+    - Exactly ONE Dgraph query is sent (the search itself) — the probe must
+      NEVER be issued under --json, regardless of emptiness (AC-SF-27's
+      contract: --json never prints the human embed hint, and now also
+      never pays the extra probe round-trip).
+    - stdout is still the empty envelope (count 0, results []), exit 0.
+    - No embed-hint / starvation text appears anywhere in stdout.
+    """
+    mock_txn, captured = _make_capturing_txn(
+        {"exact": [], "trig": [], "fts": [], "semantic": []}
+    )
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232 transceiver", "--json"])
+
+    assert result.exit_code == 0, (
+        f"AC-HY-15: empty --semantic --json must exit 0. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    assert len(captured) == 1, (
+        f"AC-HY-15: --json must NEVER issue the has(embedding) probe (no "
+        f"probe round-trip under the machine-readable path). "
+        f"Got {len(captured)} queries: {[c[0] for c in captured]}"
+    )
+    envelope = json.loads(result.output)
+    assert envelope["count"] == 0 and envelope["results"] == [], (
+        f"AC-HY-15: empty semantic --json must give an empty envelope. "
+        f"Got: {envelope}"
+    )
+    assert "embed" not in result.output.lower(), (
+        f"AC-HY-15: no embed-run hint may appear under --json. "
+        f"Got:\n{result.output}"
+    )
+    assert "loosen" not in result.output.lower(), (
+        f"AC-HY-15: no starvation message may appear under --json either. "
+        f"Got:\n{result.output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-HY-17: help text — --sort notes semantic relevance=cosine; --limit
+# notes internal oversampling, capped at 200.
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_17_help_sort_mentions_semantic_relevance_is_cosine() -> None:
+    """AC-HY-17: Given `partgraph search --help`.
+    When invoked.
+    Then the help text notes that, for a semantic search, 'relevance'
+    ordering is by cosine (embedding) similarity.
+    """
+    result = _invoke(["search", "--help"])
+    assert "--sort" in result.output
+    lowered = result.output.lower()
+    assert "cosine" in lowered, (
+        f"AC-HY-17: search --help must mention 'cosine' (semantic relevance "
+        f"= cosine similarity). Got:\n{result.output}"
+    )
+
+
+def test_ac_hy_17_help_limit_mentions_oversampling_and_200_cap() -> None:
+    """AC-HY-17: Given `partgraph search --help`.
+    When invoked.
+    Then the help text for --limit notes the internal candidate
+    oversampling and that results stay capped at 200.
+    """
+    result = _invoke(["search", "--help"])
+    assert "--limit" in result.output
+    lowered = result.output.lower()
+    assert "oversampl" in lowered, (
+        f"AC-HY-17: search --help must mention internal oversampling for "
+        f"--limit. Got:\n{result.output}"
+    )
+    assert "200" in result.output, (
+        f"AC-HY-17: search --help must mention the 200 result cap. "
+        f"Got:\n{result.output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-HY-4 (architecture MUST-fix): a filterless --semantic --limit 5 where the
+# server-side has(datasheet) @filter prunes the candidate pool still returns
+# EXACTLY 5 datasheet-backed rows (top-5 by cosine), refilled from the
+# oversampled 200-candidate pool — never a silent underfill.
+# ---------------------------------------------------------------------------
+
+def test_ac_hy_4_filterless_semantic_limit_5_refills_to_exactly_5_datasheet_backed_rows() -> None:
+    """AC-HY-4: Given a filterless semantic search with --limit 5, where the
+    server-side has(datasheet) @filter prunes the candidate pool (only
+    datasheet-backed parts come back) but the CLI oversamples the pool
+    (candidate_k = 200 for --limit 5) so more than 5 datasheet-backed
+    candidates remain.
+    When `partgraph search --semantic "rs232 transceiver" --limit 5 --json` is
+    invoked (mocked encoder + mocked client returning 8 datasheet-backed
+    semantic rows with distinct, strictly-decreasing cosine similarities).
+    Then:
+    - The DQL asks Dgraph for the OVERSAMPLED candidate_k=200 (min(max(5*20,
+      200),1500)) — the mechanism that lets the top-5 refill from a pruned pool.
+    - EXACTLY 5 rows are returned (no silent underfill below --limit just
+      because has(datasheet) pruned some candidates).
+    - The 5 survivors are the TOP 5 by cosine (R0..R4), chosen AFTER the
+      client-side cosine re-rank + truncation.
+    """
+    query_vector = [1.0] + [0.0] * 383  # 384-dim, aligned with axis 0.
+
+    def _enc(texts):
+        return [query_vector for _ in texts]
+
+    # 8 datasheet-backed semantic rows; embedding [1.0, scale]+... gives
+    # cosine = 1/sqrt(1+scale**2), strictly decreasing as scale (idx) grows.
+    semantic_rows = [
+        {
+            "uid": f"0xR{idx}",
+            "mpn": f"R{idx}",
+            "mpn_norm": f"R{idx}",
+            "stock": 10,
+            "is_basic": False,
+            "made_by": [{"name": "Texas Instruments"}],
+            "in_package": [{"name": "SOIC-16"}],
+            "datasheet": [{"url": f"https://example.com/r{idx}.pdf"}],
+            "embedding": [1.0, float(idx)] + [0.0] * 382,
+        }
+        for idx in range(8)
+    ]
+    response = {"exact": [], "trig": [], "fts": [], "semantic": semantic_rows}
+    mock_txn, captured = _make_capturing_txn(response)
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), _patch_get_encoder(_enc):
+        result = _invoke(
+            ["search", "--semantic", "rs232 transceiver", "--limit", "5", "--json"]
+        )
+
+    assert result.exit_code == 0, (
+        f"AC-HY-4: filterless --semantic --limit 5 must exit 0. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured, "AC-HY-4: expected a semantic DQL query."
+    dql = captured[0][0]
+    k_matches = re.findall(r"similar_to\([^,]+,\s*(\d+)", dql)
+    assert k_matches and int(k_matches[0]) == 200, (
+        f"AC-HY-4: --limit 5 must oversample the candidate pool to k=200 (the "
+        f"refill source). Got k={k_matches[0] if k_matches else '<none>'} "
+        f"in:\n{dql}"
+    )
+    # Exactly one query (non-empty result -> no probe).
+    assert len(captured) == 1, (
+        f"AC-HY-4: a non-empty result must issue exactly one query (no probe). "
+        f"Got {len(captured)}."
+    )
+    envelope = json.loads(result.output)
+    assert envelope["count"] == 5 and len(envelope["results"]) == 5, (
+        f"AC-HY-4: exactly 5 datasheet-backed rows must survive (no silent "
+        f"underfill). Got count={envelope['count']}, "
+        f"{len(envelope['results'])} rows."
+    )
+    mpns = [row["mpn"] for row in envelope["results"]]
+    assert mpns == ["R0", "R1", "R2", "R3", "R4"], (
+        f"AC-HY-4: the 5 survivors must be the TOP 5 by cosine (R0..R4), "
+        f"refilled from the oversampled candidate pool. Got: {mpns}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Security F4 (Gate-3 MUST-fix): _build_dgraph_client is called exactly ONCE
+# across the search+probe round-trip — the probe reuses the search's client.
+# ---------------------------------------------------------------------------
+
+def test_security_f4_build_dgraph_client_called_exactly_once_across_search_and_probe() -> None:
+    """Security F4: Given an EMPTY human-path semantic result that triggers the
+    has(embedding) probe (the probe finds an embedded part).
+    When `partgraph search --semantic "rs232 transceiver"` is invoked.
+    Then _build_dgraph_client is called EXACTLY ONCE across the whole
+    search+probe round-trip — the probe REUSES the search's client and must
+    never open a second Dgraph connection.
+    """
+    import partgraph.cli as cli_mod
+
+    empty_resp = {"exact": [], "trig": [], "fts": [], "semantic": []}
+    probe_found = {"probe": [{"uid": "0xPROBE1"}]}
+    mock_txn = _make_mock_txn([empty_resp, probe_found])
+    mock_client = _make_mock_client(mock_txn)
+
+    build_spy = MagicMock(return_value=(mock_client, MagicMock()))
+    with patch.object(cli_mod, "_build_dgraph_client", build_spy), _patch_get_encoder():
+        result = _invoke(["search", "--semantic", "rs232 transceiver"])
+
+    assert result.exit_code == 0, (
+        f"Security F4: empty semantic + probe must exit 0. "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    assert build_spy.call_count == 1, (
+        f"Security F4: _build_dgraph_client must be called EXACTLY ONCE across "
+        f"the search+probe round-trip (the probe reuses the search client). "
+        f"Got {build_spy.call_count} call(s)."
     )

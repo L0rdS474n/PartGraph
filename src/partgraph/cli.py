@@ -715,12 +715,28 @@ _EMBED_EXTRA_HINT = (
     '(sentence-transformers). Install it with: pip install -e ".[embed]".'
 )
 
-#: Actionable hint when a semantic search returns nothing — usually because the
-#: embedding predicate has not been populated yet.
+#: Actionable hint when a semantic search returns nothing AND the embedding
+#: index is genuinely empty (the probe finds no embedded part) — the user must
+#: run ``partgraph embed`` first.
 _NO_EMBEDDINGS_HINT = (
     "No semantic matches. The embedding index may be empty — run "
     "`partgraph embed` first to generate embeddings."
 )
+
+#: Actionable hint when a semantic search returns nothing but the embedding index
+#: IS populated (the probe finds >=1 embedded part): the empty result is filter/
+#: limit starvation, NOT a missing embed run (ADR-0020). Single-line, path-free,
+#: and deliberately free of any "partgraph embed" advice (AC-HY-13).
+_FILTER_STARVATION_HINT = (
+    "No semantic matches with current filters. Try loosening --category, "
+    "--manufacturer, or raising --limit."
+)
+
+#: Read-only DQL that probes whether ANY part carries an embedding. Issued once,
+#: on the SAME client as an empty semantic search, to distinguish a starved
+#: filter/limit from a genuinely empty index (ADR-0020). ``first: 1`` keeps it a
+#: single-row existence check, never a scan.
+_EMBEDDING_PROBE_DQL = "{ probe(func: has(embedding), first: 1) { uid } }"
 
 #: Fixed, path-free error shown when the embed run fails (DB down / runtime
 #: error). The raw exception is never interpolated so no internal path leaks.
@@ -921,7 +937,11 @@ def search(  # noqa: PLR0913 — Typer command surface: one option per filter fl
     limit: int = typer.Option(
         20,
         "--limit",
-        help="Maximum number of results to show (capped server-side at 200).",
+        help=(
+            "Maximum number of results to show (capped at 200). For --semantic, "
+            "the candidate pool is internally oversampled before the top results "
+            "are selected, so results stay capped at 200 regardless of --limit."
+        ),
     ),
     no_truncate: bool = typer.Option(
         False,
@@ -1002,8 +1022,9 @@ def search(  # noqa: PLR0913 — Typer command surface: one option per filter fl
         help=(
             "Order results: 'relevance' (default — best match first: tier, then "
             "in-stock and basic parts), 'stock' (most in stock first) or 'price' "
-            "(cheapest first; parts with no price last). Ignored in nearest-match "
-            "mode, where parameter distance always wins."
+            "(cheapest first; parts with no price last). For a --semantic search, "
+            "'relevance' orders by cosine (embedding) similarity. Ignored in "
+            "nearest-match mode, where parameter distance always wins."
         ),
     ),
     json_output: bool = typer.Option(
@@ -1163,6 +1184,54 @@ def search(  # noqa: PLR0913 — Typer command surface: one option per filter fl
         render_search_results(result, parsed, _console, no_truncate=no_truncate)
 
 
+def _thread_package_into_parsed(parsed, package_flag: str | None):
+    """Return *parsed* with ``--package`` threaded into ``parsed.package``.
+
+    A no-op when *package_flag* is ``None``. Otherwise it rejects the same
+    package-given-twice collision as the lexical path (fixed, path-free message,
+    exit 1) BEFORE any client is built, then returns a :class:`ParsedQuery`
+    carrying the package (creating a bare parsed query when *parsed* is ``None``).
+    Extracted so :func:`_run_semantic_search` stays a readable, cohesive handler.
+    """
+    if package_flag is None:
+        return parsed
+    from partgraph.query.parser import ParsedQuery, parse_query  # noqa: PLC0415
+
+    if parsed is not None and parsed.package is not None:
+        _err_console.print(_PACKAGE_TWICE_ERROR)
+        raise typer.Exit(code=1)
+    base = parsed if parsed is not None else parse_query("")
+    return ParsedQuery(
+        quantities=base.quantities,
+        package=package_flag,
+        text_tokens=base.text_tokens,
+        raw_query=base.raw_query,
+    )
+
+
+def _probe_embedding_hint(client) -> str:
+    """Return the correct empty-result hint by probing the embedding index.
+
+    Issued ONCE, on the SAME *client* as the just-completed (empty) semantic
+    search — it never builds a second client (security F4) — and only on the
+    human (non-``--json``) empty path. Its OWN try/except keeps a probe failure
+    from ever reaching the primary query's :data:`_DB_QUERY_ERROR`/exit-1 handler
+    (security F2): any failure degrades to the embed-run hint and the command
+    still exits 0 (ADR-0020).
+
+    - probe finds >=1 embedded part -> the index is populated, so the empty
+      result is filter/limit starvation: :data:`_FILTER_STARVATION_HINT`.
+    - probe finds 0 -> genuinely no embeddings yet: :data:`_NO_EMBEDDINGS_HINT`.
+    - probe raises -> fall back to :data:`_NO_EMBEDDINGS_HINT`.
+    """
+    try:
+        probe_data = _run_block_query(client, _EMBEDDING_PROBE_DQL, {})
+        probe_rows = probe_data.get("probe", []) or []
+    except Exception:  # noqa: BLE001 — a probe failure degrades to the embed hint (F2).
+        return _NO_EMBEDDINGS_HINT
+    return _FILTER_STARVATION_HINT if probe_rows else _NO_EMBEDDINGS_HINT
+
+
 def _run_semantic_search(  # noqa: PLR0913 — keyword-only filter passthrough
     query: str,
     semantic_text: str,
@@ -1195,8 +1264,14 @@ def _run_semantic_search(  # noqa: PLR0913 — keyword-only filter passthrough
     - a DB failure exits 1 with the fixed "partgraph db up" message;
     - an empty result prints an actionable "run `partgraph embed` first" hint.
     """
-    from partgraph.query.dql_builder import build_semantic_dql  # noqa: PLC0415
-    from partgraph.query.parser import ParsedQuery, parse_query  # noqa: PLC0415
+    from partgraph.query.dql_builder import (  # noqa: PLC0415
+        MAX_RESULT_LIMIT,
+        SEMANTIC_CANDIDATE_CAP,
+        SEMANTIC_CANDIDATE_FLOOR,
+        SEMANTIC_OVERSAMPLE_FACTOR,
+        build_semantic_dql,
+    )
+    from partgraph.query.parser import parse_query  # noqa: PLC0415
     from partgraph.query.ranker import rank_results  # noqa: PLC0415
     from partgraph.query.renderer import render_search_results  # noqa: PLC0415
 
@@ -1218,30 +1293,28 @@ def _run_semantic_search(  # noqa: PLR0913 — keyword-only filter passthrough
     query_vector = list(vectors[0])
 
     # The positional query contributes parametric/package filters only — its free
-    # text is NOT embedded (the --semantic text drives the embedding).
+    # text is NOT embedded (the --semantic text drives the embedding). --package
+    # is then threaded into parsed.package (build_semantic_dql reads it there),
+    # rejecting the package-given-twice collision before the client is built.
     parsed = parse_query(query) if query.strip() else None
+    parsed = _thread_package_into_parsed(parsed, package_flag)
 
-    # Thread --package into the hybrid parsed filters (build_semantic_dql reads the
-    # package from parsed.package). Reject the same package-given-twice collision
-    # as the lexical path, before the client is built.
-    if package_flag is not None:
-        if parsed is not None and parsed.package is not None:
-            _err_console.print(_PACKAGE_TWICE_ERROR)
-            raise typer.Exit(code=1)
-        base = parsed if parsed is not None else parse_query("")
-        parsed = ParsedQuery(
-            quantities=base.quantities,
-            package=package_flag,
-            text_tokens=base.text_tokens,
-            raw_query=base.raw_query,
-        )
+    # Oversample the candidate pool (ADR-0020): ask Dgraph for many more nearest
+    # neighbours than the user's --limit so the client-side cosine re-rank has a
+    # real pool to pick the top results from. Bounded by the CANDIDATE cap; the
+    # RESULT bound (MAX_RESULT_LIMIT) is enforced by the ranker's truncation.
+    candidate_k = min(
+        max(limit * SEMANTIC_OVERSAMPLE_FACTOR, SEMANTIC_CANDIDATE_FLOOR),
+        SEMANTIC_CANDIDATE_CAP,
+    )
 
     stub = None
+    probe_hint: str | None = None
     try:
         client, stub = _build_dgraph_client()
         query_text, variables = build_semantic_dql(
             query_vector,
-            limit,
+            candidate_k,
             parsed=parsed,
             manufacturer=manufacturer,
             category=category,
@@ -1251,8 +1324,21 @@ def _run_semantic_search(  # noqa: PLR0913 — keyword-only filter passthrough
         )
         data = _run_block_query(client, query_text, variables)
         result = rank_results(
-            data, parsed if parsed is not None else parse_query(""), sort=sort
+            data,
+            parsed if parsed is not None else parse_query(""),
+            sort=sort,
+            query_vector=query_vector,
+            result_limit=min(limit, MAX_RESULT_LIMIT),
         )
+
+        # Empty human-path result: probe the embedding index ONCE on the SAME
+        # client to choose the right hint (starvation vs run-embed). The probe is
+        # NOT issued under --json (which never prints a hint and never pays the
+        # extra round-trip; AC-SF-27/AC-HY-15) nor when there is already a row to
+        # show (AC-HY-15). _probe_embedding_hint owns its own exceptions, so a
+        # probe failure never trips this primary query's exit-1 handler (F2).
+        if not result.rows and not json_output:
+            probe_hint = _probe_embedding_hint(client)
     except typer.Exit:
         raise
     except Exception as exc:
@@ -1265,13 +1351,19 @@ def _run_semantic_search(  # noqa: PLR0913 — keyword-only filter passthrough
     envelope_parsed = parsed if parsed is not None else parse_query("")
 
     # Under --json the empty-result path emits the empty envelope and NEVER the
-    # human "run `partgraph embed` first" hint (AC-SF-27): the short-circuit that
-    # prints _NO_EMBEDDINGS_HINT on the human path is bypassed entirely.
+    # human hint or the probe round-trip (AC-SF-27/AC-HY-15): the short-circuit
+    # that prints a hint on the human path is bypassed entirely.
     if not result.rows:
         if json_output:
             _emit_search_json(result, envelope_parsed)
             return
-        _console.print(_NO_EMBEDDINGS_HINT)
+        # probe_hint is always set here (the probe ran on this human empty path);
+        # the fallback keeps a defensive default. Printed markup=False: the
+        # probe-derived text is untrusted for Rich markup.
+        _console.print(
+            probe_hint if probe_hint is not None else _NO_EMBEDDINGS_HINT,
+            markup=False,
+        )
         return
 
     if json_output:
