@@ -70,7 +70,7 @@ attr_value_num: float @index(float) .
 # ---------------------------------------------------------------------------
 
 # Sentence-embedding vector for semantic similarity search.
-embedding:      float32vector @index(hnsw(metric: "cosine")) .
+embedding:      float32vector @index(hnsw(metric: "cosine", exponent: "6")) .
 
 stock:          int @index(int) .
 is_basic:       bool @index(bool) .
