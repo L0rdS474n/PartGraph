@@ -314,8 +314,9 @@ def check_index() -> None:
 
     Calls :func:`partgraph.util.index_health.check_index_integrity`, which asks
     Dgraph's OWN HTTP ``/query`` endpoint whether the live ``hnsw`` options on the
-    ``embedding`` predicate match ``schema/partgraph.dql`` and whether an embedded
-    part's stored vector, replayed through ``similar_to``, still finds itself.
+    ``embedding`` predicate match ``schema/partgraph.dql`` and whether a sample of
+    embedded parts, replayed through ``similar_to`` at k=1000, self-matches at or
+    above the rate threshold.
     Like ``db status`` (ADR-0018) this is engine-independent — it never calls a
     container engine. Exits 0 iff the database is reachable, the schema matches,
     and the self-similarity probe passed (or there is nothing embedded yet to

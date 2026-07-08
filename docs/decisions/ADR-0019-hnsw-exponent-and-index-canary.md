@@ -160,6 +160,38 @@ affected set) — that is the canary doing its job, not a false positive. Live
 remediation (targeted re-insertion or a further rebuild) is tracked as follow-up
 operations work, outside this ADR's repo-only scope.
 
+## Addendum (2026-07-08): the `first: 1`, `k=5` canary was mostly a false positive
+
+The "Known residual" section above concluded that `db check-index` exiting 1 on the live DB was "the canary doing its job, not a false positive." **A follow-up measurement on 2026-07-08 shows that conclusion was mostly wrong**; this addendum corrects it without rewriting the original record.
+
+Re-measuring the same live 613,396-vector index while varying only the `similar_to` neighbour count `k` isolated a **Dgraph v25.3.4 HNSW early-termination effect**: a part that does not find its own stored vector at `k=5` is routinely reachable at `k=1000`.
+
+- On the earliest-uid band the old probe deterministically selects (`first: 1` → uid `0x1`), self-match was **~3% at k=5** but **~85% at k=1000**.
+- Across the whole catalogue only **~4%** of parts are genuinely unreachable even at `k=1000`; that residual concentrates in the same early band, where it shows as the ~15% shortfall below 100% at k=1000.
+
+So the old probe's exit 1 was **dominated by the k=5 early-termination artifact** on the worst-case uid it happens to select — a **false positive** — not by the ~4% genuine residual. The genuine residual and its live remediation remain tracked as follow-up operations work, unchanged and still outside this ADR's repo-only scope; real `partgraph search --semantic` relies on candidate oversampling (ADR-0020), not on k=5.
+
+## Amendment (2026-07-08): multi-sample self-similarity canary
+
+The single-part, `k=5` design in Decision 3 is replaced by a **multi-sample + rate-threshold** canary:
+
+- **Sample `N = _SELF_SIMILARITY_SAMPLE = 30`** parts via one deterministic `has(embedding), first: 30` selection — the conservative earliest-uid band: if the hardest band clears the bar, the rest of the catalogue is better.
+- **Replay each at `k = _SELF_SIMILARITY_K = 1000`** (raised from 5): the measured navigable horizon at which the worst band recovers to its ~85% plateau, and below the search path's own `SEMANTIC_CANDIDATE_CAP = 1500` neighbour bound (ADR-0007 / ADR-0020), so it adds no new upper bound.
+- **Pass when the self-match rate ≥ `_SELF_SIMILARITY_THRESHOLD = 0.5`** (inclusive). The threshold sits in the wide gap between the healthy worst-band baseline (~85% at k=1000) and the recall-collapse regime this canary exists to catch (the exponent-3 disaster, **4 / 1000 ≈ 0.4%**). At N=30, 0.5 clears the 85% baseline by roughly 5σ (a healthy DB does not false-fail on sampling noise) yet still fires decisively on a real collapse. A threshold near the healthy baseline (e.g. 0.9) is **rejected**: because the selection deterministically samples the worst band, 0.9 would false-fail a healthy DB whose worst band tops out at ~85% — reintroducing the very false positive this amendment removes.
+- The result DTO gains **`self_similarity_rate: float | None`** (the measured rate; `None` when unreachable or when nothing is embedded). A per-sample invalid/corrupt stored vector still issues **no** `similar_to` call (the Finding 1 security gate is unchanged) and now counts as one **miss** while probing continues over the remaining samples; a network failure on any call aborts the probe (`reachable = False`) and issues no further call.
+
+The CLI exit formula is unchanged (`0 iff reachable and schema_ok and self_similarity_ok in (True, None)`); `self_similarity_ok = True` now means "rate ≥ threshold".
+
+### DoS bound of the multi-sample canary (ADR-0007 discipline)
+
+The canary is read-only and operator-invoked (`partgraph db check-index`), never on a hot path, but its cost is bounded explicitly, mirroring ADR-0007:
+
+- **Sequential HTTP calls ≤ `N + 2`** (= 32 for N=30): 1 schema introspection + 1 selection + at most one `similar_to` per sampled part. An invalid sample issues no call (fewer, never more); a network timeout/connection error on any call aborts the remainder (`reachable = False`) — the probe never re-hammers a failing endpoint.
+- **uid volume ≤ `N × k`** (= 30 × 1000 = 30,000 uid rows) across all `similar_to` responses — bounded because `N` and `k` are fixed module constants and `k` stays under `SEMANTIC_CANDIDATE_CAP`.
+- **Worst-case wall-clock ≈ `(N + 2) × INDEX_PROBE_TIMEOUT_S`** (≈ 64 s at N=30, 2.0 s), reached only by a DB that answers every one of the ≤ N+2 calls slowly-but-successfully; each individual call stays bounded by `INDEX_PROBE_TIMEOUT_S = 2.0 s` (never an unbounded wait), and a real timeout aborts early. This up-to-~64 s worst case (vs the old ~6 s) is an accepted trade-off for a statistically robust verdict that no longer false-fails on the k=5 early-termination artifact; revisit via a follow-up ADR if real usage demands it.
+
+Verification for this amendment: `tests/unit/test_index_health.py` AC-IDX-28..36 (multi-sample rate, inclusive threshold boundary, per-sample-invalid-continue, variable denominator, `self_similarity_rate` per branch, mid-loop network abort, pinned message wording, all-invalid edge, and the recall-collapse regression), plus the amended DTO-shape and single-part (M=1) ACs — all hermetic.
+
 ## Non-goals
 
 - **`apply_schema` diffing / auto-rebuild.** `apply-schema` still posts the file
