@@ -60,7 +60,7 @@ _suite_state: dict[str, int | None] = {"part_count_before": None}
 
 _EXPECTED_ROW_KEYS = {
     "mpn", "mpn_norm", "manufacturer", "package", "category", "stock",
-    "is_basic", "price_usd", "match_type", "datasheets", "params",
+    "is_basic", "price_usd", "match_type", "similarity", "datasheets", "params",
 }
 
 # ---------------------------------------------------------------------------
@@ -156,6 +156,12 @@ def test_gate_pr6_1_json_envelope_validates_keys_types_no_uid(
         )
         assert isinstance(row["datasheets"], list)
         assert isinstance(row["params"], dict)
+        # ADR-0020: `similarity` is a cosine float on semantic-tier rows and
+        # null otherwise; this lexical "MAX232" search must yield None.
+        assert row["similarity"] is None or isinstance(row["similarity"], float), (
+            f"GATE-PR6-1 FAILED: similarity must be a float (semantic rows) "
+            f"or null (lexical rows). Got: {row['similarity']!r}"
+        )
         assert row["match_type"] in {"exact", "trigram", "fulltext", "semantic", "nearest"}, (
             f"GATE-PR6-1 FAILED: match_type must be a machine-safe tier "
             f"name. Got: {row['match_type']!r}"
