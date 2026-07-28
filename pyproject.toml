@@ -32,7 +32,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "ruff",
+    # Pinned exactly. A lint gate whose ruleset moves under it is not a gate:
+    # ruff 0.16.0 promoted PLR0917 out of preview and CI began failing on code
+    # that had been on main, unchanged and green, for months. Bump this
+    # deliberately, with the new findings triaged in the same commit.
+    "ruff==0.16.0",
 ]
 # Heavy semantic-search extra (pulls torch). Kept OUT of [dev] so a plain
 # `pip install -e ".[dev]"` and CI never download the model stack; only an

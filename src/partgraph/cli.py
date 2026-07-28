@@ -1115,7 +1115,7 @@ def _emit_search_json(result, parsed) -> None:
 
 
 @app.command()
-def search(  # noqa: PLR0913 — Typer command surface: one option per filter flag
+def search(  # noqa: PLR0913, PLR0917 — Typer command surface: one option per filter flag
     query: str = typer.Argument(
         "",
         help="Free-text component query, e.g. 'MAX232' or '10k 0402 1%'.",

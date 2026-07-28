@@ -170,7 +170,7 @@ def _run_wrapper(  # noqa: PLR0913 -- one keyword-only seam per scenario knob, m
         pytest.param(5, 7, 5, id="both_fail_wrapper_propagates_first_nonzero_not_last"),
     ],
 )
-def test_both_phases_always_run_in_order_and_exit_aggregates(  # noqa: PLR0913 -- repo_root/bash_path/tmp_path fixtures plus one param per parametrize case.
+def test_both_phases_always_run_in_order_and_exit_aggregates(  # noqa: PLR0913, PLR0917 -- repo_root/bash_path/tmp_path fixtures plus one param per parametrize case.
     repo_root: pathlib.Path,
     bash_path: str,
     tmp_path: pathlib.Path,
