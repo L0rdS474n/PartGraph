@@ -80,9 +80,11 @@ environment-variable override, so the client only ever talks to a local Alpha th
 same operator started. It is inside the trust boundary, not an untrusted network
 peer. Forward progress across pages is enforced by the server-side `after:` keyset
 cursor (each page starts strictly past the prior page's max uid), and every uid is
-validated against `^0x[0-9a-fA-F]+$` before it can reach query text
+validated against `^0x[0-9a-fA-F]+\Z` before it can reach query text
 (validate-before-interpolate; ADR-0010 Fix B), so the cursor is never an injection
-vector.
+vector. (This ADR originally recorded that anchor as `$`; the charset is
+unchanged, and only the end-anchor is now stricter — see ADR-0021 § 8's
+2026-07-28 amendment.)
 
 We explicitly accept one residual **Low** risk: a compromised or buggy local
 Dgraph could keep serving fresh, strictly-advancing, always-eligible pages and so

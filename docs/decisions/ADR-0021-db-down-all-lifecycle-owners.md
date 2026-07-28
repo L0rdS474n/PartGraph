@@ -30,12 +30,23 @@ running.
 Quadlet is a Podman feature — Podman generates the `systemd --user` units from
 `.container` files (`podman-systemd.unit(5)`) — so on a host running Docker
 this particular second owner cannot exist, and neither can the login-time
-resurrection it causes. The sweep below is still engine-agnostic: the container
-phase routes through `engine_command()` (ADR-0009) and works on whichever
-engine is detected, while the unit phase degrades cleanly to "no unit" — with
-no `systemctl` on PATH, `unit_state()` reports the unit absent without running
-any subprocess at all. A Docker user therefore gets the Compose-and-container
-half of `db down` in full, and loses nothing that could have applied to them.
+resurrection it causes. The sweep below is nevertheless written to be
+engine-agnostic. Two things about that are **verified in this repository's own
+source**, and are the only things asserted here: the container phase builds its
+argv through `engine_command()` (ADR-0009) rather than a hard-coded `podman`
+literal, and the unit phase degrades to "no unit" without side effects — with no
+`systemctl` on PATH, `unit_state()` returns `present=False` without running any
+subprocess at all.
+
+What is **not** verified is the step after that: that the resulting argv, run
+against a real Docker daemon, stops the container as intended. That expectation
+is inherited from ADR-0009's engine-interchangeability claim, which is itself
+documentation-derived — no Docker daemon has ever been available on the host
+this project is developed on (`/usr/bin/docker` there is a shell shim that execs
+podman; there is no `dockerd`). So "a Docker user keeps the Compose-and-container
+half of `db down`" is a statement about how the code is *built*, not a result
+anyone here has observed, and it should be read with the same caution as every
+other Docker claim on this branch.
 What a Docker host *can* have instead is the daemon's own `restart` policy
 bringing the container back at boot — a different mechanism with the same
 symptom, addressed in ADR-0022 § 7f, which also states plainly that the Docker
@@ -403,13 +414,57 @@ PartGraph controls.
 ### 8. Untrusted engine output is validated at the boundary
 
 - Container names **and** IDs must match a **positive allow-list** — the
-  Docker/podman grammar `^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`, plus a finite length
+  Docker/podman grammar `^[a-zA-Z0-9][a-zA-Z0-9_.-]*\Z`, plus a finite length
   bound — before they are used for anything. A deny-list of hostile characters
   could never be exhaustive. A rejected row is excluded before classification,
   so its raw text reaches neither a subprocess argv nor a rendered message.
   (This is also why no separate "Rich `markup=False` for a `[`-bearing name"
   test is needed: a name containing brackets is rejected earlier, at the
   allow-list.)
+
+#### Amendment (2026-07-28): end-anchor corrected from `$` to `\Z`
+
+**This ADR originally recorded the grammar as `^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`,
+and that is what shipped in `d419c82`.** The line above now quotes `\Z` because
+that is what is enforced today; this note exists so the change is visible rather
+than silently rewritten into the record.
+
+In Python, `$` matches at end of string **or just before a trailing newline**.
+`^...$` therefore accepted exactly one `"\n"` at the end of an otherwise-valid
+identifier — `_accepted_identifier("partgraph-dgraph\n")` returned the string
+including the newline — even though the charset itself never lists `\n`. The
+embedded-newline case (`"bad\nname"`) never exposed this, because the characters
+*after* an embedded newline must still satisfy the pattern and do not. `\Z`
+matches end of string only.
+
+**Only the anchor changed; the accepted charset is identical.** That was checked
+rather than assumed: a differential over 60,088 generated strings (including
+`\n \r \t \x00 ; | & $ < >`) found every divergence between the old and new
+pattern to be a string ending in a newline, and no other difference.
+
+Every `$`-anchored allow-list in `src/` carried the same quirk and was corrected
+together — ten patterns across six modules. Four of them are quoted in other
+ADRs (ADR-0010, ADR-0011, ADR-0016, ADR-0017), each of which now points back
+here.
+
+**What this did, and what it did not, enable** — stated precisely, because the
+two are easy to conflate:
+
+- **Real, for this module:** an accepted name or ID carrying a trailing newline
+  reached rendered diagnostic output. `markup=False` suppresses Rich markup but
+  does not strip control characters, so the newline printed as a genuine line
+  break in output an operator is entitled to treat as trustworthy. No argv
+  injection followed from it — a newline is not a shell metacharacter to
+  `subprocess` with `shell=False` — but the module's stated promise about what
+  reaches a rendered message did not hold.
+- **Not exploitable, in the SQLite adapter:** `_SAFE_IDENTIFIER_RE`
+  (`partgraph.sources.jlcparts`) had the identical quirk, and it guards SQL
+  identifier interpolation — but a column named `lcsc\n` could never reach
+  `_build_query`, because the query is built from the **intersection** of
+  database-derived column names with a hard-coded literal set, and
+  `"lcsc\n" != "lcsc"`. That was traced end to end against a real hostile
+  SQLite database, not reasoned about. It was defence in depth with a hole in
+  it, not a live injection path, and it should not be cited as one.
 - The systemd unit name is a **frozen constant**, never built from an
   engine-returned string, so a poisoned container name can never influence which
   unit gets stopped.

@@ -71,7 +71,6 @@ from __future__ import annotations
 
 import json
 import pathlib
-import re
 import sqlite3
 from typing import Any
 
@@ -81,10 +80,18 @@ from partgraph.sources.jlcparts import JlcpartsAdapter  # noqa: F401
 from partgraph.sources.jlcparts import open_jlcparts_db  # noqa: F401
 from partgraph.normalize.model import StagedPart, AttrRecord  # noqa: F401
 
-# ---------------------------------------------------------------------------
-# Identifier safety pattern -- only [A-Za-z_][A-Za-z0-9_]* column names allowed.
-# ---------------------------------------------------------------------------
-_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# NOTE: this file used to shadow-declare its own `_SAFE_IDENTIFIER_RE` here —
+# a second, never-referenced copy of the production allow-list
+# (src/partgraph/sources/jlcparts.py's own `_SAFE_IDENTIFIER_RE`), grammar-
+# identical but pinned to the vulnerable `$`-anchored form
+# (`r"^[A-Za-z_][A-Za-z0-9_]*$"`) rather than the fixed `\Z`-anchored one.
+# `grep -rn _SAFE_IDENTIFIER_RE tests/ src/` showed it was never read by any
+# test in this file — dead code that read as authoritative next to the one
+# real pattern with no regression coverage (see
+# tests/unit/test_regex_anchoring.py). Deleted rather than fixed in place:
+# T-ADAPT-identifier-safety below already exercises the REAL production
+# constant through `JlcpartsAdapter` end to end, so a second, independently
+# drifting local copy added nothing this suite did not already have.
 
 
 # ---------------------------------------------------------------------------
