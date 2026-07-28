@@ -2384,8 +2384,10 @@ _EMBED_SELECT_PAGE_SIZE = 10_000
 #: is validated against this before it is interpolated into a DQL ``after:``
 #: clause: a missing or malformed uid is excluded from cursor computation and
 #: never reaches query text (validate-before-interpolate; mirrors
-#: partgraph.query.dql_builder's ADR-INJECT convention; ADR-0010).
-_UID_RE = re.compile(r"^0x[0-9a-fA-F]+$")
+#: partgraph.query.dql_builder's ADR-INJECT convention; ADR-0010). Anchored
+#: with ``\Z``, never ``$``: Python's ``$`` also matches just before a trailing
+#: newline, which would admit ``"0x1a\n"`` into an ``after:`` clause.
+_UID_RE = re.compile(r"^0x[0-9a-fA-F]+\Z")
 
 #: Informational (NOT error) notice printed when the keyset cursor fails to
 #: advance between pages — the defensive guard against re-fetching the same rows
@@ -2942,7 +2944,8 @@ _REFRESH_SELECT_PAGE_SIZE = 10_000
 #: fully decoupled from the embed pipeline the design forbids modifying. The
 #: keyset cursor is validated against this before it can reach a DQL ``after:``
 #: clause (validate-before-interpolate; ADR-0010 / dql_builder's ADR-INJECT).
-_REFRESH_UID_RE = re.compile(r"^0x[0-9a-fA-F]+$")
+#: ``\Z``, not ``$`` — see :data:`_UID_RE` for the trailing-newline quirk.
+_REFRESH_UID_RE = re.compile(r"^0x[0-9a-fA-F]+\Z")
 
 #: Informational (NOT error) notice printed when the keyset cursor fails to
 #: advance between pages — the defensive guard against re-fetching the same rows
@@ -3335,7 +3338,8 @@ _REFRESH_STOCK_SELECT_PAGE_SIZE = 10_000
 #: stays fully decoupled from the pipelines the design forbids modifying. The
 #: keyset cursor is validated against this before it can reach a DQL ``after:``
 #: clause (validate-before-interpolate; ADR-0010 / dql_builder's ADR-INJECT).
-_REFRESH_STOCK_UID_RE = re.compile(r"^0x[0-9a-fA-F]+$")
+#: ``\Z``, not ``$`` — see :data:`_UID_RE` for the trailing-newline quirk.
+_REFRESH_STOCK_UID_RE = re.compile(r"^0x[0-9a-fA-F]+\Z")
 
 #: Informational (NOT error) notice printed when the keyset cursor fails to
 #: advance between pages — the defensive guard against re-fetching the same rows

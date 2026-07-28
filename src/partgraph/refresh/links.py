@@ -93,7 +93,9 @@ _MIN_HOSTNAME_LABELS = 2
 #: Broad enough for real Dgraph uids (``0x`` + hex) while excluding whitespace,
 #: angle brackets, quotes and every other n-quad/DQL metacharacter, so no
 #: untrusted value can break out of ``<...>`` or a ``uid(...)`` clause.
-_UID_SAFE_RE = re.compile(r"^0x[0-9A-Za-z]+$")
+#: Anchored with ``\Z``, never ``$``: Python's ``$`` also matches just before a
+#: trailing newline, which would admit ``"0x1a\n"`` into n-quad/query text.
+_UID_SAFE_RE = re.compile(r"^0x[0-9A-Za-z]+\Z")
 
 
 class HostRateLimiter:

@@ -81,7 +81,9 @@ _RANGE_SEP = "~"
 _CONDITION_SEP = "@"
 
 # A bare numeric package code: exactly four digits (0402/0603/0805/1206/...).
-_NUMERIC_PACKAGE_RE = re.compile(r"^[0-9]{4}$")
+# Anchored with \Z, never $: Python's $ also matches before a trailing newline,
+# which would let "0402\n" through this and the final check below.
+_NUMERIC_PACKAGE_RE = re.compile(r"^[0-9]{4}\Z")
 
 # Known alphabetic package families. Matched case-insensitively against the
 # uppercased token prefix; the catalogue uses forms like SOT-23, SOIC-16,
@@ -111,8 +113,9 @@ _ALPHA_PACKAGE_PREFIXES: tuple[str, ...] = (
 
 # Final validation applied to any candidate package before it is accepted
 # (also enforced again at the DQL builder boundary). Uppercase alnum start,
-# then up to 19 more uppercase-alnum or hyphen characters.
-_PACKAGE_VALID_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-]{0,19}$")
+# then up to 19 more uppercase-alnum or hyphen characters. \Z, never $ — see
+# _NUMERIC_PACKAGE_RE above.
+_PACKAGE_VALID_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-]{0,19}\Z")
 
 # A token that is only punctuation / symbols (no letters or digits) is dropped.
 _HAS_ALNUM_RE = re.compile(r"[A-Za-z0-9]")

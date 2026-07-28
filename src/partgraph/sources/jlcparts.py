@@ -17,7 +17,7 @@ strategies:
   ``subcategory`` (L2) columns — there is no ``categories.name``.
 
 Security: every identifier discovered via introspection is validated against a
-strict ``^[A-Za-z_][A-Za-z0-9_]*$`` allowlist, and queries only ever reference a
+strict ``^[A-Za-z_][A-Za-z0-9_]*\\Z`` allowlist, and queries only ever reference a
 hard-coded, regex-clean set of known column names. A hostile column such as
 ``bad"; --col`` is therefore never interpolated into SQL and is silently
 ignored. Rows are streamed with ``fetchmany`` (never ``fetchall``) so the
@@ -49,7 +49,9 @@ from partgraph.normalize.model import (
 __all__ = ["JlcpartsAdapter", "open_jlcparts_db"]
 
 # Strict SQL identifier allowlist. Anything failing this is never interpolated.
-_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Anchored with \Z, never $: Python's $ also matches just before a trailing
+# newline, so ^...$ would accept a column named "lcsc\n" as regex-clean.
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 
 # Hard-coded, trusted column names shared by both strategies. Each is regex-clean
 # by construction; the adapter only ever SELECTs from the intersection of these

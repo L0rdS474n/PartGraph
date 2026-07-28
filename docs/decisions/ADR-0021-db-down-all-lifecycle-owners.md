@@ -26,6 +26,22 @@ it — it never created it, so it carries no Compose project label — and
 printed `Dgraph stopped.` and exited `0` while a PartGraph database kept
 running.
 
+**That second owner is Podman-specific, and the fix is deliberately not.**
+Quadlet is a Podman feature — Podman generates the `systemd --user` units from
+`.container` files (`podman-systemd.unit(5)`) — so on a host running Docker
+this particular second owner cannot exist, and neither can the login-time
+resurrection it causes. The sweep below is still engine-agnostic: the container
+phase routes through `engine_command()` (ADR-0009) and works on whichever
+engine is detected, while the unit phase degrades cleanly to "no unit" — with
+no `systemctl` on PATH, `unit_state()` reports the unit absent without running
+any subprocess at all. A Docker user therefore gets the Compose-and-container
+half of `db down` in full, and loses nothing that could have applied to them.
+What a Docker host *can* have instead is the daemon's own `restart` policy
+bringing the container back at boot — a different mechanism with the same
+symptom, addressed in ADR-0022 § 7f, which also states plainly that the Docker
+behaviour there is read off Docker's documentation and has never been exercised
+on a real Docker daemon by this project.
+
 ### What the incident actually was (measured, not assumed)
 
 The operator reported *"four instances running"*. That report was investigated
