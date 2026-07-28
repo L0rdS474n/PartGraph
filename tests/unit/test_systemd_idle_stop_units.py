@@ -156,33 +156,43 @@ def test_service_never_mentions_root_as_a_literal_user(service_text: str) -> Non
 
 # ---------------------------------------------------------------------------
 # C-11 — %h specifiers only, never an operator path.
+#
+# [Gate 3b BLOCKING fix] An earlier draft of this file kept a LOCAL copy of
+# `tests/unit/test_repo_skeleton.py`'s own `_HOME_PATH_PATTERN` here, to
+# assert the NEGATIVE half directly ("no real operator home path appears").
+# `tests/unit/test_db_lifecycle_docs.py` already recorded, explicitly, why
+# that specific duplication is actively HARMFUL rather than merely
+# redundant: that regex's own source text contains the literal substring
+# `/home/` inside its negative lookahead, so a second, independent copy of
+# it is itself something the repo-wide scanner
+# (`test_repo_skeleton.py::test_no_operator_home_paths_in_tracked_files`)
+# reads as a real leaked home path THE MOMENT this file is tracked — the
+# copy self-matches and breaks an unrelated, previously-green gate. Gate 3a
+# independently confirmed the mechanism: a naive substring/character-class
+# scan does not see the `(` immediately after `/home/` in the regex's own
+# source as anything special, so it reads exactly like a real path segment.
+#
+# The fix mirrors `test_db_lifecycle_docs.py`'s own, already-corrected
+# resolution exactly: DROP the local copy and rely on the always-on,
+# repo-wide scanner for the NEGATIVE property (it covers every tracked file
+# uniformly, including this one, the moment it lands) — this file keeps
+# only the POSITIVE half the repo-wide scanner does not and cannot cover:
+# that the `%h` placeholder is actually PRESENT, i.e. the unit could not
+# simply omit any home-directory reference at all and still pass.
 # ---------------------------------------------------------------------------
 
-_HOME_PATH_PATTERN = re.compile(
-    r"(/home/(?!(?:user|operator|dev|test|example|you|me|username|admin|vagrant)/)[^/\s\"']+/"
-    r"|/Users/(?!(?:user|operator|dev|test|example|you|me|username|admin|vagrant)/)[^/\s\"']+/)"
-)
 
-
-def test_service_uses_percent_h_never_a_real_operator_home_path(service_text: str) -> None:
-    """C-11: Given any path this unit references that lives under a home
-    directory must use systemd's `%h` specifier (mirrors
-    `partgraph-refresh-all.service`'s own `ExecStart=%h/.local/bin/...`).
+def test_service_references_percent_h(service_text: str) -> None:
+    """C-11 [positive half only — see the note above]: Given the unit is
+    meant to reference its operator's home directory only via systemd's
+    `%h` specifier (mirrors `partgraph-refresh-all.service`'s own
+    `ExecStart=%h/.local/bin/...`).
     When the unit's full text is scanned.
-    Then no real, non-placeholder operator home path appears (this repo's
-    OWN home-path pattern, matching `tests/unit/test_repo_skeleton.py`'s
-    stricter, repo-wide scanner)."""
-    assert not _HOME_PATH_PATTERN.search(service_text), (
-        f"{SERVICE_REL} must reference home-relative paths via '%h', never "
-        "a real operator absolute path."
-    )
-
-
-def test_timer_uses_percent_h_never_a_real_operator_home_path(timer_text: str) -> None:
-    assert not _HOME_PATH_PATTERN.search(timer_text), (
-        f"{TIMER_REL} must reference home-relative paths via '%h', never "
-        "a real operator absolute path."
-    )
+    Then the literal `%h` specifier is actually present somewhere — a unit
+    that omitted any home-directory reference at all (e.g. one that never
+    reads an operator env file) would still need to prove it, not merely
+    be assumed to."""
+    assert "%h" in service_text, f"{SERVICE_REL} never references the %h specifier."
 
 
 def test_service_execstart_invokes_idle_stop(service_text: str) -> None:

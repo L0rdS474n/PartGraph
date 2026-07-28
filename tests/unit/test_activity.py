@@ -50,10 +50,16 @@ Pinned contract this file specifies:
 
     `REASON_DISABLED`, `REASON_LIVE_LEASE`, `REASON_UNDETERMINED_LEASE`,
     `REASON_FRESH_STAMP`, `REASON_STALE`, `REASON_NOTHING_TO_DO`,
-    `REASON_STAMP_BOOTSTRAPPED` — plain string tags (mirrors
-    `partgraph.util.lifecycle`'s own `_OWNER_NAME_MATCH = "S1"` style),
-    naming WHY an `IdleDecision` was reached, so a test can assert the reason,
-    not merely the boolean.
+    `REASON_STAMP_BOOTSTRAPPED`, `REASON_STAMP_POISON_RECOVERED` — plain
+    string tags (mirrors `partgraph.util.lifecycle`'s own
+    `_OWNER_NAME_MATCH = "S1"` style), naming WHY an `IdleDecision` was
+    reached, so a test can assert the reason, not merely the boolean.
+
+    `STAMP_FUTURE_POISON_CEILING_MINUTES: float` — see "[Gate 3a BLOCKING]
+    the stamp-poisoning ceiling" below.
+
+    `MAX_STAMP_FILE_BYTES` / `MAX_LEASE_FILE_BYTES` — see "[Gate 3a
+    SHOULD-FIX] size/shape bounds on stamp and lease reads" below.
 
   DTOs (frozen dataclasses, mirroring `Instance`/`UnitState`/`DownResult`):
     `Lease(pid: int, create_time: float, acquired_utc: str)`
@@ -81,6 +87,77 @@ Pinned contract this file specifies:
   Decision (C-4..C-10):
     `evaluate_idle(*, state_dir, idle_timeout_minutes, db_reachable,
     now=None, psutil_module=None) -> IdleDecision`
+
+[Gate 3a BLOCKING] the stamp-poisoning ceiling — a forward clock jump must
+not permanently poison the stamp. The ORIGINAL "monotonic-safe" rule below
+("never write earlier than the existing stamp") was reviewed and found to
+have exactly the failure mode Gate 3a flagged: a SINGLE bad `now()` (a real
+NTP/RTC correction, or a caller bug) that lands far in the future gets
+written once, and every subsequent, CORRECT `now()` is then permanently
+refused by that same rule forever — `evaluate_idle` sees a stamp that reads
+as "just active" forever (C-10's own clamp), `db idle-stop` becomes a
+silent, permanent no-op, and the idle cost this PR exists to eliminate
+returns invisibly. "Silent and permanent" is unacceptable for the same
+reason the original 14-hour incident was: silence is exactly how it
+persisted.
+
+THE FIX, applied identically at both the ONLY two places a stamp's
+plausibility is judged against a clock (`touch_activity`'s own write-time
+protection AND `evaluate_idle`'s own C-10 read-time clamp): a stored stamp
+that is more than `STAMP_FUTURE_POISON_CEILING_MINUTES` AHEAD of a genuine
+`now()` is no longer treated as "legitimately more advanced than this
+write" (the ordinary small-clock-skew case C-10 protects) — it is treated
+as UNTRUSTWORTHY:
+  - `touch_activity`: the monotonic-protection rule no longer applies to an
+    untrustworthy existing stamp — the new, correct `now()` overwrites it
+    immediately (self-heals on the VERY NEXT legitimate write, not after
+    literal wall-clock time catches up to the poisoned value, which for an
+    extreme poisoning could be centuries away).
+  - `evaluate_idle`: an untrustworthy stamp is treated EXACTLY as if no
+    stamp existed at all, routing through the SAME, already-tested C-8
+    no-stamp logic — `db_reachable=True` bootstraps a fresh, correct stamp
+    immediately (self-healing on `db idle-stop`'s OWN independent schedule,
+    without requiring any OTHER DB command to run first) and reports
+    `REASON_STAMP_POISON_RECOVERED` — a DISTINCT tag from the ordinary
+    first-install `REASON_STAMP_BOOTSTRAPPED`, so the anomaly is
+    OBSERVABLE (surfaceable by a future `db doctor`/log line) rather than
+    silently indistinguishable from a fresh install; `db_reachable=False`
+    reports `REASON_NOTHING_TO_DO` and leaves the poisoned file untouched
+    (nothing is running, so there is no urgency, and fabricating a stamp
+    for a database that is not up would violate the very property
+    `test_no_stamp_and_db_not_reachable_is_nothing_to_do_and_writes_no_stamp`
+    below already pins).
+
+`STAMP_FUTURE_POISON_CEILING_MINUTES` is a JUDGEMENT CALL (mirrors
+`STOP_GRACE_SECONDS`/`AUTOSTART_READY_TIMEOUT_S`'s own documented
+precedent), set to 10.0: it must be (a) far larger than any plausible
+ordinary clock skew during normal operation (sub-second to low-single-digit
+seconds across cores/hosts, so 10 minutes is enormous headroom against a
+false positive that would fight a genuine, small NTP backward correction —
+`test_touch_activity_never_regresses_the_stamp_on_a_small_backward_clock_
+step_within_the_poison_ceiling` below), and (b) meaningfully smaller than
+`DEFAULT_IDLE_TIMEOUT_MINUTES` (30) so the worst-case damage of ANY
+poisoning event — "the stamp looks fresh for up to the ceiling" — stays
+well under one full idle-timeout cycle, not an unbounded one.
+
+[Gate 3a SHOULD-FIX] the shared stamp's temp-filename is NOT made unique
+per-writer, unlike the lease (which IS PID-scoped, above) — disclosed here
+with the SAME rigour, as requested, rather than fixed, because the fail
+direction was traced and found SAFE: two processes racing on the same
+`activity.json.tmp` can, in the worst case, interleave a torn/partial write
+that leaves malformed JSON at the final path once `os.replace` completes.
+`read_activity_stamp` already degrades a malformed stamp to `None`
+(`test_read_activity_stamp_degrades_to_none_never_raises_on_malformed_
+content` below, unconditionally, not only for this scenario), which routes
+`evaluate_idle` through the SAME no-stamp/C-8 bootstrap-or-nothing-to-do
+branch a torn write's honest sibling — no stamp at all — already goes
+through. The worst outcome of a torn shared-stamp write is therefore
+IDENTICAL to a fresh install's own first observation, never a false "must
+not stop" nor a false "must stop" — unlike the lease, where a lost update
+could have hidden a genuinely LIVE process, a torn STAMP write cannot hide
+a live lease (the two files are independent), so the stakes are lower here
+and a shared temp name is an accepted, analysed trade-off rather than an
+oversight.
 
 OWN RULING — a per-process (PID-scoped) lease file, not one shared file
 (beyond what any single AC states verbatim, flagged here for the parent
@@ -123,6 +200,8 @@ import json
 import math
 import os
 import pathlib
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 
@@ -133,13 +212,17 @@ import pytest
 # src/partgraph/util/activity.py exists — the correct test-first red state.
 from partgraph.util.activity import (  # noqa: E402
     DEFAULT_IDLE_TIMEOUT_MINUTES,
+    MAX_LEASE_FILE_BYTES,
+    MAX_STAMP_FILE_BYTES,
     REASON_DISABLED,
     REASON_FRESH_STAMP,
     REASON_LIVE_LEASE,
     REASON_NOTHING_TO_DO,
     REASON_STALE,
     REASON_STAMP_BOOTSTRAPPED,
+    REASON_STAMP_POISON_RECOVERED,
     REASON_UNDETERMINED_LEASE,
+    STAMP_FUTURE_POISON_CEILING_MINUTES,
     IdleDecision,
     Lease,
     acquire_lease,
@@ -303,28 +386,38 @@ def test_touch_activity_uses_a_temp_file_and_os_replace(tmp_path, monkeypatch) -
     assert dst == str(activity_stamp_path(state_dir))
 
 
-def test_touch_activity_never_regresses_the_stamp_on_a_backward_clock_step(tmp_path) -> None:
-    """C-1 "monotonic-safe": Given a stamp already recorded at T2.
-    When `touch_activity` is called again with `now` returning an EARLIER
-    instant T1 (a real hazard: NTP stepping the wall clock backward mid-run,
-    or two heartbeats completing out of order across cores).
+def test_touch_activity_never_regresses_the_stamp_on_a_small_backward_clock_step_within_the_poison_ceiling(
+    tmp_path,
+) -> None:
+    """C-1 "monotonic-safe": Given a stamp already recorded at T2, and a
+    SMALL backward step — well WITHIN `STAMP_FUTURE_POISON_CEILING_MINUTES`
+    (2 minutes, against a 10-minute ceiling) — a real hazard: NTP stepping
+    the wall clock backward mid-run, or two heartbeats completing out of
+    order across cores.
+    When `touch_activity` is called again with `now` returning the earlier
+    instant T1.
     Then the stamp on disk is UNCHANGED — still T2 — never regressed to T1.
     A regression here would make a database that WAS recently confirmed
     active suddenly look OLDER (more idle) than it already was recorded as,
     which is exactly the wrong direction for a control that guards against
-    stopping something in use.
+    stopping something in use. [Gate 3a BLOCKING fix] This is deliberately
+    a SMALL gap now, not the 1-hour gap an earlier draft used — see
+    `test_touch_activity_self_heals_a_stamp_poisoned_implausibly_far_into_
+    the_future` immediately below for what happens BEYOND the ceiling,
+    where protecting the existing stamp forever is exactly the failure mode
+    Gate 3a flagged.
     """
     state_dir = tmp_path / "state"
     t2 = _dt(2026, 7, 28, 12, 0, 0)
-    t1 = _dt(2026, 7, 28, 11, 0, 0)
+    t1 = t2 - timedelta(minutes=2)
     assert t1 < t2
+    assert (t2 - t1) < timedelta(minutes=STAMP_FUTURE_POISON_CEILING_MINUTES)
 
     touch_activity(state_dir=state_dir, now=lambda: t2)
     touch_activity(state_dir=state_dir, now=lambda: t1)
 
     assert read_activity_stamp(state_dir) == t2, (
-        "touch_activity must never regress an existing, newer stamp to an "
-        "older 'now' value"
+        "a SMALL backward clock step must not regress the stamp"
     )
 
 
@@ -343,6 +436,87 @@ def test_touch_activity_advances_normally_when_now_is_later(tmp_path) -> None:
     assert read_activity_stamp(state_dir) == t2
 
 
+# ---------------------------------------------------------------------------
+# [Gate 3a BLOCKING] the stamp-poisoning ceiling and its recoverability —
+# see the module docstring's own full explanation.
+# ---------------------------------------------------------------------------
+
+
+def test_stamp_future_poison_ceiling_is_a_finite_positive_minutes_value_below_the_default_timeout() -> None:
+    """[Gate 3a BLOCKING] Given the ceiling is a JUDGEMENT CALL (module
+    docstring), not a measured requirement.
+    When the constant is read directly.
+    Then it is finite, positive, and STRICTLY LESS than
+    `DEFAULT_IDLE_TIMEOUT_MINUTES` — the whole point is bounding a
+    poisoning's worst-case damage to well under one full idle cycle, which
+    a ceiling AT OR ABOVE the default timeout could not do."""
+    assert math.isfinite(STAMP_FUTURE_POISON_CEILING_MINUTES)
+    assert STAMP_FUTURE_POISON_CEILING_MINUTES > 0
+    assert STAMP_FUTURE_POISON_CEILING_MINUTES < DEFAULT_IDLE_TIMEOUT_MINUTES
+
+
+def test_touch_activity_self_heals_a_stamp_poisoned_implausibly_far_into_the_future(
+    tmp_path,
+) -> None:
+    """[Gate 3a BLOCKING — THE property test]: Given a stamp poisoned two
+    days into the future relative to the honest wall clock (modelling a
+    real RTC/NTP fault, or a caller passing a wrong `now` once).
+    When `touch_activity` is called again with a CORRECT, ordinary `now()`.
+    Then the poisoned stamp is OVERWRITTEN with the correct value — self-
+    healing on the very next legitimate write, rather than being protected
+    forever by the monotonic rule (which would otherwise silently and
+    permanently disable this whole feature — the exact failure Gate 3a
+    flagged)."""
+    state_dir = tmp_path / "state"
+    honest_now = _dt(2026, 7, 28, 12, 0, 0)
+    poisoned = honest_now + timedelta(days=2)
+    assert (poisoned - honest_now) > timedelta(minutes=STAMP_FUTURE_POISON_CEILING_MINUTES)
+
+    touch_activity(state_dir=state_dir, now=lambda: poisoned)
+    assert read_activity_stamp(state_dir) == poisoned  # sanity: the poison landed
+
+    touch_activity(state_dir=state_dir, now=lambda: honest_now)
+    assert read_activity_stamp(state_dir) == honest_now, (
+        "a stamp poisoned beyond the ceiling must self-heal on the next "
+        "legitimate write, never be protected forever"
+    )
+
+
+def test_touch_activity_poison_ceiling_boundary_exactly_at_ceiling_still_protected(
+    tmp_path,
+) -> None:
+    """Pins the boundary operator precisely: a gap of EXACTLY the ceiling is
+    still protected (not yet poisoned) — the ceiling is exceeded strictly,
+    giving a small extra safety margin before declaring poison."""
+    state_dir = tmp_path / "state"
+    honest_now = _dt(2026, 7, 28, 12, 0, 0)
+    at_ceiling = honest_now + timedelta(minutes=STAMP_FUTURE_POISON_CEILING_MINUTES)
+
+    touch_activity(state_dir=state_dir, now=lambda: at_ceiling)
+    touch_activity(state_dir=state_dir, now=lambda: honest_now)
+
+    assert read_activity_stamp(state_dir) == at_ceiling, (
+        "a gap of exactly the ceiling must still be protected, not treated as poisoned"
+    )
+
+
+def test_touch_activity_poison_ceiling_boundary_just_over_ceiling_self_heals(
+    tmp_path,
+) -> None:
+    """Mirrors the boundary test above from the other side: a gap ONE
+    MINUTE beyond the ceiling is treated as poisoned and self-heals."""
+    state_dir = tmp_path / "state"
+    honest_now = _dt(2026, 7, 28, 12, 0, 0)
+    just_over = honest_now + timedelta(minutes=STAMP_FUTURE_POISON_CEILING_MINUTES + 1)
+
+    touch_activity(state_dir=state_dir, now=lambda: just_over)
+    touch_activity(state_dir=state_dir, now=lambda: honest_now)
+
+    assert read_activity_stamp(state_dir) == honest_now, (
+        "a gap just beyond the ceiling must be treated as poisoned and self-heal"
+    )
+
+
 def test_touch_activity_warns_once_and_never_raises_when_rename_fails(
     tmp_path, monkeypatch, caplog
 ) -> None:
@@ -352,9 +526,12 @@ def test_touch_activity_warns_once_and_never_raises_when_rename_fails(
     command's per-page heartbeat, C-2, hammering an unwritable state dir for
     a whole run).
     Then NEITHER call raises — the DB command this stamp is a side effect of
-    must never crash because its own bookkeeping failed — and exactly ONE
-    warning is logged for the whole pair, not two: a multi-hour run must not
-    flood the log with an identical warning every single page.
+    must never crash because its own bookkeeping failed — exactly ONE
+    warning is logged for the whole pair, not two (a multi-hour run must not
+    flood the log with an identical warning every single page) — and [Gate
+    3a SHOULD-FIX] the state dir is left CLEAN afterward: no `.tmp` debris
+    file survives a failed `os.replace`, even though the temp file's own
+    `write_text` genuinely succeeded before the rename failed.
     """
     state_dir = tmp_path / "state"
     monkeypatch.setattr(
@@ -369,6 +546,10 @@ def test_touch_activity_warns_once_and_never_raises_when_rename_fails(
     assert len(warnings) == 1, (
         f"expected exactly one warning across two failed touch_activity calls "
         f"against the SAME unwritable state dir, got {len(warnings)}: {warnings!r}"
+    )
+    leftover = list(state_dir.glob("*.tmp")) if state_dir.exists() else []
+    assert leftover == [], (
+        f"a failed os.replace must not leave a .tmp debris file behind: {leftover!r}"
     )
 
 
@@ -950,21 +1131,31 @@ def test_default_idle_timeout_minutes_constant_is_thirty() -> None:
 
 
 # ---------------------------------------------------------------------------
-# C-10 — clock skew: a stamp in the future is just-active, never idle. Also
-# proves no crash on an extreme skew.
+# C-10 — clock skew: a stamp MODERATELY in the future (within the poison
+# ceiling) is just-active, never idle. [Gate 3a BLOCKING fix] A stamp
+# IMPLAUSIBLY far in the future (beyond the ceiling) is a DIFFERENT case —
+# see the poisoning section below — never silently protected forever.
 # ---------------------------------------------------------------------------
 
 
-def test_future_stamp_is_treated_as_just_active_never_idle(tmp_path) -> None:
-    """C-10: Given the activity stamp is (per clock skew) an hour in the
-    FUTURE relative to `now`.
+def test_future_stamp_within_the_poison_ceiling_is_treated_as_just_active_never_idle(
+    tmp_path,
+) -> None:
+    """C-10: Given the activity stamp is (per ordinary clock skew) 2 minutes
+    in the FUTURE relative to `now` — well WITHIN
+    `STAMP_FUTURE_POISON_CEILING_MINUTES` (10).
     When `evaluate_idle` runs with a much shorter idle timeout.
     Then it is treated as FRESH (age clamped to zero, never negative), never
     as stale — the opposite of the correct direction would let a clock-skewed
-    stamp look ancient and trigger a stop."""
+    stamp look ancient and trigger a stop. [Gate 3a BLOCKING fix] Deliberately
+    a SMALL skew now, not the 1-hour skew an earlier draft used — see
+    `test_future_stamp_beyond_the_poison_ceiling_is_untrustworthy_and_self_
+    heals_via_bootstrap` immediately below for what happens beyond the
+    ceiling."""
     state_dir = tmp_path / "state"
     now_value = _dt(2026, 7, 28, 12, 0, 0)
-    future_stamp = now_value + timedelta(hours=1)
+    future_stamp = now_value + timedelta(minutes=2)
+    assert (future_stamp - now_value) < timedelta(minutes=STAMP_FUTURE_POISON_CEILING_MINUTES)
     touch_activity(state_dir=state_dir, now=lambda: future_stamp)
 
     decision = evaluate_idle(
@@ -977,19 +1168,96 @@ def test_future_stamp_is_treated_as_just_active_never_idle(tmp_path) -> None:
     assert decision == IdleDecision(should_stop=False, reason=REASON_FRESH_STAMP)
 
 
-def test_extremely_future_stamp_does_not_crash(tmp_path) -> None:
-    """C-10: An extreme clock-skew stamp (decades in the future) must not
-    raise (e.g. no OverflowError from a giant timedelta)."""
+# ---------------------------------------------------------------------------
+# [Gate 3a BLOCKING] a stamp poisoned BEYOND the ceiling, read back by
+# evaluate_idle: treated as untrustworthy, routed through the SAME no-stamp
+# (C-8) logic, self-healing on idle-stop's OWN independent schedule — see
+# the module docstring's full explanation.
+# ---------------------------------------------------------------------------
+
+
+def test_future_stamp_beyond_the_poison_ceiling_is_untrustworthy_and_self_heals_via_bootstrap(
+    tmp_path,
+) -> None:
+    """[Gate 3a BLOCKING — THE property test]: Given a stamp poisoned an
+    hour into the future (beyond the 10-minute ceiling) and the database IS
+    currently reachable.
+    When `evaluate_idle` runs.
+    Then it does NOT silently treat the poisoned stamp as "just active"
+    forever: it is treated as untrustworthy, routed through the SAME C-8
+    no-stamp logic, and — because the database is reachable — a FRESH,
+    correct stamp is bootstrapped immediately (self-healing on THIS
+    `db idle-stop` invocation's own schedule, without needing any other DB
+    command to run first). The decision is `REASON_STAMP_POISON_RECOVERED`
+    — a DISTINCT tag from an ordinary first-install bootstrap, so the
+    anomaly is OBSERVABLE, never silently indistinguishable from a fresh
+    install. `should_stop` is False (this call heals; it does not stop)."""
     state_dir = tmp_path / "state"
+    now_value = _dt(2026, 7, 28, 12, 0, 0)
+    poisoned = now_value + timedelta(hours=1)
+    assert (poisoned - now_value) > timedelta(minutes=STAMP_FUTURE_POISON_CEILING_MINUTES)
+    touch_activity(state_dir=state_dir, now=lambda: poisoned)
+
+    decision = evaluate_idle(
+        state_dir=state_dir,
+        idle_timeout_minutes=30.0,
+        db_reachable=True,
+        now=lambda: now_value,
+        psutil_module=_fake_psutil(),
+    )
+    assert decision == IdleDecision(should_stop=False, reason=REASON_STAMP_POISON_RECOVERED)
+    assert read_activity_stamp(state_dir) == now_value, (
+        "the poisoned stamp must be overwritten with a fresh, correct one immediately"
+    )
+
+
+def test_future_stamp_beyond_the_ceiling_and_db_not_reachable_leaves_it_untouched(
+    tmp_path,
+) -> None:
+    """Given the SAME poisoned-beyond-ceiling stamp, but the database is NOT
+    currently reachable (nothing is running).
+    When `evaluate_idle` runs.
+    Then `REASON_NOTHING_TO_DO` (mirrors the ordinary no-stamp/not-reachable
+    case exactly) and the poisoned file is left ON DISK, untouched — there
+    is no urgency (nothing is running to protect or stop), and fabricating
+    a stamp for a database that is not up would contradict
+    `test_no_stamp_and_db_not_reachable_is_nothing_to_do_and_writes_no_stamp`'s
+    own property."""
+    state_dir = tmp_path / "state"
+    now_value = _dt(2026, 7, 28, 12, 0, 0)
+    poisoned = now_value + timedelta(hours=1)
+    touch_activity(state_dir=state_dir, now=lambda: poisoned)
+
+    decision = evaluate_idle(
+        state_dir=state_dir,
+        idle_timeout_minutes=30.0,
+        db_reachable=False,
+        now=lambda: now_value,
+        psutil_module=_fake_psutil(),
+    )
+    assert decision == IdleDecision(should_stop=False, reason=REASON_NOTHING_TO_DO)
+    assert read_activity_stamp(state_dir) == poisoned, (
+        "an unreachable database's poisoned stamp must be left untouched, not silently healed"
+    )
+
+
+def test_extremely_future_stamp_does_not_crash_and_self_heals(tmp_path) -> None:
+    """C-10: An EXTREME clock-skew stamp (decades in the future) must not
+    raise (e.g. no OverflowError from a giant timedelta) — and, exactly like
+    the more modest hour-long poisoning above, is treated as untrustworthy
+    and self-heals rather than being silently protected forever."""
+    state_dir = tmp_path / "state"
+    now_value = _dt(2026, 7, 28)
     touch_activity(state_dir=state_dir, now=lambda: _dt(2100, 1, 1))
     decision = evaluate_idle(
         state_dir=state_dir,
         idle_timeout_minutes=30.0,
         db_reachable=True,
-        now=lambda: _dt(2026, 7, 28),
+        now=lambda: now_value,
         psutil_module=_fake_psutil(),
     )
-    assert decision.should_stop is False
+    assert decision == IdleDecision(should_stop=False, reason=REASON_STAMP_POISON_RECOVERED)
+    assert read_activity_stamp(state_dir) == now_value
 
 
 # ---------------------------------------------------------------------------
@@ -1078,3 +1346,179 @@ def test_no_stamp_bootstrap_protects_for_a_full_budget_window_then_goes_stale(tm
     assert call3 == IdleDecision(should_stop=True, reason=REASON_STALE), (
         "must go stale once a FULL budget window has elapsed since the first observation"
     )
+
+
+# ---------------------------------------------------------------------------
+# [Gate 3a SHOULD-FIX] size/shape bounds on stamp and lease reads — mirrors
+# `partgraph.util.lifecycle.MAX_PS_OUTPUT_BYTES`'s own bounded-constant
+# precedent ("ps output is bounded ... before it is decoded"), applied here
+# to a much smaller expected payload (a fixed-size, single-marker file, not
+# a whole-host container enumeration). This matters MORE than it looks: the
+# monotonic-write rule means `touch_activity` reads the EXISTING stamp
+# before writing, so this read path fires on all nine DB-touching commands
+# on every call, not merely the opt-in `db idle-stop` timer — an oversized
+# file, a directory where a file is expected, or a symlink to a FIFO/device
+# must never hang or exhaust memory during perfectly ordinary use.
+# ---------------------------------------------------------------------------
+
+_SYMLINK_HANG_SUBPROCESS_TIMEOUT_S = 8.0
+
+
+def test_max_stamp_and_lease_file_bytes_are_finite_positive_bounds() -> None:
+    assert isinstance(MAX_STAMP_FILE_BYTES, int)
+    assert isinstance(MAX_LEASE_FILE_BYTES, int)
+    assert 0 < MAX_STAMP_FILE_BYTES < 10 * 1024 * 1024
+    assert 0 < MAX_LEASE_FILE_BYTES < 10 * 1024 * 1024
+
+
+def test_read_activity_stamp_treats_an_oversized_but_otherwise_valid_file_as_unreadable(
+    tmp_path,
+) -> None:
+    """[Gate 3a SHOULD-FIX] Given a stamp file whose JSON content IS
+    otherwise well-formed and valid, but whose total byte size EXCEEDS
+    `MAX_STAMP_FILE_BYTES` (padded with an oversized filler value, isolating
+    the SIZE bound from the "malformed JSON" degradation already proven
+    elsewhere).
+    When `read_activity_stamp` is called.
+    Then it returns None — the bound is checked before/regardless of
+    whether the content would otherwise parse, mirroring
+    `MAX_PS_OUTPUT_BYTES`'s own "discarded without being decoded"
+    discipline."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    padding = "A" * (MAX_STAMP_FILE_BYTES + 1024)
+    payload = json.dumps({"last_active_utc": "2026-01-01T00:00:00Z", "_pad": padding})
+    assert len(payload.encode("utf-8")) > MAX_STAMP_FILE_BYTES
+    activity_stamp_path(state_dir).write_text(payload, encoding="utf-8")
+
+    assert read_activity_stamp(state_dir) is None
+
+
+def test_read_lease_treats_an_oversized_but_otherwise_valid_file_as_unreadable(tmp_path) -> None:
+    """[Gate 3a SHOULD-FIX] Mirrors the stamp test above, for the lease."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    padding = "A" * (MAX_LEASE_FILE_BYTES + 1024)
+    payload = json.dumps(
+        {"pid": 123, "create_time": 1.0, "acquired_utc": "2026-01-01T00:00:00Z", "_pad": padding}
+    )
+    assert len(payload.encode("utf-8")) > MAX_LEASE_FILE_BYTES
+    target = lease_path(state_dir, pid=123)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(payload, encoding="utf-8")
+
+    assert read_lease(state_dir, pid=123) is None
+
+
+def test_touch_activity_treats_an_oversized_existing_stamp_as_unreadable_and_overwrites_it(
+    tmp_path,
+) -> None:
+    """[Gate 3a SHOULD-FIX] Given the EXISTING on-disk stamp is oversized
+    (per the size bound above) — this is the path that fires on EVERY
+    DB-touching command's write, not only the opt-in timer's reads.
+    When `touch_activity` is called.
+    Then it does not hang or crash: the oversized existing stamp is treated
+    as unreadable (equivalent to no existing stamp), so the monotonic
+    comparison is skipped and the new value is written normally."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    padding = "A" * (MAX_STAMP_FILE_BYTES + 1024)
+    payload = json.dumps({"last_active_utc": "2026-01-01T00:00:00Z", "_pad": padding})
+    activity_stamp_path(state_dir).write_text(payload, encoding="utf-8")
+
+    new_value = _dt(2026, 7, 28, 12, 0, 0)
+    touch_activity(state_dir=state_dir, now=lambda: new_value)
+    assert read_activity_stamp(state_dir) == new_value
+
+
+@pytest.mark.parametrize(
+    "target_kind", ["stamp", "lease"],
+)
+def test_read_degrades_to_none_when_the_expected_path_is_actually_a_directory(
+    tmp_path, target_kind: str,
+) -> None:
+    """[Gate 3a SHOULD-FIX] Given the path the reader expects to be a plain
+    file is actually a DIRECTORY (a plausible operator mistake, or a leftover
+    from an unrelated tool).
+    When the corresponding read function is called.
+    Then it returns None (never raises `IsADirectoryError`)."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    if target_kind == "stamp":
+        activity_stamp_path(state_dir).mkdir(parents=True)
+        assert read_activity_stamp(state_dir) is None
+    else:
+        lease_path(state_dir, pid=123).mkdir(parents=True)
+        assert read_lease(state_dir, pid=123) is None
+
+
+def _assert_read_call_does_not_hang(script_body: str) -> str:
+    """Run *script_body* in a SEPARATE subprocess with a hard timeout, so a
+    genuinely-hanging implementation fails this test deterministically
+    (a `TimeoutExpired` -> `pytest.fail`) rather than hanging the whole
+    suite. Returns the subprocess's stripped stdout on success."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script_body],
+            capture_output=True, text=True,
+            timeout=_SYMLINK_HANG_SUBPROCESS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"the read hung for more than {_SYMLINK_HANG_SUBPROCESS_TIMEOUT_S}s — it "
+            "must check the file's type (e.g. stat().st_mode) before ever "
+            "opening it, never block reading a FIFO/device with no writer."
+        )
+    assert result.returncode == 0, (
+        f"subprocess failed unexpectedly:\nstdout: {result.stdout!r}\nstderr: {result.stderr!r}"
+    )
+    return result.stdout.strip()
+
+
+def test_read_activity_stamp_on_a_symlink_to_a_fifo_degrades_promptly_not_hangs(
+    tmp_path,
+) -> None:
+    """[Gate 3a SHOULD-FIX] Given the stamp path is a symlink to a REAL
+    FIFO with no writer — a plain `open()`/`Path.read_text()` on such a FIFO
+    blocks INDEFINITELY at the OS level, since nothing will ever write to
+    it.
+    When `read_activity_stamp` is called against it, in a subprocess with
+    its own hard wall-clock bound (so a genuinely-hanging implementation
+    fails this test deterministically instead of hanging the suite).
+    Then it returns `None` promptly."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("os.mkfifo is not available on this platform.")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    fifo_path = tmp_path / "real_fifo"
+    os.mkfifo(fifo_path)
+    stamp_path = activity_stamp_path(state_dir)
+    stamp_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp_path.symlink_to(fifo_path)
+
+    script = (
+        "from partgraph.util.activity import read_activity_stamp\n"
+        f"print(read_activity_stamp({str(state_dir)!r}))\n"
+    )
+    stdout = _assert_read_call_does_not_hang(script)
+    assert stdout == "None", stdout
+
+
+def test_read_lease_on_a_symlink_to_a_fifo_degrades_promptly_not_hangs(tmp_path) -> None:
+    """[Gate 3a SHOULD-FIX] Mirrors the stamp test above, for the lease."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("os.mkfifo is not available on this platform.")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    fifo_path = tmp_path / "real_fifo"
+    os.mkfifo(fifo_path)
+    lease_target = lease_path(state_dir, pid=4242)
+    lease_target.parent.mkdir(parents=True, exist_ok=True)
+    lease_target.symlink_to(fifo_path)
+
+    script = (
+        "from partgraph.util.activity import read_lease\n"
+        f"print(read_lease({str(state_dir)!r}, pid=4242))\n"
+    )
+    stdout = _assert_read_call_does_not_hang(script)
+    assert stdout == "None", stdout

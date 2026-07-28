@@ -52,6 +52,22 @@ Pinned CLI contract this file exercises:
     idle-stop practically never fires, which is the SAFE direction already
     (nothing destructive happens either way).
 
+    [Gate 3b SHOULD-FIX, recorded rather than fixed] NO FLOOR is imposed on
+    an absurdly SMALL positive value either (e.g. `"0.001"`, a likely typo
+    for `"10"`), unlike the systemd cadence bound
+    (`tests/unit/test_systemd_idle_stop_units.py`'s own
+    `_SANE_CADENCE_FLOOR_S`), which DOES get a floor. The asymmetry is
+    deliberate, not an oversight: the systemd cadence directly controls how
+    OFTEN a `partgraph db idle-stop` PROCESS itself gets spawned — too
+    frequent genuinely wastes host resources (a real, unbounded-in-practice
+    cost). The idle-TIMEOUT value only controls the THRESHOLD a check
+    applies once it does run; an absurdly small one merely makes the
+    database look "idle" sooner, and C-4's live-lease check unconditionally
+    blocks the stop regardless of how small the timeout is — so the
+    downside of a typo here is "stops a little too eagerly, pays one extra
+    autostart round-trip next use," not lost or corrupted work. A
+    recommendation for a future PR, not a blocker for this one.
+
   - `partgraph.cli.ACTIVITY_STATE_DIR: Path` — a new, patchable module
     constant (mirrors `NORMALIZE_CHECKPOINT_PATH`/`LOAD_CHECKPOINT_PATH`'s
     own already-established `monkeypatch.setattr(cli_mod, "X", tmp_path /
@@ -88,7 +104,18 @@ Pinned CLI contract this file exercises:
          unattended, best-effort background action — a survivor there only
          costs continued idle memory, never correctness, so it must not
          make a systemd timer's own run accounting look like a failure the
-         way a HUMAN-typed `db down` correctly does).
+         way a HUMAN-typed `db down` correctly does). [Gate 3a BLOCKING
+         fix] "Always exit 0" MUST NOT collapse into "always silent": if
+         `result.survivors` or `result.undetermined` is non-empty, a
+         path-free stdout line naming the fact (e.g. containing "survivor"
+         or "could not verify") is STILL printed before exiting 0 — a
+         genuinely-failed stop must remain OBSERVABLE (e.g. via
+         `journalctl --user -u partgraph-db-idle-stop.service`) even though
+         the unit itself is never reported as failed. Proven below by
+         `test_idle_stop_exits_zero_but_prints_a_path_free_diagnostic_
+         when_a_survivor_remains` — every OTHER test reaching `stop_all` in
+         this file supplies a clean `DownResult` and therefore never
+         exercises this branch on its own.
 
 HERMETICITY: every test patches only `subprocess.run`,
 `partgraph.cli.compose_command`, `partgraph.cli.engine_command`,
@@ -191,16 +218,20 @@ _UNIT_NOT_FOUND_LINES = [
 ]
 
 
-def _make_scripted_run(
+def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptable outcome.
     *,
     initial_rows: list[dict],
     mounts_by_id: dict[str, list[dict]] | None = None,
     unit_lines: list[str] | None = None,
     compose_removes_ids: frozenset[str] = frozenset(),
     stop_returncode: int = 0,
+    stop_fails_ids: frozenset[str] = frozenset(),
 ):
     """A trimmed, local copy of test_cli_db_down.py's own stateful
-    subprocess.run fake — only the knobs THIS file's scenarios need."""
+    subprocess.run fake — only the knobs THIS file's scenarios need.
+    `stop_fails_ids` (Gate 3a BLOCKING fix) makes ONE specific container's
+    engine `stop` call fail while others succeed, so a genuine SURVIVOR can
+    be scripted without failing every stop in the scenario."""
     mounts_by_id = mounts_by_id or {}
     unit_lines = unit_lines if unit_lines is not None else _UNIT_NOT_FOUND_LINES
     live: dict[str, dict] = {row["Id"]: row for row in initial_rows}
@@ -221,6 +252,8 @@ def _make_scripted_run(
             return _Proc(stdout=json.dumps(list(live.values())))
         if _is_engine_stop_call(argv):
             target_id = argv[-1]
+            if target_id in stop_fails_ids:
+                return _Proc(returncode=1, stderr="stop failed")
             if target_id in live:
                 live[target_id] = {**live[target_id], "State": "exited"}
             return _Proc(returncode=stop_returncode)
@@ -519,6 +552,114 @@ def test_idle_stop_end_to_end_real_stop_all_stops_the_partgraph_instance(
     stop_calls = [argv for argv, _k in calls if _is_engine_stop_call(argv)]
     assert len(stop_calls) == 1, f"expected exactly one engine stop call: {calls!r}"
     assert stop_calls[0][-1] == "cid-1", "the stop target must be the container id"
+
+
+def test_idle_stop_exits_zero_but_prints_a_path_free_diagnostic_when_a_survivor_remains(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """[Gate 3a BLOCKING fix] Given the REAL `stop_all` sweep leaves a
+    genuine SURVIVOR — the underlying engine `stop` call for the sole
+    PartGraph instance FAILS (scripted via `stop_fails_ids`), so
+    `stop_all()`'s own verification re-enumeration finds it still running.
+    When `partgraph db idle-stop` runs.
+    Then it STILL exits 0 (idle-stop's own "always exit 0, unattended"
+    ruling) BUT its output is NOT empty and NOT silent: a path-free line
+    naming the survivor state is printed (containing "survivor", matching
+    `db down`'s own established vocabulary for the identical DownResult
+    field, so an operator grepping `journalctl` for either command finds
+    the same word) — "always exit 0" must never collapse into "always
+    silent"; a genuinely failed stop must remain observable even though the
+    unit itself is never reported as failed.
+    """
+    monkeypatch.delenv("PARTGRAPH_IDLE_TIMEOUT_MINUTES", raising=False)
+    state_dir = tmp_path / "state"
+    _seed_state_dir_stale_no_lease(state_dir)
+
+    row = _ps_row("cid-1", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4",
+                   host_ports=(8081, 9081, 8001))
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row],
+        mounts_by_id={"cid-1": _mounts(PARTGRAPH_DATA_VOLUME)},
+        stop_fails_ids=frozenset({"cid-1"}),
+    )
+
+    with (
+        patch.object(cli_mod, "ACTIVITY_STATE_DIR", state_dir),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(True)),
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+        patch("partgraph.cli.ensure_running", side_effect=_forbid_ensure_running),
+    ):
+        result = _invoke(["db", "idle-stop"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() != "", (
+        "a genuinely-failed stop must never be reported silently, even "
+        "though idle-stop still exits 0"
+    )
+    assert "survivor" in result.output.lower(), (
+        f"expected the output to name the survivor state (matching db "
+        f"down's own vocabulary): {result.output!r}"
+    )
+    assert PARTGRAPH_CONTAINER_NAME in result.output or "cid-1" not in result.output, (
+        "the diagnostic must never leak the opaque container ID as if it "
+        "were a path — display names only, exactly like db down"
+    )
+    assert "/" not in result.output, (
+        f"the diagnostic line(s) must stay path-free: {result.output!r}"
+    )
+
+
+def test_idle_stop_exits_zero_but_prints_a_path_free_diagnostic_when_undetermined_remains(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """[Gate 3a BLOCKING fix] Mirrors the survivor test above for the
+    DISTINCT `result.undetermined` case (an inspect failure during
+    verification, never conflated with a confirmed survivor — see
+    `test_cli_db_down.py`'s own Gate 5 finding A). Given the verification
+    pass cannot confirm a row's ownership (a scripted `container inspect`
+    failure) on a row that also holds a watched PartGraph port.
+    When `partgraph db idle-stop` runs.
+    Then it exits 0 but prints a NON-EMPTY, path-free diagnostic containing
+    "could not verify" (never "survivor" — the two must stay textually
+    distinct, mirroring `db down`'s own established distinction).
+    """
+    monkeypatch.delenv("PARTGRAPH_IDLE_TIMEOUT_MINUTES", raising=False)
+    state_dir = tmp_path / "state"
+    _seed_state_dir_stale_no_lease(state_dir)
+
+    row = _ps_row("cid-unknown", "systemd-partgraph-dgraph-duplicate",
+                   "dgraph/standalone:v25.3.4", host_ports=(8081,))
+    fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+
+    real_run = fake_run
+
+    def _inspect_fails_on_verification(argv, **kwargs):
+        if _is_inspect_call(argv):
+            return _Proc(returncode=1, stderr="inspect failed")
+        return real_run(argv, **kwargs)
+
+    with (
+        patch.object(cli_mod, "ACTIVITY_STATE_DIR", state_dir),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(True)),
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("subprocess.run", side_effect=_inspect_fails_on_verification),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+        patch("partgraph.cli.ensure_running", side_effect=_forbid_ensure_running),
+    ):
+        result = _invoke(["db", "idle-stop"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() != ""
+    assert "could not verify" in result.output.lower(), (
+        f"expected an undetermined-state diagnostic: {result.output!r}"
+    )
+    assert "/" not in result.output, (
+        f"the diagnostic line(s) must stay path-free: {result.output!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
