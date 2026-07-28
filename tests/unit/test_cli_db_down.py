@@ -29,10 +29,19 @@ original design before partgraph.util.health existed):
   - `stop_all()`'s internal order is EXACTLY: (1) if the systemd unit is
     present+active, `systemctl --user stop <PARTGRAPH_UNIT_NAME>`; (2) the
     injected `compose_down` callback (`<engine> compose -f <abs> down`,
-    never `-v`); (3) `<engine> stop -t <n> <name>` for every SURVIVING S1/S2
-    instance (S3 port holders are NEVER stopped); (4) a final verification
-    re-enumeration. Every one of these is skipped under `dry_run=True` except
-    the READ-ONLY unit_state()/find_partgraph_instances() calls.
+    never `-v`) — REQUIRED, keyword-only, no default (Gate 3b finding
+    3b-M1); an EXCEPTION it raises propagates OUT of stop_all() unmodified
+    and short-circuits phases 3/4 entirely (3b-M2; pinned at leaf level in
+    tests/unit/test_lifecycle.py, not re-tested here); (3) `<engine> stop -t
+    <n> <id>` for every SURVIVING S1/S2 instance, targeted by the
+    instance's opaque container ID — NEVER its name (Gate 3a finding 3a-H1;
+    S2 classifies by volume mount, independent of name, so a name-targeted
+    stop would reopen a TOCTOU window) — S3 port holders are NEVER stopped;
+    (4) a final verification re-enumeration. Every one of these is skipped
+    under `dry_run=True` except the READ-ONLY
+    unit_state()/find_partgraph_instances() calls. `DownResult`'s tuples
+    (`stopped`/`survivors`/`skipped_foreign_port_holders`) still carry
+    NAMES — display-only, never the ids used as engine `stop` targets.
   - Exit-code formula: `result.survivors` non-empty -> exit 1 (A8); else if
     `result.still_serving_health` -> exit 0 + one advisory stderr line (A9);
     else exit 0. `--dry-run` always exits 0.
@@ -155,7 +164,7 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
     systemctl_stop_returncode: int = 0,
     systemctl_stop_removes_ids: frozenset[str] = frozenset(),
     stop_returncode: int = 0,
-    stop_fails_names: frozenset[str] = frozenset(),
+    stop_fails_ids: frozenset[str] = frozenset(),
     systemctl_stop_raises: Exception | None = None,
     ps_raises_on_call_index: int | None = None,
 ):
@@ -165,7 +174,9 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
     stop/compose-down/systemctl-stop mutates it exactly as a real engine
     would, so a SECOND `ps` call (the verification re-enumeration) genuinely
     reflects what survived. ``calls`` records every (argv, kwargs) pair in
-    order for ordering/timeout/argv assertions.
+    order for ordering/timeout/argv assertions. The engine `stop` TARGET
+    (``argv[-1]``) is always a container ID (Gate 3a finding 3a-H1) —
+    ``stop_fails_ids``/removal-from-``live`` are keyed by id, never by name.
     """
     mounts_by_id = mounts_by_id or {}
     unit_lines = unit_lines if unit_lines is not None else _UNIT_NOT_FOUND_LINES
@@ -199,12 +210,10 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
                 raise subprocess.TimeoutExpired(cmd=argv, timeout=10)
             return _Proc(stdout=json.dumps(list(live.values())))
         if _is_engine_stop_call(argv):
-            name = argv[-1]
-            if name in stop_fails_names:
+            target_id = argv[-1]
+            if target_id in stop_fails_ids:
                 return _Proc(returncode=1, stderr="stop failed")
-            for cid, row in list(live.items()):
-                if row["Names"][0] == name:
-                    live.pop(cid, None)
+            live.pop(target_id, None)
             return _Proc(returncode=stop_returncode)
         raise AssertionError(f"unscripted subprocess.run call in test fixture: {argv}")
 
@@ -426,8 +435,12 @@ def test_a5_two_matching_containers_each_stopped_once_exit_zero() -> None:
     name (S1) and one matching by mounted data volume (S2, a different
     name).
     When `partgraph db down` runs.
-    Then both names appear in exactly one `stop` argv each, and the exit
-    code is 0 only because verification finds neither surviving.
+    Then both underlying `stop` calls target the container ID — NEVER the
+    name (Gate 3a finding 3a-H1: S2 in particular is name-independent, so
+    stopping by name would reopen a TOCTOU window) — exactly one stop call
+    per instance; the human-readable NAMES still surface in the CLI's
+    output (DownResult's display fields), and the exit code is 0 only
+    because verification finds neither surviving.
     """
     row_s1 = _ps_row("cid-s1", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
     row_s2 = _ps_row("cid-s2", "systemd-partgraph-dgraph-duplicate", "dgraph/standalone:v25.3.4")
@@ -447,10 +460,18 @@ def test_a5_two_matching_containers_each_stopped_once_exit_zero() -> None:
 
     assert result.exit_code == 0, result.output
     stop_calls = [argv for argv, _k in calls if _is_engine_stop_call(argv)]
-    stopped_targets = [argv[-1] for argv in stop_calls]
-    assert stopped_targets.count(PARTGRAPH_CONTAINER_NAME) == 1
-    assert stopped_targets.count("systemd-partgraph-dgraph-duplicate") == 1
+    stopped_ids = [argv[-1] for argv in stop_calls]
+    assert stopped_ids.count("cid-s1") == 1
+    assert stopped_ids.count("cid-s2") == 1
     assert len(stop_calls) == 2
+    assert PARTGRAPH_CONTAINER_NAME not in stopped_ids, (
+        "the stop TARGET must be the container id, never the name"
+    )
+    assert "systemd-partgraph-dgraph-duplicate" not in stopped_ids
+    assert (
+        PARTGRAPH_CONTAINER_NAME in result.output
+        or "systemd-partgraph-dgraph-duplicate" in result.output
+    ), "the human-readable NAME must still surface somewhere in the CLI output"
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +598,7 @@ def test_a8_surviving_instance_after_verification_exits_one_and_names_it() -> No
     row = _ps_row("cid-1", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
     fake_run, _calls = _make_scripted_run(
         initial_rows=[row], mounts_by_id={"cid-1": []},
-        compose_removes_ids=frozenset(), stop_fails_names=frozenset({PARTGRAPH_CONTAINER_NAME}),
+        compose_removes_ids=frozenset(), stop_fails_ids=frozenset({"cid-1"}),
     )
     with (
         patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
@@ -811,6 +832,37 @@ def test_a13_compose_command_raises_container_engine_error_exit_one_no_traceback
         assert not isinstance(result.exception, ContainerEngineError)
 
 
+def test_a13b_engine_command_raises_container_engine_error_exit_one_no_traceback() -> None:
+    """A13b [3a-H2]: Given compose_command() succeeds (a usable compose
+    plugin IS resolvable) but engine_command() raises ContainerEngineError —
+    the SIBLING failure path to A13: `db down` resolves TWO independent
+    engine prefixes (one via compose_command() for the compose call, one via
+    engine_command() for the enumeration/stop sweep), and either one failing
+    must be caught identically.
+    When `partgraph db down` runs.
+    Then exactly one clean stderr "Error" message is printed, the exit code
+    is 1, and no traceback ever reaches the user's terminal.
+    """
+    fake_run, _calls = _make_scripted_run(initial_rows=[])
+    with (
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch(
+            "partgraph.cli.engine_command",
+            side_effect=ContainerEngineError("no engine"),
+        ),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "down"])
+
+    assert result.exit_code == 1
+    assert "Error" in result.output
+    assert "Traceback" not in result.output
+    if result.exception is not None:
+        assert not isinstance(result.exception, ContainerEngineError)
+
+
 # ---------------------------------------------------------------------------
 # A14 — hostile enumerated name never reaches the engine
 # ---------------------------------------------------------------------------
@@ -969,7 +1021,7 @@ def test_down_messages_are_single_line_path_free(scenario: str) -> None:
         fake_run, _calls = _make_scripted_run(
             initial_rows=[row], mounts_by_id={"cid-1": []},
             compose_removes_ids=frozenset(),
-            stop_fails_names=frozenset({PARTGRAPH_CONTAINER_NAME}),
+            stop_fails_ids=frozenset({"cid-1"}),
         )
         probe = _healthy(False)
         expect_exit = 1

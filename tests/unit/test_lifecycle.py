@@ -20,13 +20,27 @@ Imports: stdlib only, plus ``partgraph.util.container``
 (``probe_health``). NEVER imports ``partgraph.cli`` or any embed/query/load
 module (leaf discipline; mirrors container.py / health.py / index_health.py).
 NOT re-exported from ``partgraph/util/__init__.py`` (ADR-0018 Section 4
-precedent, set by index_health.py).
+precedent, set by index_health.py). Two ARCHITECTURE-level regressions this
+file cannot mechanically enforce on itself (its own top-level import already
+hard-fails collection until the module exists, so any test-level "skip if
+absent" logic placed HERE would be unreachable dead code) live instead in
+``tests/unit/test_lifecycle_architecture.py``, which imports nothing from
+``partgraph.util.lifecycle`` at module level and therefore always collects:
+the "no hard-coded docker/podman literal" static scan, the "never imports
+partgraph.cli/embed/query/load" static scan (Gate 3b finding 3b-H1), and the
+"partgraph.util does not re-export lifecycle's functions" check (3b-L2).
 
 Module constants (frozen, named — never derived at runtime):
   - ``PARTGRAPH_CONTAINER_NAME: str`` = "partgraph-dgraph" — the S1 selector:
     the EXACT container name docker/docker-compose.yml declares.
   - ``PARTGRAPH_DATA_VOLUME: str`` = "partgraph_dgraph_data" — the S2
-    selector: the named data volume declared in docker-compose.yml.
+    selector: the named data volume declared in docker-compose.yml. Matched
+    by EXACT string equality only — never ``.startswith()``/``.endswith()``
+    (a live in-repo precedent, tests/integration/test_dgraph_lifecycle.py's
+    OWN `.endswith("partgraph_dgraph_data")` mount check, exists for a
+    DIFFERENT, legitimate reason there and must NOT be copied into this
+    selector, where it would wrongly match e.g.
+    ``partgraph_dgraph_data_backup`` — Gate 3a finding 3a-H4).
   - ``PARTGRAPH_UNIT_NAME: str`` = "partgraph-dgraph.service" — the quadlet
     unit name. A FROZEN CONSTANT: never built from any engine-returned string
     (Sec finding — a poisoned container name must never be able to influence
@@ -39,38 +53,68 @@ Module constants (frozen, named — never derived at runtime):
     HEALTH_PROBE_TIMEOUT_S / ADR-0007's bounded-constant precedent). NEVER
     ``None`` (unbounded).
   - ``STOP_GRACE_SECONDS: int`` — the engine's OWN ``-t`` grace-period value
-    passed to ``stop -t <n> <name>`` (distinct from the Python-level
-    subprocess ``timeout=`` kwarg above).
+    passed to ``stop -t <n> <id>`` (distinct from the Python-level subprocess
+    ``timeout=`` kwarg above).
+  - ``MAX_PS_OUTPUT_BYTES: int`` — a finite, named ceiling on the byte length
+    of ``ps``'s stdout the parser will even ATTEMPT to decode (Gate 3a finding
+    3a-M5). Extends the same bounded-constant discipline to untrusted engine
+    OUTPUT, not just to timeouts: output at or beyond this bound is treated as
+    malformed (degrades to an empty result, never raises, never attempts to
+    ``json.loads`` an unbounded payload).
 
 Frozen dataclasses:
-  - ``Instance(name: str, image: str, status: str, ports: tuple[int, ...],
-    owned_by: str, mounts_data_volume: bool)`` — ``owned_by`` is one of the
-    literal strings ``"S1"``/``"S2"``/``"S3"``. Only S1/S2/S3-classified
-    containers are ever returned by :func:`find_partgraph_instances` — an
-    unrelated container (e.g. every cve-graph container) is excluded
-    entirely, never present in the returned tuple with some other tag.
+  - ``Instance(id: str, name: str, image: str, status: str,
+    ports: tuple[int, ...], owned_by: str, mounts_data_volume: bool)`` —
+    ``owned_by`` is one of the literal strings ``"S1"``/``"S2"``/``"S3"``.
+    Only S1/S2/S3-classified containers are ever returned by
+    :func:`find_partgraph_instances` — an unrelated container (e.g. every
+    cve-graph container) is excluded entirely, never present in the returned
+    tuple with some other tag. ``id`` is the engine-assigned, opaque
+    container ID: it is the ONLY value :func:`stop_all` ever uses as an
+    engine ``stop``/``container inspect`` TARGET (Gate 3a finding 3a-H1) —
+    ``name`` is for DISPLAY only. This matters because S2 classifies by
+    volume mount, independent of name: stopping by NAME would reopen a
+    TOCTOU window between the survivor enumeration and the stop call (a
+    different container could, in principle, come to answer to that name in
+    between), whereas an engine-assigned ID cannot be reused by a different
+    live container.
   - ``UnitState(present: bool, load_state: str | None,
     active_state: str | None, wanted_by_default: bool | None)`` —
     ``wanted_by_default`` is ``None`` when undeterminable (NEVER guessed).
   - ``DownResult(stopped: tuple[str, ...],
     skipped_foreign_port_holders: tuple[str, ...], unit_stopped: bool,
-    survivors: tuple[str, ...], still_serving_health: bool)``.
+    survivors: tuple[str, ...], still_serving_health: bool)``. Every tuple
+    here carries NAMES (never ids) — DownResult is the display-facing DTO.
+    Unlike :class:`~partgraph.util.health.HealthResult` and
+    :class:`~partgraph.util.index_health.IndexIntegrityResult`, DownResult
+    deliberately carries NO ``message: str`` field (Gate 3b finding 3b-L1):
+    every user-facing string `db down` prints (the A8 survivor line, the A9
+    unowned-port advisory, the plain success line) is composed in cli.py
+    from DownResult's structured fields, keeping ALL of `db down`'s
+    user-facing text in ONE place rather than splitting it across the leaf
+    and the CLI the way `db status`/`db check-index` do.
 
 Public functions (the ONLY public surface; everything else is private):
   - ``find_partgraph_instances(*, engine_prefix: list[str] | None = None,
     which=shutil.which, environ=None) -> tuple[Instance, ...]`` — READ-ONLY.
-    Runs ``<prefix> ps --all --format json`` (never ``--filter``), then, for
-    EVERY returned container, ``<prefix> container inspect --format json
-    <container-id>`` (by opaque ID — NEVER by name, so a foreign container's
-    NAME never reaches an inspect argv) to determine
-    :attr:`Instance.mounts_data_volume`. Classifies ownership by exact Python
-    string comparison (S1: name == PARTGRAPH_CONTAINER_NAME; S2: mounts
-    PARTGRAPH_DATA_VOLUME; S3: holds a PARTGRAPH_WATCHED_PORTS host port and
-    matches neither S1 nor S2). A name failing a strict, hostile-input
-    charset check is EXCLUDED before classification — it is never returned,
-    and its raw string never reaches any subprocess argv. ``engine_prefix``
-    defaults to :func:`partgraph.util.container.engine_command`'s result when
-    ``None`` (resolved with the given ``which``/``environ``).
+    Runs ``<prefix> ps --all --format json`` (never ``--filter``), bounded to
+    :data:`MAX_PS_OUTPUT_BYTES`. For EVERY successfully-parsed row carrying
+    both a non-empty ``Names`` list and an ``Id`` (a row missing either, an
+    empty ``Names`` list, or a non-dict array element is SKIPPED — never
+    crashes the whole enumeration, Gate 3a finding 3a-H3), runs ``<prefix>
+    container inspect --format json <container-id>`` (by opaque ID — NEVER by
+    name, so a foreign container's NAME never reaches an inspect argv) to
+    determine :attr:`Instance.mounts_data_volume`. Classifies ownership by
+    EXACT Python string comparison (S1: name == PARTGRAPH_CONTAINER_NAME; S2:
+    a mounted volume name == PARTGRAPH_DATA_VOLUME, never a
+    prefix/suffix/substring match; S3: holds a PARTGRAPH_WATCHED_PORTS host
+    port and matches neither S1 nor S2). A name failing a strict, POSITIVE
+    allow-list charset check (the Docker/podman container-name grammar
+    ``^[a-zA-Z0-9][a-zA-Z0-9_.-]*$``, Gate 3a finding 3a-M7) is EXCLUDED
+    before classification — it is never returned, and its raw string never
+    reaches any subprocess argv. ``engine_prefix`` defaults to
+    :func:`partgraph.util.container.engine_command`'s result when ``None``
+    (resolved with the given ``which``/``environ``).
   - ``unit_state(*, which=shutil.which) -> UnitState`` — READ-ONLY. Runs
     ``systemctl --user show <PARTGRAPH_UNIT_NAME> --property=LoadState
     --property=ActiveState --property=SubState --property=UnitFileState
@@ -78,30 +122,45 @@ Public functions (the ONLY public surface; everything else is private):
     ``UnitState(present=False, ...)`` WITHOUT invoking subprocess at all when
     ``which("systemctl")`` is ``None``.
   - ``stop_all(*, engine_prefix=None, which=shutil.which, environ=None,
-    compose_down: Callable[[], None] | None = None,
-    probe_health: Callable[[], Any] | None = None,
-    dry_run: bool = False) -> DownResult`` — the full orchestrator. Order:
-    (1) query :func:`unit_state`; if present and active, run ``systemctl
-    --user stop <PARTGRAPH_UNIT_NAME>`` (skipped entirely under
-    ``dry_run=True``); (2) call the injected ``compose_down`` callback
-    (skipped under ``dry_run=True``; never called with ``None`` under a real
-    run); (3) call :func:`find_partgraph_instances` and, for every SURVIVING
-    S1/S2 instance, run ``<prefix> stop -t <STOP_GRACE_SECONDS> <name>``
-    (skipped under ``dry_run=True`` — enumeration/inspection still happens,
-    nothing is stopped); (4) call :func:`find_partgraph_instances` AGAIN
-    (verification re-enumeration) to populate ``survivors``. ``probe_health``
-    defaults to a lazy import of :func:`partgraph.util.health.probe_health`
-    when ``None``; the injected seam is how `partgraph.cli`'s ALREADY
-    module-level-imported ``probe_health`` (patched by CLI tests at
-    ``partgraph.cli.probe_health``) flows through to this leaf without the
-    leaf importing anything from ``partgraph.cli``.
+    compose_down: Callable[[], None], probe_health: Callable[[], Any] | None
+    = None, dry_run: bool = False) -> DownResult`` — the full orchestrator.
+    ``compose_down`` is REQUIRED, keyword-only, and carries NO default (Gate
+    3b finding 3b-M1): a caller must decide EXPLICITLY whether/how compose is
+    invoked rather than silently no-op-ing phase 2 — this forces every future
+    caller (PR-B2's ``ensure_running()``, PR-C's ``should_stop_for_idle()``)
+    to make that call explicitly rather than inheriting a permissive
+    default. Order: (1) query :func:`unit_state`; if present and active, run
+    ``systemctl --user stop <PARTGRAPH_UNIT_NAME>`` (skipped entirely under
+    ``dry_run=True``; a FAILURE here — non-zero exit or a timeout — is
+    ABSORBED: phases 2-4 still run, A12); (2) call the injected
+    ``compose_down`` callback (skipped under ``dry_run=True``). Unlike phase
+    1, an EXCEPTION raised by ``compose_down`` propagates OUT of
+    :func:`stop_all` completely UNMODIFIED and short-circuits phases 3 and 4
+    entirely (Gate 3b finding 3b-M2) — a sharp, deliberate asymmetry: a
+    failed systemd-unit stop is survivable, a failed compose invocation is
+    not; (3) call :func:`find_partgraph_instances` and, for every SURVIVING
+    S1/S2 instance, run ``<prefix> stop -t <STOP_GRACE_SECONDS> <id>``
+    (target is the instance's ``id``, never its ``name`` — skipped under
+    ``dry_run=True``, enumeration/inspection still happens, nothing is
+    stopped); (4) call :func:`find_partgraph_instances` AGAIN (verification
+    re-enumeration) to populate ``survivors`` (by NAME, for display).
+    ``probe_health`` defaults to a lazy import of
+    :func:`partgraph.util.health.probe_health` when ``None``; the injected
+    seam is how `partgraph.cli`'s ALREADY module-level-imported
+    ``probe_health`` (patched by CLI tests at ``partgraph.cli.probe_health``)
+    flows through to this leaf without the leaf importing anything from
+    ``partgraph.cli``.
 
 This file mirrors the hermetic, injected-seam style of test_container.py
 (fake ``which``) and test_health.py (fake HTTP seam / dataclass-contract
 checks): no test in this file opens a real socket, starts a real container,
 sleeps, or reads the real wall clock. Every subprocess outcome is injected via
-a scripted fake ``subprocess.run`` (patched at the ``subprocess.run`` call
-site, mirroring how cli.py's own ``_run_compose`` is tested).
+a scripted, STATEFUL fake ``subprocess.run`` (patched at the
+``subprocess.run`` call site, mirroring how cli.py's own ``_run_compose`` is
+tested, and mirroring tests/unit/test_cli_db_down.py's stateful
+``_make_scripted_run`` — a successful ``stop`` genuinely removes a container
+from what the NEXT ``ps`` call reports, so "survived the stop" and "was
+stopped" are distinguishable, not a static snapshot).
 """
 
 from __future__ import annotations
@@ -110,7 +169,6 @@ import dataclasses
 import inspect
 import json
 import math
-import re
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -127,6 +185,7 @@ import pytest
 from partgraph.util.lifecycle import (  # noqa: E402
     ENUMERATE_TIMEOUT_S,
     INSPECT_TIMEOUT_S,
+    MAX_PS_OUTPUT_BYTES,
     PARTGRAPH_CONTAINER_NAME,
     PARTGRAPH_DATA_VOLUME,
     PARTGRAPH_UNIT_NAME,
@@ -198,7 +257,7 @@ def _is_inspect_call(argv: list[str]) -> bool:
 
 
 def _is_engine_stop_call(argv: list[str]) -> bool:
-    return argv and argv[0] != "systemctl" and "stop" in argv and "compose" not in argv
+    return bool(argv) and argv[0] != "systemctl" and "stop" in argv and "compose" not in argv
 
 
 def _is_systemctl_show_call(argv: list[str]) -> bool:
@@ -209,32 +268,42 @@ def _is_systemctl_stop_call(argv: list[str]) -> bool:
     return bool(argv) and argv[0] == "systemctl" and "stop" in argv and "show" not in argv
 
 
-def _make_scripted_run(
+_UNIT_NOT_FOUND_LINES = [
+    "LoadState=not-found", "ActiveState=", "SubState=", "UnitFileState=", "WantedBy=",
+]
+
+
+def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptable outcome.
     *,
-    ps_rows: list[dict],
+    initial_rows: list[dict],
     mounts_by_id: dict[str, list[dict]] | None = None,
     unit_lines: list[str] | None = None,
     ps_stdout_override: str | None = None,
+    stop_returncode: int = 0,
+    stop_fails_ids: frozenset[str] = frozenset(),
+    ps_raises_on_call_index: int | None = None,
 ):
-    """Return (fake_run, calls) — a subprocess.run stand-in and its call log.
+    """Return (fake_run, calls) — a STATEFUL subprocess.run stand-in.
 
-    ``fake_run`` dispatches on argv shape (never trusts call ORDER) so a test
-    can describe WHAT is running rather than HOW the module discovers it.
-    ``ps_stdout_override`` lets a test replace the ps response body verbatim
-    (empty string / malformed text) while still routing through the same
-    dispatcher for inspect/systemctl calls.
+    ``fake_run`` dispatches on argv shape (never trusts call ORDER). ``live``
+    is the in-memory {container_id: row} set; a successful engine `stop`
+    (target NOT in ``stop_fails_ids``) mutates it exactly as a real engine
+    would, so a SECOND `ps` call (a verification re-enumeration) genuinely
+    reflects what survived — "survived the stop" and "was stopped" are
+    therefore distinguishable, mirroring
+    tests/unit/test_cli_db_down.py's `_make_scripted_run` (Gate 3a finding
+    3a-M6). ``ps_stdout_override`` lets a test replace the ps response body
+    verbatim (empty string / malformed text / an oversized payload) for
+    every ps call. ``calls`` records every (argv, kwargs) pair in order.
     """
     mounts_by_id = mounts_by_id or {}
-    unit_lines = unit_lines if unit_lines is not None else [
-        "LoadState=not-found",
-        "ActiveState=",
-        "SubState=",
-        "UnitFileState=",
-        "WantedBy=",
-    ]
+    unit_lines = unit_lines if unit_lines is not None else _UNIT_NOT_FOUND_LINES
+    live: dict[str, dict] = {row["Id"]: row for row in initial_rows}
     calls: list[tuple[list[str], dict]] = []
+    ps_call_count = 0
 
-    def _fake(argv, **kwargs):
+    def _fake(argv, **kwargs):  # noqa: PLR0911 — one branch per scriptable verb.
+        nonlocal ps_call_count
         calls.append((list(argv), dict(kwargs)))
         if _is_systemctl_show_call(argv):
             return _Proc(stdout="\n".join(unit_lines))
@@ -244,11 +313,18 @@ def _make_scripted_run(
             cid = argv[-1]
             return _Proc(stdout=json.dumps([{"Id": cid, "Mounts": mounts_by_id.get(cid, [])}]))
         if _is_ps_call(argv):
+            ps_call_count += 1
+            if ps_raises_on_call_index == ps_call_count:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=10)
             if ps_stdout_override is not None:
                 return _Proc(stdout=ps_stdout_override)
-            return _Proc(stdout=json.dumps(ps_rows))
+            return _Proc(stdout=json.dumps(list(live.values())))
         if _is_engine_stop_call(argv):
-            return _Proc(returncode=0)
+            target_id = argv[-1]
+            if target_id in stop_fails_ids:
+                return _Proc(returncode=1, stderr="stop failed")
+            live.pop(target_id, None)
+            return _Proc(returncode=stop_returncode)
         raise AssertionError(f"unscripted subprocess.run call in test fixture: {argv}")
 
     return _fake, calls
@@ -296,6 +372,18 @@ def test_stop_grace_seconds_is_a_positive_bounded_int() -> None:
     assert STOP_TIMEOUT_S > STOP_GRACE_SECONDS
 
 
+def test_max_ps_output_bytes_is_a_finite_positive_bound() -> None:
+    """[3a-M5] Given MAX_PS_OUTPUT_BYTES bounds how much of `ps`'s stdout the
+    parser will even attempt to decode.
+    When the constant is read directly.
+    Then it is a positive int (a genuine, finite ceiling — mirrors
+    HEALTH_PROBE_TIMEOUT_S/INDEX_PROBE_TIMEOUT_S's bounded-constant
+    discipline, extended here to untrusted engine OUTPUT rather than time).
+    """
+    assert isinstance(MAX_PS_OUTPUT_BYTES, int)
+    assert MAX_PS_OUTPUT_BYTES > 0
+
+
 # ---------------------------------------------------------------------------
 # CONTRACT — dataclass shapes
 # ---------------------------------------------------------------------------
@@ -307,13 +395,15 @@ def test_dataclasses_are_frozen_with_exact_contract_fields() -> None:
     When each is instantiated.
     Then each exposes EXACTLY its pinned field set and is frozen (a consumer
     cannot mutate a result after the fact — mirrors HealthResult).
+    Instance's field set includes ``id`` (Gate 3a finding 3a-H1) alongside
+    the display-only ``name``.
     """
     instance = Instance(
-        name="partgraph-dgraph", image="dgraph/standalone:v25.3.4",
+        id="cid-abc123", name="partgraph-dgraph", image="dgraph/standalone:v25.3.4",
         status="running", ports=(8081,), owned_by="S1", mounts_data_volume=True,
     )
     assert {f.name for f in dataclasses.fields(instance)} == {
-        "name", "image", "status", "ports", "owned_by", "mounts_data_volume",
+        "id", "name", "image", "status", "ports", "owned_by", "mounts_data_volume",
     }
     with pytest.raises(dataclasses.FrozenInstanceError):
         instance.owned_by = "S2"  # type: ignore[misc]
@@ -359,18 +449,19 @@ def test_parse_ps_json_array() -> None:
     JSON ARRAY (podman's documented outer shape).
     When find_partgraph_instances() is called.
     Then the exact-name match is parsed into an S1 Instance with the right
-    name/image/status/ports.
+    id/name/image/status/ports.
     """
     rows = [_ps_row("id-s1", "partgraph-dgraph", "dgraph/standalone:v25.3.4",
                      host_ports=(8081, 9081, 8001))]
     fake_run, _calls = _make_scripted_run(
-        ps_rows=rows, mounts_by_id={"id-s1": _mounts("partgraph_dgraph_data")},
+        initial_rows=rows, mounts_by_id={"id-s1": _mounts("partgraph_dgraph_data")},
     )
     with patch("subprocess.run", side_effect=fake_run):
         instances = find_partgraph_instances(engine_prefix=["docker"])
 
     assert len(instances) == 1
     inst = instances[0]
+    assert inst.id == "id-s1"
     assert inst.name == "partgraph-dgraph"
     assert inst.image == "dgraph/standalone:v25.3.4"
     assert inst.status == "running"
@@ -390,13 +481,14 @@ def test_parse_ps_ndjson() -> None:
                    host_ports=(8081, 9081, 8001))
     ndjson = json.dumps(row) + "\n"
     fake_run, _calls = _make_scripted_run(
-        ps_rows=[row], mounts_by_id={"id-s1": _mounts("partgraph_dgraph_data")},
+        initial_rows=[row], mounts_by_id={"id-s1": _mounts("partgraph_dgraph_data")},
         ps_stdout_override=ndjson,
     )
     with patch("subprocess.run", side_effect=fake_run):
         instances = find_partgraph_instances(engine_prefix=["docker"])
 
     assert len(instances) == 1
+    assert instances[0].id == "id-s1"
     assert instances[0].name == "partgraph-dgraph"
     assert instances[0].owned_by == "S1"
 
@@ -407,7 +499,7 @@ def test_parse_ps_empty_returns_empty() -> None:
     When find_partgraph_instances() is called.
     Then it returns an empty tuple — never raises.
     """
-    fake_run, _calls = _make_scripted_run(ps_rows=[], ps_stdout_override="")
+    fake_run, _calls = _make_scripted_run(initial_rows=[], ps_stdout_override="")
     with patch("subprocess.run", side_effect=fake_run):
         instances = find_partgraph_instances(engine_prefix=["docker"])
     assert instances == ()
@@ -420,11 +512,127 @@ def test_parse_ps_malformed_returns_empty() -> None:
     Then it returns an empty tuple — never raises, never crashes `db down`.
     """
     fake_run, _calls = _make_scripted_run(
-        ps_rows=[], ps_stdout_override="{not json at all]###"
+        initial_rows=[], ps_stdout_override="{not json at all]###"
     )
     with patch("subprocess.run", side_effect=fake_run):
         instances = find_partgraph_instances(engine_prefix=["docker"])
     assert instances == ()
+
+
+def test_ps_output_exceeding_bound_treated_as_malformed() -> None:
+    """[3a-M5] Given `ps`'s stdout is LARGER than MAX_PS_OUTPUT_BYTES bytes (a
+    hostile/wedged engine flooding the response).
+    When find_partgraph_instances() is called.
+    Then the oversized payload is treated as malformed WITHOUT attempting to
+    `json.loads` it — degrades to an empty tuple, never raises, never spends
+    unbounded time/memory decoding an unbounded response (extends the
+    existing timeout-bound discipline to output SIZE).
+    """
+    oversized = "[" + ("1234567890" * ((MAX_PS_OUTPUT_BYTES // 10) + 10)) + "]"
+    assert len(oversized.encode("utf-8")) > MAX_PS_OUTPUT_BYTES
+    fake_run, _calls = _make_scripted_run(initial_rows=[], ps_stdout_override=oversized)
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+    assert instances == ()
+
+
+# ---------------------------------------------------------------------------
+# [3a-H3] Per-row malformed ps JSON — one bad row must never crash the whole
+# enumeration, and other well-formed rows in the SAME batch must still be
+# classified correctly (degrade to omission of the bad row, never to a global
+# empty set or a crash).
+# ---------------------------------------------------------------------------
+
+
+def test_parse_ps_row_missing_names_excluded_not_crashed() -> None:
+    """[3a-H3] Given a batch with one row missing the `Names` key entirely
+    alongside one well-formed S1 row.
+    When find_partgraph_instances() is called.
+    Then the malformed row is silently skipped and the well-formed row is
+    still classified correctly — no exception propagates.
+    """
+    good = _ps_row("id-good", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+    bad = {"Id": "id-bad", "Image": "dgraph/standalone:v25.3.4", "State": "running", "Ports": []}
+    stdout = json.dumps([bad, good])
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[], mounts_by_id={"id-good": []}, ps_stdout_override=stdout,
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    names = {i.name for i in instances}
+    assert names == {PARTGRAPH_CONTAINER_NAME}, (
+        f"a row missing 'Names' must be skipped, not crash the batch: {instances!r}"
+    )
+
+
+def test_parse_ps_row_empty_names_list_excluded_not_crashed() -> None:
+    """[3a-H3] Given a batch with one row whose `Names` is an EMPTY list
+    alongside one well-formed S1 row.
+    When find_partgraph_instances() is called.
+    Then the malformed row is silently skipped (no IndexError) and the
+    well-formed row is still classified correctly.
+    """
+    good = _ps_row("id-good", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+    bad = {"Id": "id-bad", "Names": [], "Image": "x", "State": "running", "Ports": []}
+    stdout = json.dumps([bad, good])
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[], mounts_by_id={"id-good": []}, ps_stdout_override=stdout,
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    names = {i.name for i in instances}
+    assert names == {PARTGRAPH_CONTAINER_NAME}, (
+        f"a row with an empty 'Names' list must be skipped, not crash: {instances!r}"
+    )
+
+
+def test_parse_ps_row_non_dict_element_excluded_not_crashed() -> None:
+    """[3a-H3] Given the ps JSON array contains a NON-DICT element (a bare
+    string) alongside one well-formed S1 row.
+    When find_partgraph_instances() is called.
+    Then the non-dict element is silently skipped (no AttributeError from
+    calling `.get()` on a string) and the well-formed row is still
+    classified correctly.
+    """
+    good = _ps_row("id-good", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+    stdout = json.dumps(["just-a-bare-string-not-a-row", good])
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[], mounts_by_id={"id-good": []}, ps_stdout_override=stdout,
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    names = {i.name for i in instances}
+    assert names == {PARTGRAPH_CONTAINER_NAME}, (
+        f"a non-dict array element must be skipped, not crash the batch: {instances!r}"
+    )
+
+
+def test_parse_ps_row_missing_id_excluded_not_crashed() -> None:
+    """[3a-H3] Given a batch with one row missing the `Id` key entirely
+    alongside one well-formed S1 row.
+    When find_partgraph_instances() is called.
+    Then the malformed row is silently skipped (it can never be inspected —
+    there is no id to target `container inspect` with) and the well-formed
+    row is still classified correctly.
+    """
+    good = _ps_row("id-good", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+    bad = {"Names": ["nameless-id-row"], "Image": "x", "State": "running", "Ports": []}
+    stdout = json.dumps([bad, good])
+    fake_run, calls = _make_scripted_run(
+        initial_rows=[], mounts_by_id={"id-good": []}, ps_stdout_override=stdout,
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    names = {i.name for i in instances}
+    assert names == {PARTGRAPH_CONTAINER_NAME}, (
+        f"a row missing 'Id' must be skipped, not crash the batch: {instances!r}"
+    )
+    for argv, _kwargs in calls:
+        assert "nameless-id-row" not in argv
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +654,7 @@ def test_selects_exact_name_only() -> None:
         _ps_row("id-backup", "partgraph-dgraph-backup", "dgraph/standalone:v25.3.4"),
     ]
     fake_run, _calls = _make_scripted_run(
-        ps_rows=rows,
+        initial_rows=rows,
         mounts_by_id={"id-exact": [], "id-backup": []},
     )
     with patch("subprocess.run", side_effect=fake_run):
@@ -460,6 +668,33 @@ def test_selects_exact_name_only() -> None:
     )
 
 
+def test_leading_space_and_case_variation_are_not_s1() -> None:
+    """[3a-L11] Given a container named ' partgraph-dgraph' (leading space)
+    and a second named 'Partgraph-Dgraph' (case variation) — neither
+    mounting the data volume nor holding a watched port.
+    When find_partgraph_instances() is called.
+    Then NEITHER is classified S1 (or anything else) — a defensive
+    regression pin so a later "helpful" `.strip()`/`.casefold()`
+    normalization can never silently reopen this collision.
+    """
+    row_space = _ps_row("id-space", " partgraph-dgraph", "dgraph/standalone:v25.3.4")
+    row_case = _ps_row("id-case", "Partgraph-Dgraph", "dgraph/standalone:v25.3.4")
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row_space, row_case],
+        mounts_by_id={"id-space": [], "id-case": []},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    names = {i.name for i in instances}
+    assert " partgraph-dgraph" not in names
+    assert "Partgraph-Dgraph" not in names
+    assert instances == (), (
+        "A leading-space or case-varied name must never be classified S1 "
+        f"(nor anything else here). Got: {instances!r}"
+    )
+
+
 def test_selects_by_data_volume_mount() -> None:
     """Given a container with an ARBITRARY name (e.g. the quadlet-generated
     duplicate) that mounts the named `partgraph_dgraph_data` volume at
@@ -470,15 +705,53 @@ def test_selects_by_data_volume_mount() -> None:
     """
     rows = [_ps_row("id-quadlet", "systemd-partgraph-dgraph", "dgraph/standalone:v25.3.4")]
     fake_run, _calls = _make_scripted_run(
-        ps_rows=rows,
+        initial_rows=rows,
         mounts_by_id={"id-quadlet": _mounts("partgraph_dgraph_data")},
     )
     with patch("subprocess.run", side_effect=fake_run):
         instances = find_partgraph_instances(engine_prefix=["docker"])
 
     assert len(instances) == 1
+    assert instances[0].id == "id-quadlet"
     assert instances[0].owned_by == "S2"
     assert instances[0].mounts_data_volume is True
+
+
+def test_volume_name_substring_does_not_match_s2() -> None:
+    """[3a-H4] Given three containers: one mounting
+    'partgraph_dgraph_data_backup' (a SUFFIX collision), one mounting
+    'not_partgraph_dgraph_data' (a PREFIX collision), and one mounting the
+    EXACT 'partgraph_dgraph_data' — none named S1, none holding a watched
+    port.
+
+    tests/integration/test_dgraph_lifecycle.py:288-289 uses
+    `name.endswith("partgraph_dgraph_data")` for its OWN legitimate reason —
+    that is a live in-repo precedent a careless implementer of THIS selector
+    could copy and still pass every other current unit test, which is why
+    this collision is pinned explicitly here.
+
+    When find_partgraph_instances() is called.
+    Then the two substring-colliding containers are excluded entirely; only
+    the exact-volume-name container is classified S2.
+    """
+    row_suffix = _ps_row("id-suffix-collision", "svc-a", "nginx:1.27.3")
+    row_prefix = _ps_row("id-prefix-collision", "svc-b", "nginx:1.27.3")
+    row_exact = _ps_row("id-exact-volume", "svc-c", "dgraph/standalone:v25.3.4")
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row_suffix, row_prefix, row_exact],
+        mounts_by_id={
+            "id-suffix-collision": _mounts("partgraph_dgraph_data_backup"),
+            "id-prefix-collision": _mounts("not_partgraph_dgraph_data"),
+            "id-exact-volume": _mounts(PARTGRAPH_DATA_VOLUME),
+        },
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    names = {i.name: i.owned_by for i in instances}
+    assert "svc-a" not in names, "a volume-name SUFFIX collision must not match S2"
+    assert "svc-b" not in names, "a volume-name PREFIX collision must not match S2"
+    assert names.get("svc-c") == "S2"
 
 
 def test_port_holder_is_report_only() -> None:
@@ -493,7 +766,7 @@ def test_port_holder_is_report_only() -> None:
     rows = [_ps_row("id-foreign", "some-other-service", "nginx:1.27.3",
                      host_ports=(8081,))]
     fake_run, calls = _make_scripted_run(
-        ps_rows=rows, mounts_by_id={"id-foreign": []},
+        initial_rows=rows, mounts_by_id={"id-foreign": []},
     )
     with patch("subprocess.run", side_effect=fake_run):
         instances = find_partgraph_instances(engine_prefix=["docker"])
@@ -541,7 +814,7 @@ def test_cve_graph_fixture_selects_nothing() -> None:
         "cid-alpha": _mounts("cve-graph_dgraph_alpha", destination="/dgraph"),
         "cid-loader": [],
     }
-    fake_run, calls = _make_scripted_run(ps_rows=rows, mounts_by_id=mounts_by_id)
+    fake_run, calls = _make_scripted_run(initial_rows=rows, mounts_by_id=mounts_by_id)
 
     with patch("subprocess.run", side_effect=fake_run):
         instances = find_partgraph_instances(engine_prefix=["docker"])
@@ -571,7 +844,7 @@ def test_hostile_name_rejected() -> None:
     hostile = "-rf ; rm -rf / #"
     rows = [_ps_row("id-hostile", hostile, "dgraph/standalone:v25.3.4")]
     fake_run, calls = _make_scripted_run(
-        ps_rows=rows, mounts_by_id={"id-hostile": _mounts("partgraph_dgraph_data")},
+        initial_rows=rows, mounts_by_id={"id-hostile": _mounts("partgraph_dgraph_data")},
     )
     with patch("subprocess.run", side_effect=fake_run):
         instances = find_partgraph_instances(engine_prefix=["docker"])
@@ -599,10 +872,76 @@ def test_hostile_name_rejected_parametrized_charsets(hostile_name: str) -> None:
     """
     rows = [_ps_row("id-x", hostile_name, "dgraph/standalone:v25.3.4")]
     fake_run, calls = _make_scripted_run(
-        ps_rows=rows, mounts_by_id={"id-x": _mounts("partgraph_dgraph_data")},
+        initial_rows=rows, mounts_by_id={"id-x": _mounts("partgraph_dgraph_data")},
     )
     with patch("subprocess.run", side_effect=fake_run):
         instances = find_partgraph_instances(engine_prefix=["docker"])
+    assert instances == ()
+    for argv, _kwargs in calls:
+        for token in argv:
+            assert hostile_name not in token
+
+
+# ---------------------------------------------------------------------------
+# [3a-M7] Positive allow-list: the Docker/podman container-name grammar
+# ``^[a-zA-Z0-9][a-zA-Z0-9_.-]*$``. A DENY-list of enumerated hostile
+# characters (above) can never be exhaustive; the module's actual contract
+# is a POSITIVE allow-list, pinned directly here.
+# ---------------------------------------------------------------------------
+
+
+def test_allowlist_positive_normal_docker_style_name_is_accepted() -> None:
+    """[3a-M7] Given a container mounting the data volume under a NORMAL,
+    docker/podman-grammar-valid name (letters, digits, '_', '.', '-').
+    When find_partgraph_instances() is called.
+    Then it is NOT rejected — it is classified S2 as expected. Proves the
+    allow-list is a genuine ALLOW-list (accepts valid names), not merely a
+    deny-list of a few enumerated characters in disguise.
+    """
+    row = _ps_row("id-ok", "my_service-01.local", "dgraph/standalone:v25.3.4")
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row], mounts_by_id={"id-ok": _mounts(PARTGRAPH_DATA_VOLUME)},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+    assert len(instances) == 1
+    assert instances[0].name == "my_service-01.local"
+    assert instances[0].owned_by == "S2"
+
+
+@pytest.mark.parametrize(
+    "hostile_name",
+    [
+        pytest.param("bad\nname", id="embedded-newline"),
+        pytest.param("bad`name", id="backtick"),
+        pytest.param("bad|name", id="pipe"),
+        pytest.param("a" * 300, id="excessively-long"),
+        pytest.param("has[bracket]name", id="brackets"),
+    ],
+)
+def test_allowlist_negative_table_rejects_hostile_shapes(hostile_name: str) -> None:
+    """[3a-M7] Given the positive allow-list grammar
+    ``^[a-zA-Z0-9][a-zA-Z0-9_.-]*$``.
+    When find_partgraph_instances() is called on a fixture where a container
+    otherwise mounting the data volume (an S2 match) carries a name
+    violating that grammar (embedded newline, backtick, pipe, or an
+    excessively long 300-char name).
+    Then it is excluded entirely and never reaches any subprocess argv.
+
+    [Gate 3b item 12 / 3a-M8]: the "brackets" case doubles as the
+    Rich-`markup=False` regression the amendment asked for — a `[`/`]`
+    -bearing name is rejected HERE, at the allow-list, before it could ever
+    reach a Rich-rendered CLI display string, so a dedicated CLI-level
+    `markup=False` test would be redundant with this stronger, earlier
+    guarantee and is intentionally NOT added separately.
+    """
+    row = _ps_row("id-hostile", hostile_name, "dgraph/standalone:v25.3.4")
+    fake_run, calls = _make_scripted_run(
+        initial_rows=[row], mounts_by_id={"id-hostile": _mounts(PARTGRAPH_DATA_VOLUME)},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
     assert instances == ()
     for argv, _kwargs in calls:
         for token in argv:
@@ -623,7 +962,7 @@ def test_no_docker_only_or_podman_only_flags() -> None:
     """
     rows = [_ps_row("id-s1", "partgraph-dgraph", "dgraph/standalone:v25.3.4")]
     fake_run, calls = _make_scripted_run(
-        ps_rows=rows, mounts_by_id={"id-s1": _mounts("partgraph_dgraph_data")},
+        initial_rows=rows, mounts_by_id={"id-s1": _mounts("partgraph_dgraph_data")},
     )
     with patch("subprocess.run", side_effect=fake_run):
         find_partgraph_instances(engine_prefix=["docker"])
@@ -643,7 +982,7 @@ def test_engine_prefix_comes_from_engine_command() -> None:
     partgraph.util.container.engine_command() (patched here as a spy) —
     never a hard-coded 'docker'/'podman' literal.
     """
-    fake_run, calls = _make_scripted_run(ps_rows=[], ps_stdout_override="[]")
+    fake_run, calls = _make_scripted_run(initial_rows=[], ps_stdout_override="[]")
     with (
         patch("partgraph.util.lifecycle.engine_command", return_value=["podman"]) as mock_engine,
         patch("subprocess.run", side_effect=fake_run),
@@ -669,7 +1008,7 @@ def test_all_calls_have_bounded_timeout() -> None:
     """
     rows = [_ps_row("id-s1", "partgraph-dgraph", "dgraph/standalone:v25.3.4")]
     fake_run, calls = _make_scripted_run(
-        ps_rows=rows, mounts_by_id={"id-s1": []},
+        initial_rows=rows, mounts_by_id={"id-s1": []},
     )
     with patch("subprocess.run", side_effect=fake_run):
         find_partgraph_instances(engine_prefix=["docker"])
@@ -696,7 +1035,7 @@ def test_unit_state_parses_loaded_active() -> None:
     active_state='active', wanted_by_default is True.
     """
     fake_run, calls = _make_scripted_run(
-        ps_rows=[],
+        initial_rows=[],
         unit_lines=[
             "LoadState=loaded",
             "ActiveState=active",
@@ -723,7 +1062,7 @@ def test_unit_state_parses_not_found() -> None:
     Then UnitState.present is False.
     """
     fake_run, _calls = _make_scripted_run(
-        ps_rows=[],
+        initial_rows=[],
         unit_lines=["LoadState=not-found", "ActiveState=inactive",
                     "SubState=dead", "UnitFileState=", "WantedBy="],
     )
@@ -741,7 +1080,7 @@ def test_unit_state_parses_failed() -> None:
     unit is still 'present', distinct from not-found.
     """
     fake_run, _calls = _make_scripted_run(
-        ps_rows=[],
+        initial_rows=[],
         unit_lines=["LoadState=loaded", "ActiveState=failed",
                     "SubState=failed", "UnitFileState=generated",
                     "WantedBy=default.target"],
@@ -762,7 +1101,7 @@ def test_unit_name_is_frozen_constant() -> None:
     """
     assert PARTGRAPH_UNIT_NAME == "partgraph-dgraph.service"
 
-    fake_run, calls = _make_scripted_run(ps_rows=[])
+    fake_run, calls = _make_scripted_run(initial_rows=[])
     with patch("subprocess.run", side_effect=fake_run), patch("shutil.which", return_value="/usr/bin/systemctl"):
         unit_state()
 
@@ -778,7 +1117,7 @@ def test_systemctl_argv_has_user_never_system_never_sudo() -> None:
     '--system' anywhere.
     """
     fake_run, calls = _make_scripted_run(
-        ps_rows=[],
+        initial_rows=[],
         unit_lines=["LoadState=loaded", "ActiveState=active",
                     "SubState=running", "UnitFileState=generated",
                     "WantedBy=default.target"],
@@ -817,7 +1156,7 @@ def test_partgraph_container_engine_env_var_routes_through_detection() -> None:
     routes through the shared detection helper identically to how
     compose_command()/`db up`/`db down` already honour it.
     """
-    fake_run, _calls = _make_scripted_run(ps_rows=[], ps_stdout_override="[]")
+    fake_run, _calls = _make_scripted_run(initial_rows=[], ps_stdout_override="[]")
     with (
         patch(
             "partgraph.util.lifecycle.engine_command", return_value=["docker"]
@@ -832,34 +1171,142 @@ def test_partgraph_container_engine_env_var_routes_through_detection() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC-P1 — no hard-coded engine literal in the leaf's own source
+# [3a-H1] stop_all() targets a container's opaque ID, never its name.
 # ---------------------------------------------------------------------------
 
 
-def test_ac_p1_lifecycle_source_never_hardcodes_docker_or_podman_argv_literal() -> None:
-    """AC-P1: Given every engine invocation must begin with compose_command()
-    or engine_command() output — never a literal.
-    When src/partgraph/util/lifecycle.py's source text is scanned.
-    Then it contains no argv-shaped list literal opening with "docker" or
-    "podman" (e.g. `["docker"` / `['podman'`), which would bypass detection.
-
-    Skips (does not fail red) if the source file does not exist yet — that is
-    covered by this file's own module-level ModuleNotFoundError collection
-    error, not by this specific static-scan assertion.
+def test_stop_all_targets_container_id_never_name_in_stop_argv() -> None:
+    """[3a-H1] Given a surviving S1 instance.
+    When stop_all() issues its engine `stop` sweep.
+    Then the LAST argv element (the stop TARGET) is the container's opaque
+    id — never its name. S2 in particular classifies by volume mount,
+    independent of name, so stopping by name would reopen a TOCTOU window
+    between enumeration and stop; an engine-assigned id cannot be reused by
+    a different live container. The NAME still surfaces in DownResult's
+    display-facing `stopped` tuple.
     """
-    import pathlib
-
-    module_path = (
-        pathlib.Path(__file__).resolve().parent.parent.parent
-        / "src" / "partgraph" / "util" / "lifecycle.py"
+    row = _ps_row("cid-abc123", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+    fake_run, calls = _make_scripted_run(
+        initial_rows=[row], mounts_by_id={"cid-abc123": []},
     )
-    if not module_path.exists():
-        pytest.skip("src/partgraph/util/lifecycle.py does not exist yet (expected pre-PR-A).")
+    with patch("subprocess.run", side_effect=fake_run):
+        result = stop_all(
+            engine_prefix=["docker"], compose_down=lambda: None,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
 
-    text = module_path.read_text(encoding="utf-8")
-    forbidden = re.compile(r"""\[\s*["'](docker|podman)["']""")
-    match = forbidden.search(text)
-    assert match is None, (
-        f"lifecycle.py hard-codes an engine literal in argv position: {match.group(0)!r}. "
-        "Every engine invocation must begin with compose_command()/engine_command()."
+    stop_calls = [argv for argv, _k in calls if _is_engine_stop_call(argv)]
+    assert stop_calls, "expected at least one engine stop call"
+    for argv in stop_calls:
+        assert argv[-1] == "cid-abc123", (
+            f"stop target must be the container ID, never the name: {argv}"
+        )
+        assert PARTGRAPH_CONTAINER_NAME not in argv, (
+            f"the container NAME must never appear in a stop argv: {argv}"
+        )
+    assert PARTGRAPH_CONTAINER_NAME in result.stopped, (
+        "the NAME must still surface in DownResult.stopped for human display"
+    )
+
+
+def test_stop_all_survivor_and_verification_end_to_end() -> None:
+    """[3a-M6] Given two S1/S2 survivors after compose down: one whose
+    engine `stop` call SUCCEEDS (removed from the live set) and one whose
+    `stop` call FAILS (returncode != 0, remains live).
+    When stop_all() runs its full sweep + verification re-enumeration.
+    Then DownResult.stopped contains only the NAME that was actually
+    removed, and DownResult.survivors contains only the NAME that is still
+    live after verification — proving the stateful fixture (and, once
+    implemented, stop_all() itself) distinguishes "survived the stop" from
+    "was stopped" rather than returning a static snapshot.
+    """
+    row_ok = _ps_row("cid-ok", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+    row_stuck = _ps_row(
+        "cid-stuck", "systemd-partgraph-dgraph-duplicate", "dgraph/standalone:v25.3.4"
+    )
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row_ok, row_stuck],
+        mounts_by_id={"cid-ok": [], "cid-stuck": _mounts(PARTGRAPH_DATA_VOLUME)},
+        stop_fails_ids=frozenset({"cid-stuck"}),
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        result = stop_all(
+            engine_prefix=["docker"], compose_down=lambda: None,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
+
+    assert PARTGRAPH_CONTAINER_NAME in result.stopped
+    assert "systemd-partgraph-dgraph-duplicate" not in result.stopped
+    assert "systemd-partgraph-dgraph-duplicate" in result.survivors
+    assert PARTGRAPH_CONTAINER_NAME not in result.survivors
+
+
+# ---------------------------------------------------------------------------
+# [3b-M1 / 3b-M2] compose_down is required, keyword-only, no default; its
+# exceptions propagate unmodified and short-circuit phases 3 and 4.
+# ---------------------------------------------------------------------------
+
+
+def test_compose_down_is_required_keyword_only_with_no_default() -> None:
+    """[3b-M1] Given stop_all()'s `compose_down` parameter.
+    When the signature is inspected.
+    Then it is KEYWORD_ONLY and carries NO default
+    (inspect.Parameter.empty) — a caller MUST decide explicitly whether/how
+    to invoke compose, rather than silently no-op-ing phase 2. This forces
+    PR-B2's ensure_running() and PR-C's should_stop_for_idle() to decide
+    explicitly rather than inheriting a permissive default.
+    """
+    sig = inspect.signature(stop_all)
+    param = sig.parameters["compose_down"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert param.default is inspect.Parameter.empty
+
+
+class _ComposeDownFailure(RuntimeError):
+    """A RuntimeError subclass standing in for a real compose-down failure.
+
+    Deliberately NOT ``typer.Exit`` (whose own ``__mro__`` also includes
+    ``RuntimeError``, which is exactly why cli.py's real `_run_compose`
+    failure path will reach stop_all() this way) — a plain,
+    Typer-independent exception keeps this leaf-level test fully decoupled
+    from partgraph.cli/Typer.
+    """
+
+
+def test_compose_down_exception_propagates_unmodified_short_circuits_phases_3_and_4() -> None:
+    """[3b-M2] Given the injected `compose_down` callback raises a
+    RuntimeError subclass (modelling a real compose failure).
+    When stop_all() runs (on a fixture with a survivor that WOULD otherwise
+    need an engine-level stop).
+    Then the exception propagates OUT of stop_all() completely UNMODIFIED
+    (same instance), and NEITHER the engine stop sweep (phase 3) NOR the
+    verification re-enumeration (phase 4) ever run — a sharp asymmetry
+    versus phase 1 (a failed systemd unit stop is ABSORBED, A12): a failed
+    compose_down is NOT survivable, by design.
+    """
+    row = _ps_row("cid-1", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+    fake_run, calls = _make_scripted_run(
+        initial_rows=[row], mounts_by_id={"cid-1": []},
+    )
+    boom = _ComposeDownFailure("compose down failed")
+
+    def _compose_down_raises() -> None:
+        raise boom
+
+    with (
+        patch("subprocess.run", side_effect=fake_run),
+        pytest.raises(_ComposeDownFailure) as excinfo,
+    ):
+        stop_all(
+            engine_prefix=["docker"], compose_down=_compose_down_raises,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
+    assert excinfo.value is boom
+
+    assert not any(_is_engine_stop_call(argv) for argv, _k in calls), (
+        "phase 3 (engine stop sweep) must never run after compose_down raises"
+    )
+    assert not any(_is_ps_call(argv) for argv, _k in calls), (
+        "phase 4 (verification re-enumeration), and the phase-3 survivor "
+        "enumeration it depends on, must never run after compose_down raises"
     )
