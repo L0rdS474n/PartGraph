@@ -396,6 +396,27 @@ _UNIT_NOT_FOUND_LINES = [
     "LoadState=not-found", "ActiveState=", "SubState=", "UnitFileState=", "WantedBy=",
 ]
 
+#: LIVE-VERIFIED shape (pasted from an operator's own
+#: `systemctl --user show partgraph-dgraph.service --property=WantedBy ...`
+#: after following docs/db-lifecycle.md's own documented drop-in procedure
+#: verbatim): a `loaded`, `inactive` unit whose `WantedBy` property line is
+#: PRESENT but its value is the empty string. This is positive evidence of
+#: absence — the drop-in worked — not an undeterminable answer.
+_UNIT_LOADED_EMPTY_WANTEDBY_LINES = [
+    "LoadState=loaded", "ActiveState=inactive", "SubState=dead",
+    "UnitFileState=generated", "WantedBy=",
+]
+
+#: Same loaded/inactive unit as above, but the `WantedBy` property line is
+#: ABSENT from `systemctl show`'s output altogether — never printed at all,
+#: as opposed to printed with an empty value. Distinguishing this shape from
+#: the one above is the entire point of the test block below: only THIS
+#: shape may resolve to `wanted_by_default is None`.
+_UNIT_LOADED_WANTEDBY_LINE_MISSING_LINES = [
+    "LoadState=loaded", "ActiveState=inactive", "SubState=dead",
+    "UnitFileState=generated",
+]
+
 
 def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptable outcome.
     *,
@@ -2002,6 +2023,166 @@ def test_unit_state_parses_failed() -> None:
 
     assert result.present is True
     assert result.active_state == "failed"
+
+
+# ---------------------------------------------------------------------------
+# unit_state().wanted_by_default — present-and-empty vs. genuinely
+# undeterminable. An empty WantedBy= on a LOADED unit is positive evidence
+# of absence (a `db doctor` honesty fix); it must be told apart from every
+# case where the answer is truly unknown and must stay None — never
+# guessed. The four undeterminable shapes below are exhaustive over this
+# module's own documented contract for wanted_by_default: (1) systemctl
+# absent from PATH, (2) LoadState=not-found, (3) the show query itself
+# failing/timing out, (4) the show query returning no output at all, PLUS
+# the WantedBy property line missing from otherwise-normal output — as
+# opposed to present with an empty value, which is the ONE case that must
+# now resolve to a confirmed False.
+# ---------------------------------------------------------------------------
+
+
+def test_unit_state_wanted_by_default_is_confirmed_false_when_wantedby_present_and_empty_on_loaded_unit() -> None:
+    """Given `systemctl --user show ...` answers with the LIVE-VERIFIED shape
+    for a `loaded` unit whose `WantedBy` property line is PRESENT but its
+    value is empty (exactly what this repo's own documented drop-in
+    procedure, followed verbatim, produces on a real host).
+    When unit_state() is called.
+    Then wanted_by_default is a CONFIRMED False — never None. An empty
+    WantedBy= on a loaded unit is positive evidence of absence, not absence
+    of evidence.
+    """
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[], unit_lines=_UNIT_LOADED_EMPTY_WANTEDBY_LINES,
+    )
+    with (
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", return_value="/usr/bin/systemctl"),
+    ):
+        result = unit_state()
+
+    assert result.present is True
+    assert result.load_state == "loaded"
+    assert result.wanted_by_default is False, (
+        f"an empty WantedBy= on a loaded unit must be a confirmed False, "
+        f"got {result.wanted_by_default!r}"
+    )
+
+
+def test_unit_state_wanted_by_default_stays_none_when_wantedby_property_missing_entirely_from_loaded_unit() -> None:
+    """Given `systemctl --user show ...` answers for a `loaded` unit whose
+    output never carries a `WantedBy=` line AT ALL — distinct from the
+    fixture above, where the SAME property line is present but empty.
+    When unit_state() is called.
+    Then wanted_by_default stays None (genuinely undeterminable) — it must
+    NOT collapse to False just because the unit happens to be loaded. A
+    naive fix that maps every "loaded and not confirmed-True" case to False
+    would wrongly pass the case above but would ALSO wrongly turn this one
+    into False; this test exists specifically to catch that mutation.
+    """
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[], unit_lines=_UNIT_LOADED_WANTEDBY_LINE_MISSING_LINES,
+    )
+    with (
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", return_value="/usr/bin/systemctl"),
+    ):
+        result = unit_state()
+
+    assert result.present is True
+    assert result.load_state == "loaded"
+    assert result.wanted_by_default is None, (
+        f"a WantedBy property that never appears in systemctl's output at "
+        f"all must stay None, never guessed; got {result.wanted_by_default!r}"
+    )
+
+
+def test_unit_state_wanted_by_default_stays_none_when_load_state_is_not_found_even_with_empty_wantedby() -> None:
+    """Given `systemctl --user show ...` reports LoadState=not-found — the
+    unit was never generated on this host — while ALSO answering with an
+    empty WantedBy= (systemd's real shape for a not-found unit; this is
+    exactly `_UNIT_NOT_FOUND_LINES`, the same fixture
+    test_unit_state_parses_not_found above already exercises for `present`).
+    When unit_state() is called.
+    Then wanted_by_default stays None, NOT False: an empty WantedBy= is only
+    positive evidence of absence on a unit systemd actually LOADED. A
+    not-found unit's empty WantedBy= means nothing, and must not be
+    confused for the confirmed-absent case pinned above.
+    """
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[], unit_lines=_UNIT_NOT_FOUND_LINES,
+    )
+    with (
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", return_value="/usr/bin/systemctl"),
+    ):
+        result = unit_state()
+
+    assert result.present is False
+    assert result.wanted_by_default is None, (
+        f"a not-found unit's empty WantedBy= must stay None, never be read "
+        f"as a confirmed False; got {result.wanted_by_default!r}"
+    )
+
+
+def test_unit_state_wanted_by_default_stays_none_when_systemctl_absent_from_path() -> None:
+    """Given `shutil.which('systemctl')` returns None (no systemd on PATH at
+    all).
+    When unit_state() is called.
+    Then wanted_by_default stays None, present is False, AND no
+    subprocess.run call was made at all — the documented "absent rather
+    than guessed at, and no subprocess invoked" contract for this branch.
+    """
+    def _fail_if_called(argv, **_kwargs):
+        raise AssertionError(
+            f"unit_state() must not invoke subprocess.run when systemctl is "
+            f"not on PATH; got {argv}"
+        )
+
+    with (
+        patch("subprocess.run", side_effect=_fail_if_called),
+        patch("shutil.which", return_value=None),
+    ):
+        result = unit_state()
+
+    assert result.present is False
+    assert result.wanted_by_default is None
+
+
+def test_unit_state_wanted_by_default_stays_none_when_the_show_call_raises() -> None:
+    """Given the `systemctl --user show ...` subprocess call itself raises
+    (timed out, or could not be executed at all).
+    When unit_state() is called.
+    Then wanted_by_default stays None and present is False — the query
+    failing outright is exactly as undeterminable as it never answering.
+    """
+    def _raise(argv, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=SYSTEMCTL_TIMEOUT_S)
+
+    with (
+        patch("subprocess.run", side_effect=_raise),
+        patch("shutil.which", return_value="/usr/bin/systemctl"),
+    ):
+        result = unit_state()
+
+    assert result.present is False
+    assert result.wanted_by_default is None
+
+
+def test_unit_state_wanted_by_default_stays_none_when_the_show_call_returns_no_output_at_all() -> None:
+    """Given `systemctl --user show ...` returns (exit 0, but) completely
+    empty stdout — no property lines at all, not even LoadState.
+    When unit_state() is called.
+    Then wanted_by_default stays None, and present is False (mirrors the
+    not-found case: no evidence parsed at all is not evidence of anything).
+    """
+    fake_run, _calls = _make_scripted_run(initial_rows=[], unit_lines=[])
+    with (
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", return_value="/usr/bin/systemctl"),
+    ):
+        result = unit_state()
+
+    assert result.present is False
+    assert result.wanted_by_default is None
 
 
 def test_unit_name_is_frozen_constant() -> None:
