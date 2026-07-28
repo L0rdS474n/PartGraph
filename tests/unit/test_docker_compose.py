@@ -9,10 +9,29 @@ configuration required:
 - No bind mounts to absolute host paths
 - Host-side port strings "8080:" and "9080:" must NOT appear
 - No "0.0.0.0" anywhere in the file
+- stop_grace_period matches STOP_GRACE_SECONDS (Gate 7 — see below)
+
+Gate 7 addition: live journal evidence on this host proved Compose's own
+10s stop_grace_period DEFAULT (the same default a bare `docker/podman stop`
+without an explicit `-t` uses) insufficient under load — after a 14h run,
+`StopSignal SIGTERM failed to stop container partgraph-dgraph in 10
+seconds, resorting to SIGKILL` (unit exit status 137). Without an explicit
+`stop_grace_period:`, a Compose-started instance inherits that same 10s
+default, so it needs the SAME fix `partgraph.util.lifecycle.
+STOP_GRACE_SECONDS` (our own engine `stop` sweep's budget) already pins.
+`STOP_GRACE_SECONDS` is imported directly (never re-declared as a second
+literal) so the two pins can never silently drift apart — a change to one
+without the other fails this test.
+
+HONESTY BOUNDARY: this ONLY covers Compose-started instances. It does NOT
+reach the quadlet/systemd path — that unit's `ExecStop=podman rm -v -f`
+uses whatever stop-timeout was baked in at quadlet-generation time,
+independent of this file, and remains PR-B1 territory.
 """
 
 from __future__ import annotations
 
+import math
 import pathlib
 import re
 import subprocess
@@ -21,6 +40,7 @@ import pytest
 import yaml
 
 from partgraph.util.container import ContainerEngineError, compose_command
+from partgraph.util.lifecycle import STOP_GRACE_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -313,4 +333,85 @@ def test_no_absolute_host_bind_mounts(compose_config: dict) -> None:
 
     assert not bind_mounts, (
         f"Absolute host bind mounts found (not allowed): {bind_mounts}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate 7 — stop_grace_period matches STOP_GRACE_SECONDS (load-tolerant
+# shutdown budget; live SIGKILL/exit-137 incident on this host).
+# ---------------------------------------------------------------------------
+
+def _normalize_duration_seconds(value: object) -> float:
+    """Best-effort parse a Compose duration value into a float of seconds.
+
+    Accepts a bare int/float (already seconds — some `compose config`
+    expansions normalize durations this way) or a Go-duration-style string
+    such as ``"60s"``/``"1m"``/``"1m30s"``. Returns ``math.nan`` for
+    anything else (including ``None``) so a comparison against the
+    expected value fails loudly rather than silently passing.
+    """
+    if isinstance(value, bool):
+        return math.nan
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        match = re.fullmatch(
+            r"(?:(?P<hours>\d+)h)?(?:(?P<minutes>\d+)m)?(?:(?P<seconds>\d+(?:\.\d+)?)s)?",
+            value.strip(),
+        )
+        if match and any(match.groupdict().values()):
+            hours = match.group("hours")
+            minutes = match.group("minutes")
+            seconds = match.group("seconds")
+            total = 0.0
+            if hours:
+                total += int(hours) * 3600
+            if minutes:
+                total += int(minutes) * 60
+            if seconds:
+                total += float(seconds)
+            return total
+    return math.nan
+
+
+def test_dgraph_service_declares_stop_grace_period_matching_engine_budget(
+    compose_config: dict,
+) -> None:
+    """Gate 7: Given a Compose-started instance must get the SAME shutdown
+    window as our own engine `stop` sweep
+    (`partgraph.util.lifecycle.STOP_GRACE_SECONDS`) — without an explicit
+    `stop_grace_period`, Compose falls back to its own 10s default, the
+    same insufficient window that produced a live SIGKILL (unit exit
+    status 137) after a 14h run on this host.
+    When we inspect the dgraph service configuration.
+    Then it must declare `stop_grace_period` equal to STOP_GRACE_SECONDS
+    (imported directly from partgraph.util.lifecycle, never re-declared as
+    an independent literal here, so the two pins cannot silently drift
+    apart).
+    """
+    services = compose_config.get("services", {})
+    assert services, "No services defined in docker-compose.yml"
+
+    for svc_name, svc in services.items():
+        image = svc.get("image", "")
+        if "dgraph" in image.lower():
+            stop_grace_period = svc.get("stop_grace_period")
+            assert stop_grace_period is not None, (
+                f"Service '{svc_name}' does not declare 'stop_grace_period'. "
+                "Without it, Compose falls back to its own 10s default — the "
+                "same insufficient window that produced a live SIGKILL (exit "
+                "137) after a 14h run on this host."
+            )
+            normalized = _normalize_duration_seconds(stop_grace_period)
+            assert normalized == float(STOP_GRACE_SECONDS), (
+                f"Service '{svc_name}' stop_grace_period={stop_grace_period!r} "
+                f"(parsed as {normalized}s) does not match "
+                f"STOP_GRACE_SECONDS ({STOP_GRACE_SECONDS}s) — the two "
+                "budgets must stay in lockstep."
+            )
+            return
+
+    pytest.fail(
+        "No dgraph service found in docker-compose.yml — cannot verify "
+        f"stop_grace_period. Services: {list(services.keys())}"
     )

@@ -52,9 +52,36 @@ Module constants (frozen, named — never derived at runtime):
     every subprocess.run call this module makes (mirrors
     HEALTH_PROBE_TIMEOUT_S / ADR-0007's bounded-constant precedent). NEVER
     ``None`` (unbounded).
-  - ``STOP_GRACE_SECONDS: int`` — the engine's OWN ``-t`` grace-period value
-    passed to ``stop -t <n> <id>`` (distinct from the Python-level subprocess
-    ``timeout=`` kwarg above).
+  - ``STOP_GRACE_SECONDS: int`` = 60 — the engine's OWN ``-t`` grace-period
+    value passed to ``stop -t <n> <id>`` (distinct from the Python-level
+    subprocess ``timeout=`` kwarg above). Raised from a prior 10 (Gate 7):
+    live journal evidence on this host proved 10s insufficient under load —
+    after a 14h run, ``StopSignal SIGTERM failed to stop container
+    partgraph-dgraph in 10 seconds, resorting to SIGKILL`` (unit exit
+    status 137). Badger's WAL means data survives a SIGKILL (verified,
+    613,396 Part nodes intact), but routinely SIGKILLing a database is not
+    the intended shutdown path and costs recovery work on the next start.
+    60 is a JUDGEMENT CALL, not a measured minimum — the evidence supports
+    "more than 10", not a precise number. ``docker/docker-compose.yml``'s
+    ``stop_grace_period`` must match this SAME budget, so a Compose-started
+    instance gets equal treatment (tests/unit/test_docker_compose.py pins
+    this independently, importing the constant directly so the two can
+    never silently drift apart). ``STOP_TIMEOUT_S`` must exceed it by a
+    MEANINGFUL margin (not a bare "greater than"), or the Python-level
+    subprocess watchdog can fire before the engine finishes waiting out its
+    own grace period, defeating the fix.
+
+    HONESTY BOUNDARY (do not overclaim): this budget covers ONLY the
+    lifecycle paths PartGraph owns directly — its own engine `stop` sweep
+    and Compose. It does NOT reach the quadlet/systemd path: when
+    :func:`stop_all` stops the ``partgraph-dgraph.service`` unit, the
+    unit's OWN ``ExecStop=podman rm -v -f`` applies whatever stop-timeout
+    was baked into the container at quadlet-generation time — this repo
+    cannot influence that from inside ``partgraph.util.lifecycle``; a
+    ``StopTimeout=`` drop-in on the host is PR-B1 territory. No test or
+    docstring in this file may claim `db down` guarantees a graceful
+    shutdown in ALL cases — only that our own two paths (engine sweep,
+    Compose) now share a load-tolerant budget.
   - ``MAX_PS_OUTPUT_BYTES: int`` — a finite, named ceiling on the byte length
     of ``ps``'s stdout the parser will even ATTEMPT to decode (Gate 3a finding
     3a-M5). Extends the same bounded-constant discipline to untrusted engine
@@ -447,6 +474,111 @@ def test_stop_grace_seconds_is_a_positive_bounded_int() -> None:
     assert isinstance(STOP_GRACE_SECONDS, int)
     assert STOP_GRACE_SECONDS > 0
     assert STOP_TIMEOUT_S > STOP_GRACE_SECONDS
+
+
+#: The minimum acceptable buffer (seconds) between STOP_TIMEOUT_S and
+#: STOP_GRACE_SECONDS — "strictly greater than" alone is not enough; a
+#: one-second margin would let the Python-level watchdog race the engine's
+#: own grace period under normal scheduling jitter. A JUDGEMENT CALL (Gate
+#: 7), not a measured minimum, chosen to be clearly non-trivial without
+#: being arbitrarily large.
+_MEANINGFUL_WATCHDOG_MARGIN_S = 10.0
+
+
+def test_stop_grace_seconds_is_raised_to_a_load_tolerant_budget() -> None:
+    """[Gate 7] Given live journal evidence on this host proved the PRIOR
+    10s grace insufficient under load — after a 14h run, `StopSignal
+    SIGTERM failed to stop container partgraph-dgraph in 10 seconds,
+    resorting to SIGKILL` (unit exit status 137) — while a short-lived
+    instance shut down cleanly within the same window (the failure is
+    LOAD-dependent, not a fixed defect).
+    When STOP_GRACE_SECONDS is read directly.
+    Then it is 60 — a JUDGEMENT CALL informed by "10 is proven
+    insufficient", not a measured minimum — and STOP_TIMEOUT_S exceeds it
+    by a MEANINGFUL margin (>= 10s), not by a single second: a thin margin
+    would let the Python-level subprocess watchdog fire before the engine
+    finishes waiting out its own (now-larger) grace period, silently
+    defeating the fix by forcing a SIGKILL at the WATCHDOG layer instead of
+    the engine layer.
+    """
+    assert STOP_GRACE_SECONDS == 60, (
+        "STOP_GRACE_SECONDS must be raised from the proven-insufficient 10s "
+        f"default to a load-tolerant budget; got {STOP_GRACE_SECONDS}."
+    )
+    assert STOP_TIMEOUT_S > STOP_GRACE_SECONDS
+    margin = STOP_TIMEOUT_S - STOP_GRACE_SECONDS
+    assert margin >= _MEANINGFUL_WATCHDOG_MARGIN_S, (
+        f"STOP_TIMEOUT_S ({STOP_TIMEOUT_S}) must exceed STOP_GRACE_SECONDS "
+        f"({STOP_GRACE_SECONDS}) by a MEANINGFUL margin (>= "
+        f"{_MEANINGFUL_WATCHDOG_MARGIN_S}s); got a margin of only {margin}s."
+    )
+
+
+def test_stop_all_engine_stop_argv_carries_the_grace_period_via_dash_t() -> None:
+    """[Gate 7] Given stop_all() issues an engine `stop` for a surviving
+    S1/S2 instance.
+    When the stop argv is inspected.
+    Then it carries `-t <STOP_GRACE_SECONDS>` immediately before the
+    container-id target — the VALUE is pinned by READING the constant
+    itself (never a hard-coded literal), so this test stays correct across
+    any future change to STOP_GRACE_SECONDS and cannot be satisfied by a
+    stale `-t 10` that happens to still be present in argv.
+    """
+    row = _ps_row("cid-1", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+    fake_run, calls = _make_scripted_run(initial_rows=[row], mounts_by_id={"cid-1": []})
+    with patch("subprocess.run", side_effect=fake_run):
+        stop_all(
+            engine_prefix=["docker"], compose_down=lambda: None,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
+
+    stop_calls = [argv for argv, _k in calls if _is_engine_stop_call(argv)]
+    assert stop_calls, "expected at least one engine stop call"
+    for argv in stop_calls:
+        assert "-t" in argv, f"stop argv must carry '-t': {argv}"
+        t_index = argv.index("-t")
+        assert argv[t_index + 1] == str(STOP_GRACE_SECONDS), (
+            f"the '-t' value must be STOP_GRACE_SECONDS ({STOP_GRACE_SECONDS}), "
+            f"never a hard-coded literal: {argv}"
+        )
+
+
+def test_systemctl_stop_argv_never_carries_our_engine_grace_value() -> None:
+    """[Gate 7 HONESTY BOUNDARY] Given `db down` also stops the quadlet
+    systemd unit when it is present and active.
+    When the systemctl stop argv is inspected.
+    Then it NEVER carries STOP_GRACE_SECONDS, and never an `-t` flag at
+    all — PartGraph does not control the quadlet unit's own shutdown
+    timeout from inside this repo (its `ExecStop=podman rm -v -f` uses
+    whatever stop-timeout was baked in at quadlet-generation time; a
+    `StopTimeout=` drop-in on the HOST is PR-B1 territory). This pins the
+    boundary itself: the systemctl phase must never pretend to carry our
+    grace value.
+    """
+    fake_run, calls = _make_scripted_run(
+        initial_rows=[],
+        unit_lines=["LoadState=loaded", "ActiveState=active",
+                    "SubState=running", "UnitFileState=generated",
+                    "WantedBy=default.target"],
+    )
+    with (
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", return_value="/usr/bin/systemctl"),
+    ):
+        stop_all(
+            engine_prefix=["docker"], compose_down=lambda: None,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
+
+    systemctl_stop_calls = [argv for argv, _k in calls if _is_systemctl_stop_call(argv)]
+    assert systemctl_stop_calls, "expected a systemctl stop call"
+    for argv in systemctl_stop_calls:
+        assert str(STOP_GRACE_SECONDS) not in argv, (
+            "the systemctl stop argv must NEVER carry our engine grace "
+            f"value — PartGraph cannot influence the quadlet unit's own "
+            f"shutdown timeout from inside the repo: {argv}"
+        )
+        assert "-t" not in argv, f"systemctl stop must never carry '-t': {argv}"
 
 
 def test_max_ps_output_bytes_is_a_finite_positive_bound() -> None:
