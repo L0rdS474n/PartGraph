@@ -233,8 +233,12 @@ Three deliberate, enumerated breaking changes to the `db down` contract:
   Compose call. On a host with no `systemd --user` session, `systemctl` is
   simply never invoked (no error, the sweep continues).
 
-Also new: the `--dry-run` flag, which performs **only** the read-only unit query
-and the two enumerations, mutates nothing, and always exits 0.
+Also new: the `--dry-run` flag, which performs **only** the read-only steps —
+the unit query, the two enumerations and the health probe — mutates nothing, and
+always exits 0. It **reports** every one of those observations, including
+whether the health endpoint is answering: a preview must not pay for an answer
+and then discard it, and "the database is answering right now" is the one signal
+that still says something when no container matches any selector at all.
 
 ## Relationship to ADR-0009 (extended, not broken)
 

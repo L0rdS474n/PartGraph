@@ -253,6 +253,13 @@ def up() -> None:
 def _print_down_dry_run(result: DownResult) -> None:
     """Print what a real ``db down`` would have stopped, and what it would not.
 
+    Every field of *result* that a real run would act on is reported here,
+    including the health probe: a preview that silently discarded an answer it
+    had already paid for would be both wasted work and a worse preview. Whether
+    the database is answering right now is exactly what an operator about to
+    stop it wants to know — and it is the one signal that survives even when no
+    container matches any selector at all.
+
     ``markup=False``: every name here is engine-derived, so a '[...]'-bearing
     string must never be misread as a Rich style tag. ``soft_wrap=True`` keeps
     each message on the single line it is contracted to be.
@@ -277,6 +284,13 @@ def _print_down_dry_run(result: DownResult) -> None:
             markup=False,
             soft_wrap=True,
         )
+    _console.print(
+        "Dry run: the Dgraph health endpoint is answering right now."
+        if result.still_serving_health
+        else "Dry run: the Dgraph health endpoint is not answering.",
+        markup=False,
+        soft_wrap=True,
+    )
 
 
 def _down_success_line(result: DownResult) -> str:

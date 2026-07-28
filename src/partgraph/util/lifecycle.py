@@ -564,10 +564,22 @@ def find_partgraph_instances(
         present under some other tag.
 
     Raises:
-        subprocess.SubprocessError: If the enumeration call itself times out or
-            fails to execute. This is NOT degraded to an empty tuple: an
-            enumeration that never happened must never be mistaken for "nothing
-            is running".
+        subprocess.SubprocessError: If the enumeration call itself exceeds
+            :data:`ENUMERATE_TIMEOUT_S` (``TimeoutExpired``) or the child
+            process fails in a way the subprocess module reports.
+        OSError: If the engine binary cannot be executed at all — e.g. a
+            ``FileNotFoundError`` raised in the narrow window between
+            ``engine_command()``'s PATH check and the actual ``exec``, or a
+            permission error on the binary.
+
+    Neither is caught here, and that is DELIBERATE: an enumeration that never
+    happened must never be degraded to an empty tuple, because an empty tuple
+    reads as "nothing PartGraph owns is running" — the exact false success this
+    module exists to prevent. Every EXPECTED outcome (empty, unparseable,
+    oversized, or partially-malformed output; a non-zero ``ps`` exit) is
+    degraded to a result inside this function instead; only a failure to run
+    the enumeration at all escapes. ``db down`` turns both exception types into
+    one clean, path-free error line and a non-zero exit.
     """
     lookup = _resolve_which(which)
     prefix = _resolve_engine_prefix(engine_prefix, which=lookup, environ=environ)
@@ -780,9 +792,12 @@ def stop_all(  # noqa: PLR0913 — one keyword-only seam per injected dependency
         probe_health: Injected health seam; defaults to a lazy import of
             :func:`partgraph.util.health.probe_health`.
         dry_run: When True, every MUTATING step (the unit stop, *compose_down*,
-            the engine stop sweep) is skipped; the read-only unit query and both
-            enumerations still run, so the caller can report exactly what would
-            have been stopped.
+            the engine stop sweep) is skipped; the READ-ONLY steps — the unit
+            query, both enumerations and the health probe — still run, so the
+            caller can report exactly what would have been stopped and whether
+            the database is answering. Every field of the returned
+            :class:`DownResult` is therefore populated by a real observation
+            under ``dry_run`` too; none is a placeholder.
 
     Returns:
         A frozen :class:`DownResult` carrying display names only.
