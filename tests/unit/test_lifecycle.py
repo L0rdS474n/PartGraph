@@ -441,7 +441,15 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
     mounts_by_id = mounts_by_id or {}
     unit_lines = unit_lines if unit_lines is not None else _UNIT_NOT_FOUND_LINES
     inspect_fails_ids_by_pass = inspect_fails_ids_by_pass or {}
-    live: dict[str, dict] = {row["Id"]: row for row in initial_rows}
+    # `.get("Id") or .get("ID")` (never a bare `row["Id"]`): this fixture's
+    # OWN bookkeeping key must accept a Docker-shaped row (id key spelled
+    # 'ID') exactly like the production `_row_id()` it is standing in for —
+    # otherwise a Docker-shaped `initial_rows` entry raises `KeyError`
+    # before the scenario under test even runs. Backward compatible: every
+    # existing caller here only ever sets "Id", so this is additive.
+    live: dict[str, dict] = {
+        (row.get("Id") or row.get("ID")): row for row in initial_rows
+    }
     calls: list[tuple[list[str], dict]] = []
     ps_call_count = 0
 
@@ -1059,6 +1067,236 @@ def test_docker_shaped_ports_on_s2_container_does_not_change_classification() ->
 
     assert len(instances) == 1
     assert instances[0].owned_by == "S2"
+
+
+# ---------------------------------------------------------------------------
+# [Docker-parity investigation] Docker's `Id` -> `ID` key spelling and its
+# `Names` comma-joined STRING shape (not podman's list).
+#
+# `_row_id()`'s and `_row_name()`'s OWN docstrings already claim both engine
+# shapes are accepted ("Docker's `ps --format json` spells it 'ID'"; "Docker's
+# `ps --format json` reports [Names] as a single comma-joined string") — and,
+# read directly, the parser genuinely does (`row.get("Id") or row.get("ID")`;
+# `names.split(",")[0]` before allow-listing). But until the tests below were
+# added, NOTHING in this test suite (hermetic or integration) ever built a row
+# using either shape: Gate 5 Finding B closed the identical gap for the
+# `Ports` field only, and every `_ps_row`/`_ps_row_with_ports_field` fixture in
+# this file — including Gate 5 Finding B's own — still hard-codes `"Id"` and
+# `"Names": [name]` regardless of which engine prefix a test passes. So
+# `PARTGRAPH_CONTAINER_ENGINE=docker` on THIS host (or `engine_prefix=
+# ["docker"]` in a test) has only ever exercised podman's OWN row shape,
+# through the podman shim, wearing a "docker" argv[0] label — the exact "false
+# comfort" this investigation was asked to find, one field short of where
+# Gate 5 already found it.
+#
+# HERMETIC SIMULATION ONLY, clearly labelled per that finding: every test
+# below pins the row shape `partgraph.util.lifecycle`'s OWN docstrings already
+# assert Docker uses. None of it is validated against a real Docker daemon —
+# there is none on this host (independently confirmed while writing this
+# file: `dockerd` is not on PATH, `systemctl is-active docker` reports
+# "inactive", and `/usr/bin/docker` is a 228-byte POSIX shell script whose
+# entire body is `exec /usr/bin/podman "$@"`). If that documented shape is
+# ever wrong, these tests pin the WRONG thing convincingly; they cannot prove
+# it right, only that the code does what its own docstrings already claim.
+# ---------------------------------------------------------------------------
+
+
+def _ps_row_with_id_field(id_key: str, container_id: str, name: str, image: str, *,
+                           state: str = "running") -> dict:
+    """Like `_ps_row`, but with the id key spelled EXACTLY as `id_key`
+    ('Id' or 'ID') — isolates the id-key-spelling divergence from the
+    Names/Ports shape, mirroring `_ps_row_with_ports_field`'s isolation of the
+    Ports field alone.
+    """
+    return {
+        id_key: container_id,
+        "Names": [name],
+        "Image": image,
+        "State": state,
+        "Ports": [],
+    }
+
+
+def _ps_row_with_names_field(container_id: str, names_field: object, image: str, *,
+                              state: str = "running") -> dict:
+    """Like `_ps_row`, but with an EXPLICIT, already-shaped `Names` value —
+    Docker's comma-joined string (or a hostile variant of one) — isolating
+    the Names-shape divergence the same way `_ps_row_with_ports_field`
+    isolates Ports.
+    """
+    return {
+        "Id": container_id,
+        "Names": names_field,
+        "Image": image,
+        "State": state,
+        "Ports": [],
+    }
+
+
+def test_docker_shaped_id_key_ID_uppercase_is_accepted_same_as_podmans_Id() -> None:
+    """[Docker parity, HERMETIC SIMULATION — see section note above] Given a
+    `ps --all --format json` row spells the id key `ID` (Docker's own shape,
+    per `_row_id`'s docstring) rather than podman's `Id` — isolated: `Names`/
+    `Ports` stay in podman's own shape so only the id key itself is under
+    test.
+    When find_partgraph_instances() is called.
+    Then the row is still classified (S1, by its exact name) and
+    `Instance.id` is the value taken from the `ID` key.
+    """
+    row = _ps_row_with_id_field(
+        "ID", "cid-docker-id-key", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4",
+    )
+    fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert instances[0].id == "cid-docker-id-key"
+    assert instances[0].owned_by == "S1"
+
+
+def test_docker_shaped_names_comma_joined_string_single_name_matches_podman_list_shape() -> None:
+    """[Docker parity, HERMETIC SIMULATION — see section note above] Given a
+    row's `Names` is a single-element Docker-style comma-joined STRING
+    (`"partgraph-dgraph"`) rather than podman's `["partgraph-dgraph"]` list.
+    When find_partgraph_instances() is called.
+    Then it is classified identically to the podman list-shaped equivalent
+    (S1, by exact name) — the two shapes must be indistinguishable to every
+    downstream consumer.
+    """
+    docker_row = _ps_row_with_names_field(
+        "id-docker-names", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4",
+    )
+    podman_row = _ps_row("id-podman-names", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+
+    for row, cid in [(docker_row, "id-docker-names"), (podman_row, "id-podman-names")]:
+        fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+        with patch("subprocess.run", side_effect=fake_run):
+            instances = find_partgraph_instances(engine_prefix=["docker"])
+        assert len(instances) == 1, f"{cid}: {instances!r}"
+        assert instances[0].id == cid
+        assert instances[0].name == PARTGRAPH_CONTAINER_NAME
+        assert instances[0].owned_by == "S1"
+
+
+def test_docker_shaped_names_multiple_comma_separated_only_first_name_used() -> None:
+    """[Docker parity, HERMETIC SIMULATION — see section note above] Given a
+    Docker-shaped `Names` string carrying TWO comma-separated names — Docker
+    reports every name/alias a container has this way, e.g.
+    `"partgraph-dgraph,some-compose-alias"`.
+    When find_partgraph_instances() is called.
+    Then only the FIRST name is taken as `Instance.name` (mirrors
+    `_row_name`'s documented behaviour); the second name never appears in it.
+    """
+    row = _ps_row_with_names_field(
+        "id-multi-name", f"{PARTGRAPH_CONTAINER_NAME},some-compose-alias",
+        "dgraph/standalone:v25.3.4",
+    )
+    fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert instances[0].name == PARTGRAPH_CONTAINER_NAME
+    assert "some-compose-alias" not in instances[0].name
+
+
+def test_docker_shaped_names_second_segment_never_reaches_a_subprocess_argv_even_when_hostile() -> None:
+    """[Docker parity, security, HERMETIC SIMULATION — see section note
+    above] Given a Docker-shaped `Names` string whose FIRST segment is
+    PartGraph's own exact name (so the row IS classified and will be
+    inspected) and whose SECOND segment is a string that would fail the
+    allow-list outright on its own (`"; rm -rf /"`).
+    When find_partgraph_instances() is called.
+    Then the row is still classified S1 by its first name, and the hostile
+    second segment is never used for anything: `_row_name` splits on the
+    comma BEFORE allow-listing, so it can never smuggle a second value past
+    validation, and it never reaches ANY subprocess argv this sweep issues.
+    """
+    hostile_second = "; rm -rf /"
+    row = _ps_row_with_names_field(
+        "id-hostile-second-name", f"{PARTGRAPH_CONTAINER_NAME},{hostile_second}",
+        "dgraph/standalone:v25.3.4",
+    )
+    fake_run, calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert instances[0].owned_by == "S1"
+    assert instances[0].name == PARTGRAPH_CONTAINER_NAME
+    for argv, _kwargs in calls:
+        assert hostile_second not in argv, f"hostile second name segment reached argv: {argv}"
+
+
+def test_docker_shaped_id_key_is_the_container_inspect_target_for_s2_classification() -> None:
+    """[Docker parity, HERMETIC SIMULATION — see section note above] Given a
+    Docker-shaped row (id key `ID`) for a container with an ARBITRARY name
+    that mounts the PartGraph data volume — S2 classification requires a
+    `container inspect` call TARGETING the row's id.
+    When find_partgraph_instances() is called.
+    Then the `container inspect` call issued targets the id taken from the
+    `ID` key (never some other value), and the row is classified S2.
+    """
+    row = {
+        "ID": "cid-docker-s2",
+        "Names": "systemd-partgraph-dgraph-duplicate",
+        "Image": "dgraph/standalone:v25.3.4",
+        "State": "running",
+        "Ports": "",
+    }
+    fake_run, calls = _make_scripted_run(
+        initial_rows=[row], mounts_by_id={"cid-docker-s2": _mounts(PARTGRAPH_DATA_VOLUME)},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert instances[0].owned_by == "S2"
+    inspect_calls = [argv for argv, _kwargs in calls if _is_inspect_call(argv)]
+    assert inspect_calls, f"expected a container inspect call: {calls!r}"
+    assert inspect_calls[0][-1] == "cid-docker-s2"
+
+
+def test_fully_docker_shaped_row_parses_identically_to_the_equivalent_podman_shaped_row() -> None:
+    """[Docker parity, comprehensive, HERMETIC SIMULATION — see section note
+    above] Given ONE row using ALL THREE of Docker's own reported field
+    shapes simultaneously — `ID` (not `Id`), `Names` as a comma-joined string
+    (not a list), and `Ports` as a comma-joined string (not a list of dicts,
+    Gate 5 Finding B's own shape) — versus the SAME container described in
+    podman's own shape.
+    When find_partgraph_instances() is called against each shape separately.
+    Then both produce the SAME classification, the SAME display name and
+    image/status, and the SAME de-duplicated, sorted ports tuple — only the
+    opaque container id legitimately differs (each row is given its own).
+    """
+    docker_row = {
+        "ID": "cid-docker-full",
+        "Names": f"{PARTGRAPH_CONTAINER_NAME},compose-alias",
+        "Image": "dgraph/standalone:v25.3.4",
+        "State": "running",
+        "Ports": _docker_ports_string(8081, 9081, 8001),
+    }
+    podman_row = _ps_row(
+        "cid-podman-full", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4",
+        host_ports=(8081, 9081, 8001),
+    )
+
+    fake_docker, _calls_docker = _make_scripted_run(initial_rows=[docker_row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_docker):
+        docker_instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    fake_podman, _calls_podman = _make_scripted_run(initial_rows=[podman_row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_podman):
+        podman_instances = find_partgraph_instances(engine_prefix=["podman"])
+
+    assert len(docker_instances) == len(podman_instances) == 1
+    docker_instance, podman_instance = docker_instances[0], podman_instances[0]
+    assert docker_instance.name == podman_instance.name == PARTGRAPH_CONTAINER_NAME
+    assert docker_instance.owned_by == podman_instance.owned_by == "S1"
+    assert docker_instance.ports == podman_instance.ports == (8001, 8081, 9081)
+    assert docker_instance.image == podman_instance.image
+    assert docker_instance.status == podman_instance.status
 
 
 # ---------------------------------------------------------------------------

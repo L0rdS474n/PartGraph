@@ -1096,3 +1096,130 @@ def test_doctor_subprocess_call_count_is_bounded_over_a_large_synthetic_row_set(
         f"db doctor issued {call_count} subprocess calls for {len(rows)} "
         "rows — expected sub-linear scaling, not one call per row."
     )
+
+
+# ---------------------------------------------------------------------------
+# [Docker-parity investigation] Honest degradation on a host with NO systemd
+# user session at all, and Docker-shaped `ps` row consumption end to end.
+#
+# `_which_nothing_present` (defined earlier in this file, immediately after
+# `_which_systemctl_present`) was DEFINED but never once used by any test
+# before this section — a genuine gap, not a design choice: `db down`'s own
+# A10 ("systemctl absent") is pinned in tests/unit/test_cli_db_down.py, but
+# `db doctor` — the OTHER command ADR-0022 names as needing to "degrade
+# honestly on a host with no systemd user session" — had no equivalent. A
+# host that genuinely runs Docker rather than podman is exactly the host most
+# likely to have no `systemctl --user` session at all (a minimal container
+# image, a non-systemd distribution, or simply a machine where podman/quadlet
+# was never installed): the tri-state discipline this module already uses for
+# a QUERY failure (`unit_state()` returning `present=False`,
+# `wanted_by_default=None` "undetermined") must hold identically when there is
+# no `systemctl` BINARY to query in the first place — never silently upgraded
+# to "not present" being read as "confirmed absent" versus "cannot be asked".
+# ---------------------------------------------------------------------------
+
+
+def _which_engine_only(name: str) -> str | None:
+    """PATH lookup for a host with a container engine but NO systemd session
+    at all: only 'docker'/'podman' resolve, 'systemctl' does not — the
+    inverse of `_which_systemctl_present`.
+    """
+    return f"/usr/bin/{name}" if name in ("docker", "podman") else None
+
+
+def test_doctor_degrades_unit_honestly_when_systemctl_is_not_on_path_at_all() -> None:
+    """[Docker-parity, honest degradation] Given `shutil.which("systemctl")`
+    returns None — no systemd user session exists on this host at all (a
+    real, common Docker-host shape: a minimal image, a non-systemd
+    distribution, or simply no podman/quadlet ever installed) — while the
+    container ENGINE is still present and `db doctor`'s own instance/volume
+    sections work normally.
+    When `partgraph db doctor` runs.
+    Then NO `systemctl` subprocess call is made at all (not even `show`,
+    mirroring `db down`'s own A10), the unit line reports it as
+    "not present"/"not found"/"absent" (never guessed as anything else), the
+    `WantedBy` line says "unknown" and asserts NEITHER direction, and the
+    command still exits 0 with the instance/volume sections and the static
+    remediation text unaffected — a missing systemd session degrades the
+    SAME way a query that returns LoadState=not-found already does, never
+    worse and never silently.
+    """
+    row = _ps_row("cid-1", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+    fake = _make_doctor_scripted_run(
+        ps_rows=[row], mounts_by_id={"cid-1": []}, volume_returncode=0,
+    )
+    with (
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake) as mock_run,
+        patch("shutil.which", side_effect=_which_nothing_present),
+    ):
+        result = _invoke(["db", "doctor"])
+
+    _assert_clean(result, 0)
+    systemctl_calls = [
+        call for call in mock_run.call_args_list if call.args[0] and call.args[0][0] == "systemctl"
+    ]
+    assert systemctl_calls == [], (
+        f"no systemctl call should be made when it is not on PATH: {systemctl_calls!r}"
+    )
+    unit_line = _line_with(result.output, PARTGRAPH_UNIT_NAME)
+    low = unit_line.lower()
+    assert "not present" in low or "not found" in low or "absent" in low, (
+        f"expected the unit line to plainly say it is absent: {unit_line!r}"
+    )
+    wanted_by_line = _line_with(result.output, "WantedBy")
+    assert "unknown" in wanted_by_line.lower(), (
+        f"a systemctl-absent host must report WantedBy as unknown, never guessed: "
+        f"{wanted_by_line!r}"
+    )
+    # The engine-dependent sections still work: the instance is still visible.
+    instance_line = _line_with(result.output, PARTGRAPH_CONTAINER_NAME)
+    assert "Running PartGraph instance" in instance_line, (
+        f"a missing systemd session must not degrade the UNRELATED instance "
+        f"section: {instance_line!r}"
+    )
+
+
+def test_doctor_reports_a_docker_shaped_ps_row_identically_to_a_podman_shaped_one() -> None:
+    """[Docker parity, HERMETIC SIMULATION] Given the SAME running PartGraph
+    instance, reported ONCE via a Docker-shaped `ps` row (id key `ID`, a
+    comma-joined `Names` string) and ONCE via the podman-shaped equivalent
+    `_ps_row()` already used everywhere else in this file.
+
+    HERMETIC SIMULATION ONLY: pins the row shape `partgraph.util.lifecycle`'s
+    own docstrings already document Docker as using (see
+    tests/unit/test_lifecycle.py's Docker-parity section note for the full
+    disclosure) — not validated against a real Docker daemon, which does not
+    exist on this host.
+    When `partgraph db doctor` runs against each shape separately.
+    Then both produce a "Running PartGraph instance" line naming
+    `partgraph-dgraph` with the SAME selector tag (S1) — proving `db doctor`,
+    not just the leaf parser, treats the two shapes identically.
+    """
+    docker_row = {
+        "ID": "cid-docker-doctor",
+        "Names": f"{PARTGRAPH_CONTAINER_NAME},compose-alias",
+        "Image": "dgraph/standalone:v25.3.4",
+        "State": "running",
+        "Ports": "",
+    }
+    podman_row = _ps_row("cid-podman-doctor", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+
+    for row in (docker_row, podman_row):
+        fake = _make_doctor_scripted_run(ps_rows=[row], volume_returncode=1)
+        with (
+            patch("partgraph.cli.engine_command", return_value=["docker"]),
+            patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+            patch("subprocess.run", side_effect=fake),
+            patch("shutil.which", side_effect=_which_systemctl_present),
+        ):
+            result = _invoke(["db", "doctor"])
+
+        _assert_clean(result, 0)
+        instance_line = _line_with(result.output, "Running PartGraph instance")
+        assert PARTGRAPH_CONTAINER_NAME in instance_line
+        assert "selector S1" in instance_line, (
+            f"expected an S1 selector tag regardless of row shape: {instance_line!r}"
+        )
+        assert "compose-alias" not in result.output
