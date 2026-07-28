@@ -780,11 +780,24 @@ def _existing_dummy_sqlite(tmp_path) -> os.PathLike[str]:
 def test_b6_ingest_jlcparts_load_stage_triggers_autostart_before_db_work_with_real_seams(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """B-6 [BLOCKING 1 fix]: Given `partgraph ingest jlcparts` reaches the
-    LOAD stage (the source file exists, and both fetch/normalize are
-    stubbed to succeed). `partgraph.normalize.run.normalize` is a LOCAL,
-    non-DB stage and is deliberately left OUTSIDE the ordering check; only
-    `_build_dgraph_client` (reached inside `_stage_load`) is the marker.
+    """B-6 [BLOCKING 1 fix; fixture fixed per Gate re-review, defect 2]: Given
+    `partgraph ingest jlcparts` reaches the LOAD stage (the source file
+    "exists" as a 0-byte dummy, and fetch/normalize's OWN sub-steps are all
+    stubbed to succeed). `_stage_normalize` does not merely call
+    `partgraph.normalize.run.normalize` — it FIRST constructs
+    `JlcpartsAdapter(open_jlcparts_db(dest))`, both imported lazily from
+    `partgraph.sources.jlcparts` inside `_stage_normalize` itself, and a
+    0-byte dummy file fails `open_jlcparts_db`'s own schema introspection
+    (`Unrecognized jlcparts schema: the 'components' table is missing the
+    required 'lcsc' column`) before `normalize()` is ever reached — so both
+    are patched at their ORIGIN module here too (mirrors how
+    `partgraph.normalize.run.normalize`/`partgraph.load.loader.Loader.load`
+    are already patched at THEIR origin modules, since all three are lazy,
+    function-local imports inside cli.py, never module-level `cli_mod`
+    attributes). `open_jlcparts_db`/`JlcpartsAdapter` and
+    `partgraph.normalize.run.normalize` are all LOCAL, non-DB stages and are
+    deliberately left OUTSIDE the ordering check; only `_build_dgraph_client`
+    (reached inside `_stage_load`) is the marker.
     When it runs with autostart ON.
     Then `ensure_running` fires strictly before `_build_dgraph_client`
     during the load stage, with the CLI's real `probe_health` and a genuine
@@ -813,6 +826,8 @@ def test_b6_ingest_jlcparts_load_stage_triggers_autostart_before_db_work_with_re
                 order, "_build_dgraph_client", return_value=(mock_client, MagicMock())
             ),
         ),
+        patch("partgraph.sources.jlcparts.open_jlcparts_db", return_value=MagicMock()),
+        patch("partgraph.sources.jlcparts.JlcpartsAdapter"),
         patch("partgraph.normalize.run.normalize", return_value=None),
         patch("partgraph.load.loader.Loader.load", return_value=None),
     ):
@@ -854,11 +869,22 @@ def test_b6_ingest_jlcparts_fetch_stage_never_triggers_autostart(
 def test_b6_ingest_jlcparts_normalize_stage_never_triggers_autostart(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """B-6 (negative half): Given `partgraph ingest jlcparts` (no --fetch,
-    source file present) where the NORMALIZE stage itself fails (never
-    reaching load).
+    """B-6 (negative half) [fixture fixed per Gate re-review, defect 2 — "the
+    two negative siblings must stay meaningful"]: Given `partgraph ingest
+    jlcparts` (no --fetch, source file "present" as a 0-byte dummy) where the
+    NORMALIZE stage itself fails (never reaching load). `open_jlcparts_db`/
+    `JlcpartsAdapter` (both lazily imported from `partgraph.sources.jlcparts`
+    inside `_stage_normalize`, exactly like the load-stage positive test
+    above) are patched to succeed on the dummy file, so the injected
+    `_failing_normalize` RuntimeError is what genuinely aborts the run — a
+    0-byte dummy's OWN, unrelated schema-validation failure inside
+    `open_jlcparts_db` would otherwise abort the run FIRST, making this test
+    pass for the wrong reason (never actually reaching, let alone failing
+    inside, `normalize()` at all).
     When it runs with autostart ON.
-    Then `ensure_running` is NEVER called.
+    Then `ensure_running` is NEVER called, and the failure is attributably
+    the injected normalize failure (its own message reaches the output),
+    not an earlier, unrelated one.
     """
     _autostart_on(monkeypatch)
     monkeypatch.setattr(cli_mod, "RAW_DB_PATH", _existing_dummy_sqlite(tmp_path))
@@ -868,12 +894,20 @@ def test_b6_ingest_jlcparts_normalize_stage_never_triggers_autostart(
 
     with (
         patch("partgraph.cli.ensure_running") as mock_ensure,
+        patch("partgraph.sources.jlcparts.open_jlcparts_db", return_value=MagicMock()),
+        patch("partgraph.sources.jlcparts.JlcpartsAdapter"),
         patch("partgraph.normalize.run.normalize", side_effect=_failing_normalize),
         patch("subprocess.run", side_effect=_forbid_any_subprocess),
     ):
         result = _invoke(["ingest", "jlcparts"])
 
     assert result.exit_code != 0, result.output
+    assert "malformed source database" in result.output, (
+        f"expected the INJECTED normalize failure's own message in the "
+        f"output, proving the run genuinely reached and failed inside "
+        f"normalize() rather than aborting earlier for an unrelated reason: "
+        f"{result.output!r}"
+    )
     mock_ensure.assert_not_called()
 
 
@@ -1059,15 +1093,36 @@ def test_b7_help_never_autostarts_and_spawns_no_subprocess(args: list[str]) -> N
 
 # ---------------------------------------------------------------------------
 # B-8 — validation errors never start a container: the flag is rejected
-# BEFORE autostart is reached. Reuses the exact existing scenarios pinned by
+# BEFORE autostart is reached. Reuses existing scenarios pinned by
 # tests/unit/test_cli_search.py's own `_build_dgraph_client` never-called
 # assertions (not modified here — this file only ADDS an `ensure_running`
-# assertion on top of the same, unmodified scenarios).
+# assertion on top of the same, unmodified scenarios) — specifically
+# `--min-stock abc` (AC-SF-28) and `--sort bogus` (AC-SF-40), both of which
+# genuinely exist there. `search --limit` is deliberately NOT one of these
+# cases: unlike `embed`/`refresh`/`refresh-links`/`ingest jlcparts`,
+# `search`'s own `--limit` is a bare Typer `int` with no `_validate_limit()`
+# call at all (confirmed by `grep -n "_validate_limit(limit)" src/partgraph/
+# cli.py`, which lists exactly four call sites and `search` is not one of
+# them) — `--limit 0` is silently clamped to 1 by
+# `partgraph.query.dql_builder`'s `max(1, min(int(limit), MAX_RESULT_LIMIT))`
+# and the command exits 0. An earlier draft of this file asserted the
+# opposite (a fabricated citation, caught in review — see this module's own
+# note on the habit below); pinning that non-existent behaviour here would
+# have been the third such fabrication in this body of work. See the FOLLOW-UP
+# note below the last test in this section: this silent-clamp-vs-reject
+# inconsistency between `search` and its siblings is real and worth fixing,
+# but doing so is a user-visible contract change outside PR-B2's scope, not
+# a test-authoring fix.
 # ---------------------------------------------------------------------------
 
 
-def test_b8_search_limit_zero_never_autostarts(monkeypatch: pytest.MonkeyPatch) -> None:
-    """B-8: Given `search --limit 0` (an invalid --limit value).
+def test_b8_search_sort_invalid_never_autostarts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B-8: Given `search --sort bogus` (AC-SF-40 — an invalid --sort value,
+    rejected by `_validate_sort_flag` with a fixed exit-1 message BEFORE any
+    Dgraph client is built; see
+    `tests/unit/test_cli_search.py::test_ac_sf_40_sort_bogus_value_exits_1_not_2_no_db_query`,
+    whose own `_build_dgraph_client` never-called assertion this test reuses
+    unmodified, adding only the `ensure_running` half).
     When it runs with autostart ON.
     Then `ensure_running` is never called and no subprocess is spawned —
     the validation error is reached and reported before autostart.
@@ -1078,11 +1133,30 @@ def test_b8_search_limit_zero_never_autostarts(monkeypatch: pytest.MonkeyPatch) 
         patch.object(cli_mod, "_build_dgraph_client") as mock_build,
         patch("subprocess.run", side_effect=_forbid_any_subprocess),
     ):
-        result = _invoke(["search", "MAX232", "--limit", "0"])
+        result = _invoke(["search", "MAX232", "--sort", "bogus"])
 
-    assert result.exit_code != 0, result.output
+    assert result.exit_code == 1, result.output
+    assert "--sort must be one of: relevance, stock, price." in result.output
     mock_ensure.assert_not_called()
     mock_build.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# FOLLOW-UP (recorded here, deliberately NOT fixed by this file — a
+# user-visible contract change with no ADR is out of scope for PR-B2):
+# `search --limit 0` silently CLAMPS to 1 (`partgraph.query.dql_builder`'s
+# `max(1, min(int(limit), MAX_RESULT_LIMIT))`) and exits 0, while
+# `embed --limit 0` / `refresh --limit 0` / `refresh-links --limit 0` /
+# `ingest jlcparts --limit 0` all REJECT it via the shared `_validate_limit()`
+# helper and exit 1 with "--limit must be a positive integer." `search` is
+# the one command among these five that never calls `_validate_limit()` at
+# all (confirmed: `grep -n "_validate_limit(limit)" src/partgraph/cli.py`
+# lists exactly four call sites, none of them `search`). This inconsistency
+# predates PR-B2 and is orthogonal to autostart; it should become its own
+# small fix (either give `search --limit` the same validator, or document
+# the clamp deliberately) with its own test coverage, not be silently
+# absorbed into this file.
+# ---------------------------------------------------------------------------
 
 
 def test_b8_search_min_stock_not_an_integer_never_autostarts(
