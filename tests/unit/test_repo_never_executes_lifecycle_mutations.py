@@ -24,37 +24,80 @@ AC-B3's own remediation text impossible to write while staying green here,
 which would be a genuinely self-contradictory pair of acceptance tests.
 
 THE ACTUAL SEMANTIC LINE this file draws: a forbidden term may appear
-ANYWHERE in `src/` **except** inside the argument list of a call this
-process would itself EXECUTE or a filesystem WRITE this process would itself
+ANYWHERE in `src/` **except** where it would reach a call this process
+would itself EXECUTE or a filesystem WRITE this process would itself
 PERFORM — subprocess/process-exec calls (`subprocess.run`/`Popen`/`call`/
 `check_call`/`check_output`, `os.system`/`os.popen`/`os.exec*`/`os.spawn*`)
 and file-mutating calls (`open`/`write_text`/`write_bytes`/`replace`/
 `rename`/`remove`/`unlink`/`rmtree`/`move`/`copy*`/`mkdir`/`makedirs`/
-`rmdir`/`symlink`/`chmod`/`truncate`). Everything else — a docstring, a `#`
-comment (never even reaches the AST, so it is automatically exempt), a
-`console.print(...)` remediation message, a module-level constant used only
-for display — is legitimate prose and is deliberately left alone. This is
-also EXACTLY the "concrete example" this file's own author was asked to
-defend against: "genuinely fail if someone later adds a
-`subprocess.run([... "daemon-reload"])`" — that shape (a forbidden literal
-inside a recognised dangerous call's own argument subtree, including nested
-list/f-string literals) is precisely what `_find_violations` below detects,
-and the self-test section proves it does, with both a positive control (must
-flag) and negative controls (must NOT flag: docstring, comment, print/display
-text).
+`rmdir`/`symlink`/`chmod`/`truncate`) — INCLUDING when the actual call is
+made through a LOCAL wrapper function around one of those (this repo's own
+idiom, see the GATE 3A note below), and INCLUDING when a forbidden term
+reaches such a call via a same-file variable assignment rather than an
+inline literal. Everything else — a docstring, a `#` comment (never even
+reaches the AST, so it is automatically exempt), a `console.print(...)`
+remediation message, a module-level constant used only for display — is
+legitimate prose and is deliberately left alone. This is also EXACTLY the
+"concrete example" this file's own author was asked to defend against:
+"genuinely fail if someone later adds a `subprocess.run([...
+"daemon-reload"])`" — that shape, and the two shapes below it that this
+repo's real code actually uses, are precisely what `_find_violations`
+detects, and the self-test section proves it does, with positive controls
+(must flag) and negative controls (must NOT flag: docstring, comment,
+print/display text).
+
+GATE 3A BLOCKING 1 (fixed here; the earlier version of this scanner was
+verified, not merely believed, to catch NOTHING real): grepping for a
+literal `subprocess.run([` argv-list-opener across
+src/partgraph/util/lifecycle.py and src/partgraph/cli.py returns NOTHING.
+Every real call in this repo goes through a local wrapper —
+`lifecycle.py`'s own `_run_capture(argv, *, timeout)`, whose body calls
+`subprocess.run(argv, ...)` with `argv` as a bound PARAMETER, never a
+literal — so a scanner that only recognised the builtin names `run`/
+`Popen`/... as dangerous matched zero real call sites, while its own
+docstring FALSELY claimed the opposite ("every `subprocess.run([...])` call
+already in `src/partgraph/util/lifecycle.py` and `src/partgraph/cli.py`") —
+a second fabricated, un-grepped claim in this PR's test docstrings, found and
+corrected together with the phantom `cli.py` fixture-convention citation
+(see CONTRIBUTING.md's "Test fixtures stay local to their file" paragraph).
+Both were justifications written to make a weaker check look sufficient;
+that is the pattern to distrust here, not just these two instances.
+`_effective_dangerous_names` now also recognises a same-module wrapper
+function BY NAME (fixed-point, any depth — "resolving the wrapper by name
+within the same module is enough, full interprocedural analysis is not
+wanted"), and `_scoped_assignment_fragments` resolves the MORE common real
+shape — `argv = [...]` one line earlier, then `_run_capture(argv, ...)`
+(lifecycle.py:577-579, :802-814, :902-904) — not only the inline-literal
+shape (lifecycle.py:765-767, :866-871). This resolution is SCOPE-PRECISE
+(walked once per function, via `_walk_same_scope`, not once per whole
+file): a bare Name is resolved only against an assignment DIRECTLY in the
+SAME function (or the module level) as the call using it — a same-named
+local in an unrelated function, or a wrapper's OWN parameter of the same
+name (a parameter is never an `ast.Assign`), is never conflated with it.
+An EARLIER draft of this fix used one flat, whole-file assignment map
+instead, and a self-test (kept, not deleted, once the bug it caught was
+fixed) demonstrated the resulting false attribution directly: `_run_capture`'s
+own `argv` PARAMETER was wrongly resolved against an UNRELATED caller's
+local `argv` variable purely because they share a name, reporting the same
+violation twice at two unrelated lines. `_joined_div_chain_fragments`
+additionally reconstructs a term split across pathlib's `/` operand chain
+(`Path.home() / ".config" / "containers" / "systemd" / ...`), which
+otherwise splits the compound term "containers/systemd" across separate
+`ast.Constant` fragments that individually match nothing; it also
+deliberately processes only the OUTERMOST `Div` BinOp of each chain (an
+identical, still-disclosed reason: an earlier draft processed every nested
+BinOp in the chain independently and reported OVERLAPPING PREFIXES of the
+same chain as separate, redundant violations).
 
 HONEST SCOPE LIMITATION (documented, not hidden — this file's own author
-must not overclaim): the scanner inspects only the ARGUMENT SUBTREE of each
-recognised dangerous call. It does NOT perform cross-statement dataflow
-analysis, so `argv = [engine, "daemon-reload"]; subprocess.run(argv)` (the
-forbidden literal built in one statement, then passed to the dangerous call
-via a bare variable in a LATER statement) would NOT be caught. This is a
-known, disclosed gap, not a claim of exhaustive proof — it directly catches
-the concrete evasion shape this AC names, and the repo's existing style
-(inline list-literal argv, e.g. every `subprocess.run([...])` call already in
-`src/partgraph/util/lifecycle.py` and `src/partgraph/cli.py`) makes the
-indirect form both unidiomatic here and, if it ever appeared, a strong
-independent signal worth a human's attention regardless of this scanner.
+must not overclaim, and was corrected once already in this PR for
+overclaiming): the assignment resolution above is deliberately SINGLE-HOP —
+`a = [..., "daemon-reload"]; f(a)` is caught, but
+`a = b; b = [..., "daemon-reload"]; f(a)` (aliasing through a SECOND
+variable within the SAME scope) is not; `a` is never traced through `b`.
+True cross-MODULE (interprocedural, across files) resolution remains
+entirely out of scope, as explicitly requested. This is a known, disclosed
+gap, not a claim of exhaustive proof.
 """
 
 from __future__ import annotations
@@ -95,13 +138,86 @@ DANGEROUS_CALL_NAMES: frozenset[str] = _EXEC_CALL_NAMES | _MUTATE_CALL_NAMES
 
 
 def _callee_name(node: ast.Call) -> str | None:
-    """Return the call's own name: the last dotted attribute, or a bare name."""
+    """Return the call's own resolved name.
+
+    Handles three shapes:
+      - a plain dotted attribute (``subprocess.run(...)`` -> ``"run"``);
+      - a bare name (``run(...)`` -> ``"run"``, also how a local wrapper
+        function or an import-aliased name resolves);
+      - [cheap defence-in-depth] dynamic dispatch via ``getattr(x, "name")``
+        used AS the callee expression itself (``getattr(subprocess,
+        "run")(...)``) — the literal string argument IS the resolved name.
+    """
     func = node.func
     if isinstance(func, ast.Attribute):
         return func.attr
     if isinstance(func, ast.Name):
         return func.id
+    if (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[1], ast.Constant)
+        and isinstance(func.args[1].value, str)
+    ):
+        return func.args[1].value
     return None
+
+
+def _flatten_div_chain(node: ast.BinOp) -> list[ast.AST]:
+    """Flatten a LEFT-associative chain of ``/`` (``ast.Div``) BinOps into
+    its operands in left-to-right order, e.g. ``a / b / c`` (which parses as
+    ``BinOp(BinOp(a, Div, b), Div, c)``) becomes ``[a, b, c]``.
+    """
+    if isinstance(node.left, ast.BinOp) and isinstance(node.left.op, ast.Div):
+        return [*_flatten_div_chain(node.left), node.right]
+    return [node.left, node.right]
+
+
+def _joined_div_chain_fragments(node: ast.AST) -> list[str]:
+    """[GATE 3A BLOCKING 1] Reconstruct a forbidden term split across
+    pathlib's ``/`` operator, e.g. ``Path.home() / ".config" / "containers"
+    / "systemd"``: each segment is its OWN separate ``ast.Constant``, so no
+    SINGLE fragment contains "containers/systemd" — this joins each MAXIMAL
+    run of >= 2 ADJACENT string-literal operands with ``'/'`` so the
+    compound term becomes visible again, exactly as it would read on disk.
+    A non-literal operand (``Path.home()``) breaks a run without discarding
+    what came before it.
+
+    Processes ONLY the OUTERMOST ``Div`` BinOp of each chain: a chain of N
+    ``/`` operators parses as N-1 NESTED ``BinOp`` nodes (``a/b/c`` is
+    ``BinOp(BinOp(a, Div, b), Div, c)``), and ``ast.walk`` visits every one
+    of them individually — processing each independently would re-derive
+    overlapping PREFIXES of the same chain (e.g. both ``"b/c"`` and
+    ``"a/b/c"``) as separate, redundant fragments. A ``BinOp``/``Div`` node
+    that is itself the ``.left`` of another ``Div`` BinOp is an interior
+    link, not a chain's outermost node, and is skipped; the outermost node's
+    own flatten already covers its full length.
+    """
+    div_nodes = [
+        child for child in ast.walk(node)
+        if isinstance(child, ast.BinOp) and isinstance(child.op, ast.Div)
+    ]
+    interior_ids = {
+        id(child.left) for child in div_nodes
+        if isinstance(child.left, ast.BinOp) and isinstance(child.left.op, ast.Div)
+    }
+    joined: list[str] = []
+    for child in div_nodes:
+        if id(child) in interior_ids:
+            continue
+        run: list[str] = []
+        for operand in _flatten_div_chain(child):
+            if isinstance(operand, ast.Constant) and isinstance(operand.value, str):
+                run.append(operand.value)
+                continue
+            if len(run) >= 2:
+                joined.append("/".join(run))
+            run = []
+        if len(run) >= 2:
+            joined.append("/".join(run))
+    return joined
 
 
 def _string_fragments(node: ast.AST) -> list[str]:
@@ -111,55 +227,207 @@ def _string_fragments(node: ast.AST) -> list[str]:
     so this reaches string literals inside a nested list literal
     (``["a", "b"]``) and inside an f-string's literal segments (each
     non-interpolated chunk of an ``ast.JoinedStr`` is its own ``ast.Constant``
-    child) without any special-casing.
+    child) without any special-casing. Also includes reconstructed
+    ``/``-chain fragments (:func:`_joined_div_chain_fragments`).
     """
-    return [
+    plain = [
         child.value
         for child in ast.walk(node)
         if isinstance(child, ast.Constant) and isinstance(child.value, str)
     ]
+    return plain + _joined_div_chain_fragments(node)
+
+
+def _import_aliases_of_dangerous_names(tree: ast.Module) -> set[str]:
+    """[GATE 3A BLOCKING 1, cheap defence-in-depth] Return every LOCAL alias
+    a ``from ... import <dangerous> as <alias>`` statement introduces for an
+    already-known-dangerous name (e.g. ``from subprocess import Popen as
+    P`` -> ``{"P"}``). A plain ``import subprocess as sp`` needs no special
+    handling: ``sp.run(...)``'s own ``.attr`` is still ``"run"``, already
+    matched by :func:`_callee_name` regardless of the module's own alias.
+    """
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in DANGEROUS_CALL_NAMES and alias.asname:
+                    aliases.add(alias.asname)
+    return aliases
+
+
+def _local_wrapper_function_names(tree: ast.Module, seed: frozenset[str]) -> set[str]:
+    """[GATE 3A BLOCKING 1] Return the names of every function DEFINED in
+    this module whose OWN body calls something already known dangerous —
+    "resolving the wrapper BY NAME within the same module", exactly the
+    scope this fix was asked for (no cross-module/interprocedural
+    resolution). Iterated to a FIXED POINT so a wrapper-of-a-wrapper, at any
+    depth, is still recognised (e.g. a future ``doctor()`` helper that calls
+    ``_run_capture`` which calls ``subprocess.run`` — two hops).
+
+    Deliberately NOT scope-precise: ``ast.walk(func)`` also descends into any
+    function NESTED inside ``func``, so a call inside a nested function could
+    be mis-attributed to the OUTER function's name too. This over-
+    approximates rather than under-approximates — the safe direction for a
+    guard whose job is to never silently miss a real violation.
+    """
+    func_defs = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    wrapper_names: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        current = seed | wrapper_names
+        for func in func_defs:
+            if func.name in wrapper_names:
+                continue
+            for call in ast.walk(func):
+                if isinstance(call, ast.Call) and _callee_name(call) in current:
+                    wrapper_names.add(func.name)
+                    changed = True
+                    break
+    return wrapper_names
+
+
+def _effective_dangerous_names(tree: ast.Module) -> frozenset[str]:
+    """The full, file-scoped set of callee names this scanner treats as
+    dangerous: the base builtin set, PLUS import aliases of any of them,
+    PLUS every local wrapper function (at any fixed-point depth) whose own
+    body calls something already in that combined set.
+    """
+    seed = frozenset(DANGEROUS_CALL_NAMES | _import_aliases_of_dangerous_names(tree))
+    return frozenset(seed | _local_wrapper_function_names(tree, seed))
+
+
+#: Node types that open a NEW lexical scope — a bare Name assignment on one
+#: side of one of these never leaks into the other side, matching real
+#: Python scoping (a function's own local variables are invisible to a
+#: DIFFERENT function, even one defined earlier in the same file).
+_SCOPE_BOUNDARY_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _walk_same_scope(scope_node: ast.AST):
+    """Yield every descendant of *scope_node* belonging to *scope_node*'s
+    OWN lexical scope (a module body or a single function body): recurses
+    through control-flow blocks (``if``/``for``/``while``/``with``/``try``/
+    ``match``, which share the enclosing scope in Python) but does NOT
+    descend past a nested function/lambda/class boundary — each of those
+    opens its own separate scope, walked independently as its own entry in
+    :func:`_find_violations`'s ``scopes`` list.
+    """
+    stack = list(ast.iter_child_nodes(scope_node))
+    while stack:
+        current = stack.pop()
+        yield current
+        if isinstance(current, _SCOPE_BOUNDARY_TYPES):
+            continue
+        stack.extend(ast.iter_child_nodes(current))
+
+
+def _scoped_assignment_fragments(scope_node: ast.AST) -> dict[str, list[str]]:
+    """[GATE 3A BLOCKING 1, the MORE common real shape than an inline
+    literal] Map every simple ``name = <expr>`` assignment DIRECTLY within
+    *scope_node*'s own scope (never a NESTED function's) to the string/
+    ``/``-chain fragments found in its right-hand side — this is what lets
+    a bare-Name argument at a dangerous call site (e.g. ``argv = [...]`` one
+    line earlier, then ``_run_capture(argv, timeout=...)`` — the shape MOST
+    of this repo's own real call sites actually use, e.g.
+    lifecycle.py:577-579/802-814/902-904) be resolved.
+
+    SCOPE-PRECISE: a bare Name is resolved only against an assignment in the
+    SAME function (or the module level, for module-level calls) — never a
+    same-named local in a DIFFERENT, unrelated function, and never a
+    same-named PARAMETER of the function containing the call (a parameter is
+    never an ``ast.Assign`` at all, so it is correctly never present here).
+    Still deliberately SINGLE-HOP, not transitive: ``a = [...]`` is
+    resolved; ``a = b; b = [...]`` is not — ``a`` is never traced through
+    ``b``. This stays intentionally short of "full interprocedural
+    analysis", which was explicitly not wanted: it is a single function's
+    (or the module's) own local variables only — no execution, no
+    control-flow graph, no cross-function dataflow.
+    """
+    mapping: dict[str, list[str]] = {}
+    for node in _walk_same_scope(scope_node):
+        if isinstance(node, ast.Assign):
+            fragments = _string_fragments(node.value)
+            if not fragments:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    mapping.setdefault(target.id, []).extend(fragments)
+    return mapping
+
+
+def _resolved_call_fragments(node: ast.Call, assignment_map: dict[str, list[str]]) -> list[str]:
+    """Return *node*'s own string fragments PLUS, for every bare ``Name``
+    anywhere in its subtree (covering both a direct argument and a Name
+    inside the callee expression, e.g. ``p.write_text(...)``'s ``p``), the
+    fragments of any same-named assignment found in *assignment_map* (the
+    CALLING scope's own local assignments — see :func:`_scoped_assignment_fragments`).
+    """
+    fragments = _string_fragments(node)
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and child.id in assignment_map:
+            fragments.extend(assignment_map[child.id])
+    return fragments
 
 
 def _find_violations(source: str, label: str) -> list[str]:
     """Return one message per forbidden term found inside a dangerous call's
     subtree in *source* (labelled *label* for the message).
 
+    "Dangerous" is FILE-SCOPED, not a fixed global set
+    (:func:`_effective_dangerous_names`): the builtin exec/mutate names,
+    their import aliases, and any LOCAL wrapper function (at any depth)
+    whose own body calls something already dangerous — this repo's actual
+    idiom is `subprocess.run` wrapped once by a local `_run_capture(argv,
+    *, timeout)` helper, so recognising only the builtin names caught
+    nothing real at all (Gate 3a BLOCKING 1).
+
     Scans the WHOLE matched ``Call`` node — including ``node.func`` — not
-    just ``node.args``/``node.keywords``. This is REQUIRED for a common,
-    realistic pattern this scanner must not miss:
-    ``Path("...containers/systemd...").write_text("x")``. There, the
-    dangerous verb is ``write_text``, but the forbidden path string lives
-    inside the *callee* expression's own nested ``Path(...)`` call — i.e.
-    inside ``node.func.value``, not inside ``node.args``. Including
-    ``node.func`` in the scan is SAFE: a call's own name (e.g. ``"run"``,
-    ``"write_text"``) is an ``ast.Name``/``ast.Attribute`` node, never an
-    ``ast.Constant`` string, so it can never be picked up by
-    :func:`_string_fragments` regardless. (An earlier version of this
-    scanner excluded ``node.func`` on exactly that "the call name itself
-    could never match" reasoning, but then missed this call chain entirely —
-    the reasoning was right, the exclusion was an unrelated and unnecessary
-    scope-narrowing that cost real coverage; a positive-control self-test
-    below pins this exact chained-call shape so a regression here is
-    caught immediately, not just asserted away in prose.)
+    just ``node.args``/``node.keywords``, so a chained callee expression
+    (``Path("...").write_text("x")``, whose forbidden string lives inside
+    ``node.func.value``) is still caught. A bare ``Name`` ANYWHERE in that
+    subtree is additionally resolved against that SAME CALL's own enclosing
+    SCOPE's local assignments (:func:`_scoped_assignment_fragments`,
+    computed once per scope and reused for every call directly in it), so
+    the more common ``argv = [...]; _run_capture(argv, ...)`` shape is
+    caught too, not only an inline literal at the call site — while a
+    same-named variable in a DIFFERENT function, or a wrapper's OWN
+    parameter of the same name, is correctly never conflated with it.
+
+    Iterates scope-by-scope (the module, then every function/async function
+    def, regardless of nesting) rather than one flat whole-tree walk, which
+    is what makes the scope precision above possible. De-duplicates the
+    returned messages (``dict.fromkeys``) as a final safety net.
     """
     tree = ast.parse(source, filename=label)
+    effective_dangerous = _effective_dangerous_names(tree)
+    scopes: list[ast.AST] = [tree] + [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
     violations: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        name = _callee_name(node)
-        if name not in DANGEROUS_CALL_NAMES:
-            continue
-        pieces = _string_fragments(node)
-        for piece in pieces:
-            lowered = piece.lower()
-            for term in FORBIDDEN_TERMS:
-                if term in lowered:
-                    violations.append(
-                        f"{label}:{node.lineno}: forbidden term {term!r} found inside "
-                        f"an argument to {name!r}(): {piece!r}"
-                    )
-    return violations
+    for scope in scopes:
+        assignment_map = _scoped_assignment_fragments(scope)
+        for node in _walk_same_scope(scope):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _callee_name(node)
+            if name not in effective_dangerous:
+                continue
+            pieces = _resolved_call_fragments(node, assignment_map)
+            for piece in pieces:
+                lowered = piece.lower()
+                for term in FORBIDDEN_TERMS:
+                    if term in lowered:
+                        violations.append(
+                            f"{label}:{node.lineno}: forbidden term {term!r} found inside "
+                            f"an argument to {name!r}() (directly, via a chained callee, "
+                            f"or via a same-scope local variable): {piece!r}"
+                        )
+    return list(dict.fromkeys(violations))
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +489,118 @@ def test_scanner_flags_forbidden_term_hidden_inside_an_f_string_argument() -> No
     violations = _find_violations(bad, "canary.py")
     assert len(violations) == 1, violations
     assert "quadlet" in violations[0]
+
+
+def test_scanner_flags_forbidden_term_reached_through_a_local_wrapper_function() -> None:
+    """[Positive control — GATE 3A BLOCKING 1: this repo's OWN real idiom]
+    Given a snippet shaped EXACTLY like every real subprocess call in
+    src/partgraph/util/lifecycle.py: a module-local wrapper (mirroring
+    ``_run_capture``) whose OWN body calls ``subprocess.run(argv, ...)``
+    with ``argv`` as a bound PARAMETER — never a literal at that inner call
+    site — and a caller that passes a forbidden literal INLINE at the
+    WRAPPER's own call site (exactly how ``_run_capture([_SYSTEMCTL,
+    "--user", "stop", PARTGRAPH_UNIT_NAME], timeout=SYSTEMCTL_TIMEOUT_S)``
+    is written for real, e.g. lifecycle.py:866).
+    When the scanner runs.
+    Then it reports the violation: the wrapper is recognised as dangerous
+    because ITS OWN body calls a name already known dangerous.
+    """
+    bad = (
+        "import subprocess\n\n"
+        "def _run_capture(argv, *, timeout):\n"
+        "    return subprocess.run(argv, capture_output=True, text=True, "
+        "shell=False, timeout=timeout, check=False)\n\n"
+        "def bad():\n"
+        '    return _run_capture(["systemctl", "--user", "daemon-reload"], timeout=5.0)\n'
+    )
+    violations = _find_violations(bad, "canary.py")
+    assert len(violations) == 1, violations
+    assert "daemon-reload" in violations[0]
+
+
+def test_scanner_flags_forbidden_term_reached_through_a_wrapper_call_sites_own_local_variable() -> None:
+    """[Positive control — GATE 3A BLOCKING 1, the MORE common real shape]
+    Given the SAME wrapper as above, but called the way MOST real call
+    sites in lifecycle.py actually write it (e.g. lines 577-579, 802-814,
+    902-904): the argv list is built in its OWN assignment statement one
+    line earlier, and the WRAPPER call site passes only a bare variable
+    name — ``argv = [...]; _run_capture(argv, timeout=...)`` — not an
+    inline literal.
+    When the scanner runs.
+    Then it STILL reports the violation: a bare-Name argument to a
+    recognised-dangerous call is resolved against that name's own
+    same-file assignment(s).
+    """
+    bad = (
+        "import subprocess\n\n"
+        "def _run_capture(argv, *, timeout):\n"
+        "    return subprocess.run(argv, capture_output=True, text=True, "
+        "shell=False, timeout=timeout, check=False)\n\n"
+        "def bad():\n"
+        '    argv = ["systemctl", "--user", "daemon-reload"]\n'
+        "    return _run_capture(argv, timeout=5.0)\n"
+    )
+    violations = _find_violations(bad, "canary.py")
+    assert len(violations) == 1, violations
+    assert "daemon-reload" in violations[0]
+
+
+def test_scanner_flags_forbidden_term_split_across_a_pathlib_slash_chain() -> None:
+    """[Positive control — GATE 3A BLOCKING 1: component-wise path
+    construction] Given a target path built as ``Path.home() / ".config" /
+    "containers" / "systemd" / "x"`` — pathlib's ``/`` (``__truediv__``)
+    operator — where each segment is its OWN separate ``ast.Constant``, so
+    no single fragment contains "containers/systemd" on its own.
+    When the scanner runs.
+    Then it still reports the violation: adjacent string-literal operands
+    of a ``/``-chain are reconstructed and matched jointly.
+    """
+    bad = (
+        "from pathlib import Path\n\n"
+        "def bad():\n"
+        '    (Path.home() / ".config" / "containers" / "systemd" / "x")'
+        '.write_text("y")\n'
+    )
+    violations = _find_violations(bad, "canary.py")
+    assert len(violations) == 1, violations
+    assert "containers/systemd" in violations[0]
+
+
+def test_scanner_flags_forbidden_term_via_getattr_dynamic_dispatch() -> None:
+    """[Positive control — cheap defence-in-depth] Given a call issued via
+    ``getattr(subprocess, "run")(...)`` instead of ``subprocess.run(...)``
+    — the callee is not a plain ``Name``/``Attribute`` at all.
+    When the scanner runs.
+    Then it still reports the violation: a ``getattr(x, "name")`` used as
+    the callee expression is resolved to ``"name"``.
+    """
+    bad = (
+        "import subprocess\n\n"
+        "def bad():\n"
+        '    getattr(subprocess, "run")(["systemctl", "--user", "daemon-reload"])\n'
+    )
+    violations = _find_violations(bad, "canary.py")
+    assert len(violations) == 1, violations
+    assert "daemon-reload" in violations[0]
+
+
+def test_scanner_flags_forbidden_term_via_an_import_alias() -> None:
+    """[Positive control — cheap defence-in-depth] Given
+    ``from subprocess import Popen as P`` and a call site written ``P(...)``
+    — the bare name at the call site is the ALIAS, never the string
+    ``"Popen"`` that appears in ``DANGEROUS_CALL_NAMES``.
+    When the scanner runs.
+    Then it still reports the violation: an import alias of a known
+    dangerous name is itself treated as dangerous.
+    """
+    bad = (
+        'from subprocess import Popen as P\n\n'
+        "def bad():\n"
+        '    P(["systemctl", "--user", "daemon-reload"])\n'
+    )
+    violations = _find_violations(bad, "canary.py")
+    assert len(violations) == 1, violations
+    assert "daemon-reload" in violations[0]
 
 
 def test_scanner_does_not_flag_a_docstring_mentioning_all_three_terms() -> None:

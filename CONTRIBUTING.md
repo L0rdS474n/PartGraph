@@ -55,6 +55,24 @@ pytest -m integration           # integration tests — requires `partgraph db u
   (`partgraph db up`).
   They are executed locally only and are never run in CI.
 
+### Test fixtures stay local to their file
+
+Each test file defines its own small fixture builders (e.g. a `_ps_row`/
+`_Proc` pair for a scripted `subprocess.run` fake) rather than importing them
+from a shared `tests/` helper module. A test file should be readable and
+verifiable on its own, without tracing an import graph across the suite, and
+a shared fixture module becomes a second, unreviewed API surface that
+quietly changes behaviour for every consumer at once.
+
+This has a real, documented cost, not a hypothetical one: a bug in how the
+scripted `subprocess.run` fake modelled a successful engine `stop` — it
+removed the container from its in-memory state entirely (`rm` semantics)
+instead of leaving it listed as `exited`, which is what a `stop`-only verb
+surface actually does — had to be found and fixed independently in both
+`tests/unit/test_lifecycle.py` and `tests/unit/test_cli_db_down.py`
+(commit `43fb5df`), precisely because neither file's fixture code depended
+on the other's. Keep the convention; know its price.
+
 ## Pull-request rules
 
 - **One objective per PR.** Keep the change set small and reviewable.

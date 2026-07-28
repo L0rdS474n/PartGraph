@@ -105,9 +105,9 @@ def _invoke(args: list[str]):
 
 # ---------------------------------------------------------------------------
 # Fixture builders (deliberately independent copies of test_lifecycle.py's —
-# each test file stays self-contained; mirrors cli.py's own documented
-# convention of copying small UID/cursor helpers across sections rather than
-# sharing internals across independently-readable modules).
+# each test file stays self-contained; per CONTRIBUTING.md's "Test fixtures
+# stay local to their file" policy, copying small helpers across test files
+# rather than sharing internals across independently-readable modules).
 # ---------------------------------------------------------------------------
 
 

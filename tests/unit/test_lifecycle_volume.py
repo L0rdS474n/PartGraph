@@ -60,13 +60,22 @@ shared import list):
   not inside the leaf.
 
   The call ALWAYS carries: a list argv (never a string), ``shell=False``,
-  ``capture_output=True``, ``text=True``, ``check=False``, and a finite,
-  positive ``timeout=`` (mirrors every other subprocess call in this module —
-  ADR-0007's bounded-constant precedent). The argv never contains ``-f``,
-  ``--force``, ``rm``, ``create``, or ``prune`` — this is a pure ``inspect``,
-  never a mutation (belt-and-suspenders at the leaf level; the repo-wide
-  static guard lives in
+  ``capture_output=True``, ``text=True``, ``check=False``, and
+  ``timeout=VOLUME_INSPECT_TIMEOUT_S`` — a NEW, named, finite, positive
+  bounded constant (Gate 3a SHOULD-FIX: never a bare literal float, mirrors
+  ``INSPECT_TIMEOUT_S``/``SYSTEMCTL_TIMEOUT_S``'s own ADR-0007 bounded-
+  constant discipline). The argv never contains ``-f``, ``--force``, ``rm``,
+  ``create``, or ``prune`` — this is a pure ``inspect``, never a mutation
+  (belt-and-suspenders at the leaf level; the repo-wide static guard lives in
   ``tests/unit/test_repo_never_executes_lifecycle_mutations.py``, AC-B2).
+
+  SIGNATURE (Gate 3a SHOULD-FIX): every parameter is KEYWORD-ONLY, and the
+  parameter SET is EXACTLY ``{"engine_prefix", "which", "environ"}`` — no
+  ``volume_name=``/``name=``/``volume=`` parameter. ``PARTGRAPH_DATA_VOLUME``
+  is a FROZEN constant, never derived from caller input, exactly like
+  ``PARTGRAPH_CONTAINER_NAME``/``PARTGRAPH_UNIT_NAME``'s own discipline — a
+  caller-supplied volume name would reopen the kind of poisoned-target
+  injection surface PR-A's allow-list discipline exists to close.
 
 Hermetic: every test here patches ONLY ``subprocess.run`` (and, where engine
 auto-detection is exercised, ``shutil.which``) — mirrors
@@ -76,17 +85,20 @@ engine, no real wall clock.
 
 from __future__ import annotations
 
+import inspect
 import subprocess
 from unittest.mock import patch
 
 import pytest
 
 # This import is expected to raise ImportError until
-# ``partgraph.util.lifecycle.volume_exists`` exists — the correct test-first
-# RED state. Scoped to ONLY the new symbol plus stable, already-landed PR-A
-# symbols so a collection failure here never touches test_lifecycle.py.
+# ``partgraph.util.lifecycle.volume_exists``/``VOLUME_INSPECT_TIMEOUT_S``
+# exist — the correct test-first RED state. Scoped to ONLY the new symbols
+# plus stable, already-landed PR-A symbols so a collection failure here
+# never touches test_lifecycle.py.
 from partgraph.util.lifecycle import (  # noqa: E402
     PARTGRAPH_DATA_VOLUME,
+    VOLUME_INSPECT_TIMEOUT_S,
     volume_exists,
 )
 
@@ -224,14 +236,18 @@ def test_volume_exists_argv_never_carries_a_mutating_flag_or_verb() -> None:
         assert token not in forbidden, f"volume_exists() argv carries a mutating token: {calls[0]!r}"
 
 
-def test_volume_exists_subprocess_call_carries_shell_false_and_a_finite_timeout() -> None:
-    """[ADR-0007 bounded-constant precedent] Given every subprocess call this
-    module makes is documented to carry a finite, named timeout and
-    ``shell=False``.
+def test_volume_exists_subprocess_call_carries_shell_false_and_the_named_timeout_constant() -> None:
+    """[ADR-0007 bounded-constant precedent; Gate 3a SHOULD-FIX] Given every
+    subprocess call this module makes is documented to carry a finite,
+    NAMED timeout and ``shell=False`` — never a bare literal float.
     When volume_exists() issues its one call.
     Then the kwargs show ``shell=False``, ``capture_output=True``,
-    ``text=True``, ``check=False``, and a ``timeout`` that is a positive,
-    finite float — never None/unbounded.
+    ``text=True``, ``check=False``, and ``timeout`` EQUAL to
+    ``VOLUME_INSPECT_TIMEOUT_S`` — read from the constant itself, never a
+    hard-coded literal, so this test stays correct across any future change
+    to that constant's value (mirrors
+    ``test_stop_all_engine_stop_argv_carries_the_grace_period_via_dash_t``'s
+    exact pattern in tests/unit/test_lifecycle.py).
     """
     captured_kwargs: dict = {}
 
@@ -246,9 +262,46 @@ def test_volume_exists_subprocess_call_carries_shell_false_and_a_finite_timeout(
     assert captured_kwargs.get("capture_output") is True
     assert captured_kwargs.get("text") is True
     assert captured_kwargs.get("check") is False
-    timeout = captured_kwargs.get("timeout")
-    assert isinstance(timeout, float)
-    assert timeout > 0
+    assert captured_kwargs.get("timeout") == VOLUME_INSPECT_TIMEOUT_S, (
+        f"volume_exists()'s timeout kwarg must be VOLUME_INSPECT_TIMEOUT_S "
+        f"({VOLUME_INSPECT_TIMEOUT_S}), never a hard-coded literal; got "
+        f"{captured_kwargs.get('timeout')!r}."
+    )
+
+
+def test_volume_inspect_timeout_is_a_finite_positive_bounded_float() -> None:
+    """[ADR-0007 bounded-constant precedent] Given VOLUME_INSPECT_TIMEOUT_S
+    is a NEW named constant, mirroring INSPECT_TIMEOUT_S/SYSTEMCTL_TIMEOUT_S.
+    When it is read directly.
+    Then it is a finite float strictly greater than zero — never
+    None/unbounded.
+    """
+    assert isinstance(VOLUME_INSPECT_TIMEOUT_S, float)
+    assert VOLUME_INSPECT_TIMEOUT_S > 0
+
+
+def test_volume_exists_signature_has_no_caller_controlled_volume_name_parameter() -> None:
+    """[Gate 3a SHOULD-FIX] Given PARTGRAPH_DATA_VOLUME is a FROZEN constant
+    — mirrors PARTGRAPH_CONTAINER_NAME/PARTGRAPH_UNIT_NAME's own discipline:
+    never derived from caller-supplied input, so a poisoned value can never
+    influence which engine object gets targeted.
+    When volume_exists()'s own signature is inspected directly.
+    Then its parameter SET is EXACTLY {"engine_prefix", "which", "environ"}
+    — no `volume_name=`/`name=`/`volume=` parameter exists that could let a
+    future caller override the inspected volume and reopen the kind of
+    caller-controlled-target injection surface PR-A's allow-list discipline
+    exists to close — and EVERY parameter is keyword-only (no positional
+    override either, mirroring every other public function in this module).
+    """
+    sig = inspect.signature(volume_exists)
+    assert set(sig.parameters) == {"engine_prefix", "which", "environ"}, (
+        f"unexpected volume_exists() signature — a new parameter here is a "
+        f"potential caller-controlled injection surface: {sig}"
+    )
+    for name, param in sig.parameters.items():
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
+            f"volume_exists()'s {name!r} parameter must be keyword-only: {sig}"
+        )
 
 
 def test_volume_exists_never_calls_a_second_subprocess() -> None:

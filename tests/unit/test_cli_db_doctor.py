@@ -53,8 +53,17 @@ future reader needs the reasoning):
    can never actually carry a Rich-style-tag-shaped substring. This file
    instead exercises the markup=False discipline against `ActiveState`
    (raw, UNVALIDATED text straight from `systemctl show`, and one of the
-   fields AC-B3 explicitly requires `db doctor` to print) — the correct,
-   reachable analogue of the same risk.
+   fields AC-B3 explicitly requires `db doctor` to print) as a concrete,
+   RUNTIME demonstration — the correct, reachable analogue of the same
+   risk. [Gate 3a SHOULD-FIX] That demonstration alone only proves ONE
+   field is safe; LoadState/SubState/UnitFileState and any
+   `Instance.image`/`status` text `doctor()` chooses to surface are equally
+   unvalidated and would need chasing one at a time. A SECOND, STATIC test
+   (`test_doctor_source_every_print_call_carries_markup_false`) instead
+   parses cli.py's own source and asserts the ARCHITECTURAL rule directly:
+   every `.print(...)` call inside `doctor()`'s body carries `markup=False`
+   — removing the whole "did we forget one" class of bug rather than
+   pinning it field by field.
 
 HERMETICITY (mirrors tests/unit/test_cli_db_down.py exactly): every test
 patches ONLY `subprocess.run`, `partgraph.cli.engine_command`,
@@ -74,7 +83,9 @@ call") an explicit scan of `subprocess.run`'s own `call_args_list` too.
 
 from __future__ import annotations
 
+import ast
 import json
+import pathlib
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -123,9 +134,10 @@ def _line_with(output: str, needle: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Fixture builders (deliberately independent copies — mirrors cli.py's own
-# documented convention of copying small helpers across test files rather
-# than sharing internals across independently-readable modules).
+# Fixture builders (deliberately independent copies — per CONTRIBUTING.md's
+# "Test fixtures stay local to their file" policy, copying small helpers
+# across test files rather than sharing internals across
+# independently-readable modules).
 # ---------------------------------------------------------------------------
 
 
@@ -844,6 +856,60 @@ def test_doctor_prints_engine_derived_active_state_verbatim_markup_false() -> No
     )
 
 
+def test_doctor_source_every_print_call_carries_markup_false() -> None:
+    """[Gate 3a SHOULD-FIX] Given per-field pinning (ActiveState only, the
+    test above) leaves every OTHER field `doctor()` also prints —
+    LoadState, SubState, UnitFileState, and any `Instance.image`/`status`
+    text it chooses to surface — EQUALLY unvalidated raw text and EQUALLY
+    exposed to the same Rich-markup-injection risk; chasing fields one at a
+    time invites "did we forget one" the next time a field is added.
+    When cli.py's own source text is parsed and the `doctor()` function's
+    body is scanned for every `.print(...)` call (on ANY console object —
+    `_console`/`_err_console`/otherwise).
+    Then EVERY SUCH CALL carries `markup=False` as an explicit keyword
+    argument — the architectural rule, not a per-field one. Skips cleanly
+    (not a failure) while `doctor()` does not exist in cli.py yet.
+    """
+    cli_path = (
+        pathlib.Path(__file__).resolve().parent.parent.parent
+        / "src" / "partgraph" / "cli.py"
+    )
+    source = cli_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(cli_path))
+
+    doctor_func = next(
+        (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "doctor"
+        ),
+        None,
+    )
+    if doctor_func is None:
+        pytest.skip("cli.py's `doctor()` command does not exist yet (expected pre-PR-B1 implementation).")
+
+    violations: list[str] = []
+    for call in ast.walk(doctor_func):
+        if not isinstance(call, ast.Call):
+            continue
+        func = call.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "print"):
+            continue
+        has_markup_false = any(
+            kw.arg == "markup" and isinstance(kw.value, ast.Constant) and kw.value.value is False
+            for kw in call.keywords
+        )
+        if not has_markup_false:
+            violations.append(
+                f"cli.py:{call.lineno}: a .print(...) call inside doctor() is "
+                "missing markup=False"
+            )
+
+    assert not violations, (
+        "every print call inside doctor() must carry markup=False "
+        "(architectural rule, AC-B3d):\n" + "\n".join(violations)
+    )
+
+
 # ---------------------------------------------------------------------------
 # AC-B3d — exit code is always 0 once the diagnostic ran
 # ---------------------------------------------------------------------------
@@ -953,3 +1019,66 @@ def test_doctor_instance_enumeration_failure_is_absorbed_reported_and_exits_zero
     low = result.output.lower()
     assert "instance" in low
     assert "could not" in low or "unknown" in low
+
+
+# ---------------------------------------------------------------------------
+# [Gate 3a SHOULD-FIX — ROOT CAUSE IS PR-A CODE, NOT PR-B1'S REMIT]
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_subprocess_call_count_is_bounded_over_a_large_synthetic_row_set() -> None:
+    """[Gate 3a SHOULD-FIX] Given a large host (a busy CI runner, a shared
+    dev box) reports thousands of containers via `ps --all`, NONE of them
+    PartGraph's or even dgraph-family. PR-A's own
+    `find_partgraph_instances()` (src/partgraph/util/lifecycle.py,
+    `_instance_from_row`) calls `_mounts_data_volume` — one `container
+    inspect` subprocess call, up to INSPECT_TIMEOUT_S (10s) each —
+    UNCONDITIONALLY for every row carrying a usable name and id, BEFORE
+    `_classify` ever decides whether that row is PartGraph's at all. There
+    is no cap on row count. `db doctor` (AC-B3d) advertises itself as
+    always safe, quick to run.
+    When `partgraph db doctor` runs against 2000 synthetic, entirely
+    unrelated containers.
+    Then the TOTAL number of subprocess calls made stays well below one per
+    row — NOT O(row count).
+
+    HONESTLY FLAGGED, NOT WORKED AROUND: this test is expected to stay RED
+    even once `doctor()` itself is fully implemented, UNLESS the underlying
+    PR-A enumeration is ALSO bounded — a change to
+    `src/partgraph/util/lifecycle.py`'s `find_partgraph_instances()`
+    (shared by `db down` too, not `doctor()`-specific), which is outside
+    this PR's `no src/` constraint and PR-A's remit, not PR-B1's. Recorded
+    here as a pinned, failing acceptance test rather than silently left
+    unencoded, exactly as the Gate 3a review asked: "if bounding it needs a
+    change there, say so" — said here, in the one place a future
+    implementer will find it attached to the behaviour it constrains.
+    """
+    rows = [
+        _ps_row(f"cid-{i}", f"unrelated-service-{i}", "nginx:1.27.3")
+        for i in range(2000)
+    ]
+    fake = _make_doctor_scripted_run(
+        ps_rows=rows,
+        mounts_by_id={row["Id"]: [] for row in rows},
+        unit_lines=_UNIT_NOT_FOUND_LINES,
+        volume_returncode=1,
+    )
+    with (
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake) as mock_run,
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "doctor"])
+
+    _assert_clean(result, 0)
+    call_count = len(mock_run.call_args_list)
+    assert call_count < len(rows) // 2, (
+        f"db doctor issued {call_count} subprocess calls for {len(rows)} "
+        "entirely unrelated containers — that scales with row count, "
+        "inherited from PR-A's find_partgraph_instances() calling "
+        "`container inspect` once per row before classification. A "
+        "diagnostic advertised as always-safe to run must not scale this "
+        "way. Bounding this is PR-A's remit "
+        "(src/partgraph/util/lifecycle.py), not PR-B1's."
+    )

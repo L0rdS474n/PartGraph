@@ -10,11 +10,13 @@ must hold, hermetically, once it exists.
 
 Every test here is genuinely FALSIFIABLE against a wrong-but-plausible draft:
 a doc that merely SAYS "edit the unit file" without the ``WantedBy=`` key,
-one that hard-codes this machine's own ``/home/<realname>/`` instead of a
-templated ``$HOME``/``%h``, or one that recommends the ``StopTimeout=``
-drop-in WITHOUT the honest caveat that it does not, by itself, restore
-signal delivery — each of those would fail a specific test below, not just
-"the file doesn't exist yet".
+one that hard-codes this machine's own home directory instead of a templated
+``$HOME``/``%h``, one that recommends the ``StopTimeout=`` drop-in WITHOUT
+the honest caveat that it does not, by itself, restore signal delivery, or
+one that tells the operator to edit files in
+``~/.config/containers/systemd/`` without ever naming which file is
+PartGraph's or warning about its five neighbours — each of those would fail
+a specific test below, not just "the file doesn't exist yet".
 
 RED-STATE CONVENTION: the file does not exist yet, so
 ``test_doc_file_exists_and_is_nonempty`` below is a HARD, non-skipped
@@ -26,11 +28,23 @@ in this exact repo for "a file this PR's implementer has not written yet":
 skip cleanly, go green the moment the file lands with the right content, and
 FAIL (not skip) if it lands with the WRONG content.
 
-AC-PRIV OVERLAP (disclosed, not duplicated): once ``docs/db-lifecycle.md``
+AC-PRIV OVERLAP (disclosed, not duplicated — and DELIBERATELY not
+re-implemented locally, see the note below): once ``docs/db-lifecycle.md``
 exists, ``tests/unit/test_repo_skeleton.py::test_no_operator_home_paths_in_tracked_files``
-ALREADY scans every tracked file (this one included) for a real
-``/home/<realname>/`` path — that NEGATIVE check is not re-implemented here.
-This file adds only the POSITIVE half that scanner does not cover: that a
+ALREADY scans every tracked file (this one included) for a real, concrete
+a real, non-placeholder ``/home/`` path — that NEGATIVE check is intentionally NOT
+duplicated here (an earlier draft of this file DID keep a local copy of that
+scanner's own regex for self-contained readability, mirroring
+CONTRIBUTING.md's "Test fixtures stay local to their file" policy — but a
+regex whose OWN negative-lookahead source text contains a literal
+``/home/(?!...)`` substring is, ironically, itself something the SIMPLE
+substring-based scanner reads as a real home path; the copy self-matched and
+broke `test_repo_skeleton.py`, exactly the kind of independent-duplication
+cost CONTRIBUTING.md's own new paragraph asks contributors to weigh. Here the
+weighing comes out the other way: the check is fully, uniformly covered by
+the always-on repo-wide scanner the moment this file's own text exists, so a
+second, narrower, hazard-prone copy buys nothing). This file adds only the
+POSITIVE half the repo-wide scanner does not and cannot cover: that a
 ``$HOME``/``%h`` placeholder is actually PRESENT, i.e. the doc could not
 simply omit any home-directory reference at all and still pass.
 """
@@ -38,7 +52,6 @@ simply omit any home-directory reference at all and still pass.
 from __future__ import annotations
 
 import pathlib
-import re
 
 import pytest
 
@@ -108,32 +121,12 @@ def test_doc_uses_a_home_placeholder_not_a_concrete_path(doc_text: str) -> None:
     )
 
 
-#: Mirrors tests/unit/test_repo_skeleton.py's own _HOME_PATH_PATTERN exactly
-#: (kept as an independent, self-contained copy per this codebase's own
-#: documented convention of not sharing internals across test files). The
-#: repo-wide scanner in that file already asserts NO tracked file (this one
-#: included, once it exists) contains a real, non-placeholder home path; this
-#: local copy exists only so THIS file's own test suite is self-contained and
-#: independently readable, not to duplicate that scanner's authority.
-_HOME_PATH_PATTERN = re.compile(
-    r"(/home/(?!(?:user|operator|dev|test|example|you|me|username|admin|vagrant)/)[^/\s\"']+/"
-    r"|/Users/(?!(?:user|operator|dev|test|example|you|me|username|admin|vagrant)/)[^/\s\"']+/)"
-)
-
-
-def test_doc_never_hardcodes_a_real_operator_home_path(doc_text: str) -> None:
-    """AC-B1: Given the doc must never leak this (or any) machine's actual
-    home directory.
-    When we scan its text for a concrete '/home/<realname>/' pattern.
-    Then none is found (the global scanner in test_repo_skeleton.py already
-    enforces this across every tracked file; this is the same rule, checked
-    locally and independently for this specific, security-sensitive file).
-    """
-    match = _HOME_PATH_PATTERN.search(doc_text)
-    assert match is None, (
-        f"docs/db-lifecycle.md contains a real operator home path: {match.group(0)!r}. "
-        "Use '$HOME' or '%h' instead."
-    )
+# NOTE: no local _HOME_PATH_PATTERN copy here — see the module docstring's
+# "AC-PRIV OVERLAP" note for why keeping one turned out to be actively
+# harmful (a literal, self-matching duplicate of test_repo_skeleton.py's own
+# regex) rather than merely redundant. The negative check (no real home path)
+# is covered exclusively by the always-on repo-wide scanner in
+# tests/unit/test_repo_skeleton.py once this file's text exists.
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +165,88 @@ def test_doc_documents_systemctl_user_daemon_reload(doc_text: str) -> None:
         "docs/db-lifecycle.md must document the exact command "
         "'systemctl --user daemon-reload' — editing WantedBy= alone is not "
         "enough; systemd must be told to reload unit files."
+    )
+
+
+def test_doc_requires_wanted_by_removal_via_a_drop_in_not_a_direct_edit(doc_text: str) -> None:
+    """[Gate 3a BLOCKING 2, "Recommended" half] Given AC-B1b already requires
+    the StopTimeout= budget to be documented as a drop-in rather than a
+    direct edit of the generated .container file — and the SAME reasoning
+    applies to WantedBy=: hand-editing a quadlet-generated file directly is
+    strictly more dangerous than a drop-in override in the shared
+    ~/.config/containers/systemd/ directory that also holds five OTHER
+    units, because a direct edit invites opening (and mis-editing) the wrong
+    file entirely, where a drop-in's own filename names only the unit it
+    overrides.
+    When we scan the window after the doc's first 'WantedBy=' mention.
+    Then it documents the removal via a drop-in (a '.d/' override directory,
+    or 'override.conf', or the word 'drop-in' itself) — exactly the same
+    three acceptable phrasings already required for StopTimeout=.
+    """
+    window = _window_after(doc_text, "WantedBy=", size=1500).lower()
+    assert "drop-in" in window or ".d/" in window or "override.conf" in window, (
+        f"expected the WantedBy= removal to be documented via a DROP-IN, "
+        f"exactly like StopTimeout= already must be: {window!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# [Gate 3a BLOCKING 2] The shared directory holds SIX unit files; five are
+# NOT PartGraph's. A doc that never distinguishes them, followed correctly,
+# lets an operator delete a stranger's container by mistake — exactly the
+# outcome this whole PR exists to prevent, achieved through documentation
+# instead of code.
+# ---------------------------------------------------------------------------
+
+#: The five real, observed foreign units sharing
+#: ~/.config/containers/systemd/ with partgraph-dgraph's own unit (ADR-0021).
+_FOREIGN_UNIT_NAMES = ("cve-alpha", "cve-loader", "cve-ratel", "cve-zero", "min-web")
+
+
+def test_doc_names_the_specific_unit_file_near_the_wanted_by_instructions(doc_text: str) -> None:
+    """[Gate 3a BLOCKING 2] Given the doc's WantedBy= removal instructions
+    are the exact place an operator could edit the WRONG file.
+    When we scan the window after the doc's first 'WantedBy=' mention.
+    Then it names the SPECIFIC unit file — 'partgraph-dgraph.container' or
+    'partgraph-dgraph.service' — not just "the unit file" in the abstract.
+    """
+    window = _window_after(doc_text, "WantedBy=", size=1500)
+    assert "partgraph-dgraph.container" in window or "partgraph-dgraph.service" in window, (
+        "docs/db-lifecycle.md must name the SPECIFIC unit file "
+        "('partgraph-dgraph.container' or 'partgraph-dgraph.service') within "
+        f"the same window as its WantedBy= removal instructions: {window!r}"
+    )
+
+
+def test_doc_warns_against_touching_the_other_units_in_the_shared_directory(doc_text: str) -> None:
+    """[Gate 3a BLOCKING 2] Given ~/.config/containers/systemd/ holds SIX
+    unit files on the host this ADR describes — partgraph-dgraph's own, and
+    five belonging to an entirely unrelated cve-graph/min-web stack this
+    repo has promised never to touch (ADR-0021) — and a doc that never once
+    distinguishes them would pass every other test in this file while an
+    operator following it correctly could delete a stranger's container.
+    When we scan the window after the doc's first 'WantedBy=' mention.
+    Then EITHER all five real foreign unit names are present (an explicit,
+    host-specific warning) OR an unambiguous generic caution is present:
+    the word "only" together with "partgraph-dgraph" and a negation word
+    ("other"/"not"/"never") — the generic form is PREFERRED (the doc ships
+    to any operator, not just this host's), but either satisfies the
+    underlying safety requirement.
+    """
+    window = _window_after(doc_text, "WantedBy=", size=2500)
+    low = window.lower()
+    names_all_foreign_units = all(name in low for name in _FOREIGN_UNIT_NAMES)
+    generic_caution = (
+        "only" in low
+        and "partgraph-dgraph" in low
+        and any(word in low for word in ("other", "not ", "never", "no other"))
+    )
+    assert names_all_foreign_units or generic_caution, (
+        "docs/db-lifecycle.md must warn the operator against touching any "
+        "OTHER file in ~/.config/containers/systemd/ — either by naming all "
+        f"five real foreign units ({', '.join(_FOREIGN_UNIT_NAMES)}), or "
+        "(preferred) with an explicit, generic 'edit only "
+        f"partgraph-dgraph...' caution. Window scanned:\n{window!r}"
     )
 
 

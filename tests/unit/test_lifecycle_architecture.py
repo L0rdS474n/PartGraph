@@ -22,6 +22,7 @@ individually rather than failing collection.
 
 from __future__ import annotations
 
+import inspect
 import pathlib
 import re
 
@@ -114,26 +115,53 @@ def test_lifecycle_source_never_imports_partgraph_cli_embed_query_or_load() -> N
 
 
 def test_partgraph_util_package_does_not_reexport_lifecycle_functions() -> None:
-    """[3b-L2] Given ADR-0018 Section 4's precedent: neither `health` nor
-    `index_health` is re-exported from `partgraph/util/__init__.py`, even
-    though `container`/`resources` both are.
+    """[3b-L2, amended: the forbidden-name set is now DERIVED, not hardcoded]
+    Given ADR-0018 Section 4's precedent: neither `health` nor `index_health`
+    is re-exported from `partgraph/util/__init__.py`, even though
+    `container`/`resources` both are.
     When `partgraph.util` (the package's own `__init__.py`) is inspected.
-    Then it does NOT expose `stop_all`, `find_partgraph_instances`, or
-    `unit_state` as top-level attributes — a caller must always reach them
-    via `partgraph.util.lifecycle` explicitly, never via the package
-    shortcut.
+    Then it does NOT expose ANY non-DTO name from
+    `partgraph.util.lifecycle.__all__` (every function and every constant —
+    `stop_all`, `find_partgraph_instances`, `unit_state`, and whatever else
+    the leaf adds to `__all__` in the future, e.g. `volume_exists`) as a
+    top-level attribute — a caller must always reach them via
+    `partgraph.util.lifecycle` explicitly, never via the package shortcut.
+
+    The forbidden-name set is derived from `lifecycle.__all__` at RUN TIME,
+    filtering out the DTOs (`Instance`/`UnitState`/`DownResult`) by
+    introspecting each exported object with `inspect.isclass` — a DTO's own
+    naming convention (PascalCase, a frozen dataclass) is identified
+    mechanically, not by a hardcoded exclusion list either. This means the
+    two sibling checks in this file (the docker/podman-literal scan, the
+    forbidden-import scan) and this one now share the SAME property: none of
+    the three needs a manual entry updated when the leaf's public surface
+    grows. Previously this test hardcoded the tuple
+    `("stop_all", "find_partgraph_instances", "unit_state")`, so a NEW
+    function or constant added to `__all__` (e.g. `volume_exists`, PR-B1)
+    could be re-exported from `partgraph/util/__init__.py` in violation of
+    the ADR-0018 Section 4 precedent while this test stayed green.
 
     Uses `pytest.importorskip` (not a top-level import) so THIS test skips
     individually and cleanly while partgraph.util.lifecycle does not yet
     exist, rather than erroring the whole file's collection.
     """
-    pytest.importorskip(
+    lifecycle = pytest.importorskip(
         "partgraph.util.lifecycle",
         reason="partgraph.util.lifecycle does not exist yet (expected pre-PR-A).",
     )
     import partgraph.util as util_package  # noqa: PLC0415
 
-    for forbidden_name in ("stop_all", "find_partgraph_instances", "unit_state"):
+    forbidden_names = [
+        name for name in lifecycle.__all__
+        if not inspect.isclass(getattr(lifecycle, name))
+    ]
+    assert forbidden_names, (
+        "sanity check: expected at least one non-DTO name in "
+        "partgraph.util.lifecycle.__all__ to check — an empty list here would "
+        "make the loop below vacuously pass without testing anything."
+    )
+
+    for forbidden_name in forbidden_names:
         assert not hasattr(util_package, forbidden_name), (
             f"partgraph.util must NOT re-export {forbidden_name!r} — it must "
             "only be reachable via partgraph.util.lifecycle directly "
