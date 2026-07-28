@@ -21,14 +21,16 @@ not apply here). This reuses PR-A's established injected-seam style
 (``engine_prefix``/``which``/``environ``, all keyword-only, all resolved at
 CALL time) rather than inventing a parallel one.
 
-Pinned contract (NOT YET IMPLEMENTED — collection of THIS file is expected to
-ERROR with ImportError until ``partgraph.util.lifecycle.volume_exists``
-exists; the correct test-first RED state. Deliberately scoped to import ONLY
-the one new symbol plus existing, already-landed PR-A symbols needed for
-fixtures, so this file's collection failure is isolated to the NEW addition —
-it does not retroactively turn ``tests/unit/test_lifecycle.py`` (PR-A's own,
-currently-passing suite) red merely because one more name was appended to a
-shared import list):
+Pinned contract, now IMPLEMENTED and verified green (this file was written
+test-first: until ``partgraph.util.lifecycle.volume_exists`` existed,
+collection of THIS file ERRORED with ImportError — the correct RED state at
+the time. The import list was deliberately scoped to ONLY the one new symbol
+plus existing, already-landed PR-A symbols needed for fixtures, so that
+collection failure was isolated to the new addition and never retroactively
+turned ``tests/unit/test_lifecycle.py`` — PR-A's own, separately-passing
+suite — red merely because one more name was appended to a shared import
+list. Both symbols below now exist in ``src/partgraph/util/lifecycle.py``
+exactly as pinned here):
 
   ``volume_exists(*, engine_prefix: list[str] | None = None,
   which: Callable[[str], str | None] | None = None,
@@ -91,11 +93,12 @@ from unittest.mock import patch
 
 import pytest
 
-# This import is expected to raise ImportError until
-# ``partgraph.util.lifecycle.volume_exists``/``VOLUME_INSPECT_TIMEOUT_S``
-# exist — the correct test-first RED state. Scoped to ONLY the new symbols
-# plus stable, already-landed PR-A symbols so a collection failure here
-# never touches test_lifecycle.py.
+# Before implementation, this import raised ImportError — the correct
+# test-first RED state, since ``partgraph.util.lifecycle.volume_exists``/
+# ``VOLUME_INSPECT_TIMEOUT_S`` did not exist yet. Both now exist and this
+# collects cleanly. Scoped to ONLY the new symbols plus stable,
+# already-landed PR-A symbols so that RED-phase collection failure was
+# isolated to this file and never touched test_lifecycle.py.
 from partgraph.util.lifecycle import (  # noqa: E402
     PARTGRAPH_DATA_VOLUME,
     VOLUME_INSPECT_TIMEOUT_S,

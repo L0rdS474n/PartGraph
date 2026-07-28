@@ -18,25 +18,31 @@ one that tells the operator to edit files in
 PartGraph's or warning about its five neighbours — each of those would fail
 a specific test below, not just "the file doesn't exist yet".
 
-RED-STATE CONVENTION: the file does not exist yet, so
-``test_doc_file_exists_and_is_nonempty`` below is a HARD, non-skipped
-failure (the base fact every other test depends on). Every OTHER test in
-this file uses a module-scoped fixture that SKIPS individually, with a clear
-reason, while the file is absent — mirrors
-``tests/unit/test_lifecycle_architecture.py``'s own established convention
-in this exact repo for "a file this PR's implementer has not written yet":
-skip cleanly, go green the moment the file lands with the right content, and
-FAIL (not skip) if it lands with the WRONG content.
+RED-STATE CONVENTION (this file was written test-first, before the doc
+existed): while ``docs/db-lifecycle.md`` was absent,
+``test_doc_file_exists_and_is_nonempty`` below was a HARD, non-skipped
+failure (the base fact every other test depends on), and every OTHER test
+used a module-scoped fixture that SKIPPED individually, with a clear reason
+— mirrors ``tests/unit/test_lifecycle_architecture.py``'s own established
+convention in this exact repo for "a file this PR's implementer has not
+written yet": skip cleanly, go green the moment the file lands with the
+right content, and FAIL (not skip) if it lands with the WRONG content.
+``docs/db-lifecycle.md`` now exists and every test below is green — the
+fixture and its skip branch are kept exactly as they were, unchanged,
+because the mechanism itself (not merely its RED-phase behaviour) is still
+load-bearing: it is what makes this file's content assertions run at all,
+and what would make them skip cleanly again rather than crash outright if
+the file were ever deleted.
 
 AC-PRIV OVERLAP (disclosed, not duplicated — and DELIBERATELY not
-re-implemented locally, see the note below): once ``docs/db-lifecycle.md``
-exists, ``tests/unit/test_repo_skeleton.py::test_no_operator_home_paths_in_tracked_files``
-ALREADY scans every tracked file (this one included) for a real, concrete
-a real, non-placeholder ``/home/`` path — that NEGATIVE check is intentionally NOT
-duplicated here (an earlier draft of this file DID keep a local copy of that
-scanner's own regex for self-contained readability, mirroring
-CONTRIBUTING.md's "Test fixtures stay local to their file" policy — but a
-regex whose OWN negative-lookahead source text contains a literal
+re-implemented locally, see the note below): ``docs/db-lifecycle.md``, now
+that it exists, is scanned like every other tracked file by
+``tests/unit/test_repo_skeleton.py::test_no_operator_home_paths_in_tracked_files``
+for a real, concrete, non-placeholder ``/home/`` path — that NEGATIVE check
+is intentionally NOT duplicated here (an earlier draft of this file DID keep
+a local copy of that scanner's own regex for self-contained readability,
+mirroring CONTRIBUTING.md's "Test fixtures stay local to their file" policy
+— but a regex whose OWN negative-lookahead source text contains a literal
 ``/home/(?!...)`` substring is, ironically, itself something the SIMPLE
 substring-based scanner reads as a real home path; the copy self-matched and
 broke `test_repo_skeleton.py`, exactly the kind of independent-duplication

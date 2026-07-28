@@ -8,16 +8,16 @@ PR-A (`fix/db-down-all-instances`, already landed on this branch) gave
 SEE what PR-A's own selector policy (S1/S2/S3/UNKNOWN) sees, and whether the
 quadlet unit will bring the database back at the next login, WITHOUT db
 doctor ever being able to change any of it. This file is the acceptance test
-for that command; `db doctor` does not exist yet, so every test below is
-EXPECTED TO FAIL (RED) until it is implemented — mirrors the FIRST test file
-in `tests/unit/test_cli_db_down.py`'s own history, except here the RED state
-shows up as individual runtime assertion failures (typer reports "No such
-command 'doctor'"), not a whole-file ModuleNotFoundError at collection: no
-NEW top-level lifecycle symbol is required for THIS file to collect —
-`PARTGRAPH_UNIT_NAME`/`PARTGRAPH_DATA_VOLUME`/`PARTGRAPH_CONTAINER_NAME`/
-`PARTGRAPH_WATCHED_PORTS` already exist (landed by PR-A). Only the CLI
-SUBCOMMAND is missing, so collection succeeds and every test fails at
-run time instead.
+for that command, written test-first: before `doctor()` existed, every test
+below FAILED (RED) — typer reported "No such command 'doctor'" as an
+individual runtime assertion failure per test (never a whole-file
+ModuleNotFoundError at collection, unlike `tests/unit/test_cli_db_down.py`'s
+own history for PR-A: no NEW top-level lifecycle symbol was required for
+THIS file to collect — `PARTGRAPH_UNIT_NAME`/`PARTGRAPH_DATA_VOLUME`/
+`PARTGRAPH_CONTAINER_NAME`/`PARTGRAPH_WATCHED_PORTS` already existed, landed
+by PR-A; only the CLI SUBCOMMAND was missing, so collection always succeeded
+and every test failed at run time instead). `doctor()` is now implemented in
+`src/partgraph/cli.py` (ADR-0022) and every test below is green.
 
 DESIGN DECISIONS pinned by this file (none dictated verbatim by any AC;
 recorded here, and repeated in the test-runner's final report, because a
@@ -96,6 +96,7 @@ from typer.testing import CliRunner
 from partgraph.cli import app
 from partgraph.util.container import ContainerEngineError
 from partgraph.util.lifecycle import (
+    MAX_INSPECTED_ROWS,
     PARTGRAPH_CONTAINER_NAME,
     PARTGRAPH_DATA_VOLUME,
     PARTGRAPH_UNIT_NAME,
@@ -1022,36 +1023,43 @@ def test_doctor_instance_enumeration_failure_is_absorbed_reported_and_exits_zero
 
 
 # ---------------------------------------------------------------------------
-# [Gate 3a SHOULD-FIX — ROOT CAUSE IS PR-A CODE, NOT PR-B1'S REMIT]
+# The inspect fan-out is bounded (MAX_INSPECTED_ROWS/INSPECT_SWEEP_BUDGET_S,
+# src/partgraph/util/lifecycle.py, ADR-0022 §4).
 # ---------------------------------------------------------------------------
 
 
 def test_doctor_subprocess_call_count_is_bounded_over_a_large_synthetic_row_set() -> None:
-    """[Gate 3a SHOULD-FIX] Given a large host (a busy CI runner, a shared
-    dev box) reports thousands of containers via `ps --all`, NONE of them
-    PartGraph's or even dgraph-family. PR-A's own
-    `find_partgraph_instances()` (src/partgraph/util/lifecycle.py,
-    `_instance_from_row`) calls `_mounts_data_volume` — one `container
-    inspect` subprocess call, up to INSPECT_TIMEOUT_S (10s) each —
-    UNCONDITIONALLY for every row carrying a usable name and id, BEFORE
-    `_classify` ever decides whether that row is PartGraph's at all. There
-    is no cap on row count. `db doctor` (AC-B3d) advertises itself as
-    always safe, quick to run.
+    """Given a large host (a busy CI runner, a shared dev box) reports
+    thousands of containers via `ps --all`, NONE of them PartGraph's or even
+    dgraph-family. `db doctor` (AC-B3d) advertises itself as always safe,
+    quick to run.
     When `partgraph db doctor` runs against 2000 synthetic, entirely
     unrelated containers.
-    Then the TOTAL number of subprocess calls made stays well below one per
-    row — NOT O(row count).
+    Then the TOTAL number of subprocess calls made is bounded, not
+    proportional to row count: `find_partgraph_instances()`'s own
+    `container inspect` fan-out is capped at `MAX_INSPECTED_ROWS` calls per
+    enumeration (src/partgraph/util/lifecycle.py's `_InspectSweepBudget`,
+    ADR-0022 §4) — a row past that ceiling is never inspected at all, and
+    its mount status degrades to UNDETERMINED (the same tri-state a failed
+    inspect already produces), never to a guessed "not ours". `db doctor`
+    itself calls `unit_state()`, `find_partgraph_instances()` and
+    `volume_exists()` exactly once each, so this scenario's expected total
+    is `1 (ps --all) + MAX_INSPECTED_ROWS (container inspect, at most) + 1
+    (systemctl show) + 1 (volume inspect)` — read from the real constant,
+    never a hard-coded number, so this stays correct across any future
+    change to it.
 
-    HONESTLY FLAGGED, NOT WORKED AROUND: this test is expected to stay RED
-    even once `doctor()` itself is fully implemented, UNLESS the underlying
-    PR-A enumeration is ALSO bounded — a change to
-    `src/partgraph/util/lifecycle.py`'s `find_partgraph_instances()`
-    (shared by `db down` too, not `doctor()`-specific), which is outside
-    this PR's `no src/` constraint and PR-A's remit, not PR-B1's. Recorded
-    here as a pinned, failing acceptance test rather than silently left
-    unencoded, exactly as the Gate 3a review asked: "if bounding it needs a
-    change there, say so" — said here, in the one place a future
-    implementer will find it attached to the behaviour it constrains.
+    HISTORY (this docstring itself was once stale, and was rewritten for
+    that — Gate 5 review): this test was originally written, and correctly
+    stayed RED, against PR-A's THEN-unbounded `find_partgraph_instances()`
+    — encoded and flagged deliberately rather than silently worked around,
+    per "if bounding it needs a change there, say so" (Gate 3a review). The
+    bound shipped inside this SAME PR (`MAX_INSPECTED_ROWS`/
+    `INSPECT_SWEEP_BUDGET_S`, ADR-0022 §4), so the test is green at HEAD; a
+    prior draft of this docstring still described the pre-fix, unbounded
+    state as if it were current, which was exactly the "docstring asserting
+    something that is not true" failure mode this whole PR exists to
+    eliminate.
     """
     rows = [
         _ps_row(f"cid-{i}", f"unrelated-service-{i}", "nginx:1.27.3")
@@ -1073,12 +1081,18 @@ def test_doctor_subprocess_call_count_is_bounded_over_a_large_synthetic_row_set(
 
     _assert_clean(result, 0)
     call_count = len(mock_run.call_args_list)
-    assert call_count < len(rows) // 2, (
+    # 1 ps --all + up to MAX_INSPECTED_ROWS container inspect + 1 systemctl
+    # show + 1 volume inspect.
+    expected_ceiling = MAX_INSPECTED_ROWS + 3
+    assert call_count <= expected_ceiling, (
         f"db doctor issued {call_count} subprocess calls for {len(rows)} "
-        "entirely unrelated containers — that scales with row count, "
-        "inherited from PR-A's find_partgraph_instances() calling "
-        "`container inspect` once per row before classification. A "
-        "diagnostic advertised as always-safe to run must not scale this "
-        "way. Bounding this is PR-A's remit "
-        "(src/partgraph/util/lifecycle.py), not PR-B1's."
+        f"entirely unrelated containers — expected at most "
+        f"{expected_ceiling} (MAX_INSPECTED_ROWS ({MAX_INSPECTED_ROWS}) + "
+        f"3 for ps/systemctl show/volume inspect). The inspect fan-out "
+        f"bound in src/partgraph/util/lifecycle.py appears to have "
+        f"regressed."
+    )
+    assert call_count < len(rows), (
+        f"db doctor issued {call_count} subprocess calls for {len(rows)} "
+        "rows — expected sub-linear scaling, not one call per row."
     )

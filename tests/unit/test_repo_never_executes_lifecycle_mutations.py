@@ -66,9 +66,22 @@ that is the pattern to distrust here, not just these two instances.
 function BY NAME (fixed-point, any depth — "resolving the wrapper by name
 within the same module is enough, full interprocedural analysis is not
 wanted"), and `_scoped_assignment_fragments` resolves the MORE common real
-shape — `argv = [...]` one line earlier, then `_run_capture(argv, ...)`
-(lifecycle.py:577-579, :802-814, :902-904) — not only the inline-literal
-shape (lifecycle.py:765-767, :866-871). This resolution is SCOPE-PRECISE
+shape — `argv = [...]` one line earlier, then `_run_capture(argv, ...)`,
+the shape MOST of `_run_capture`'s own real callers use (e.g.
+`_mounts_data_volume`'s S2 inspect, `unit_state`'s `systemctl show`,
+`volume_exists`, and `_stop_instances`'s per-target `stop`) — not only the
+INLINE-literal shape a minority of callers use instead (e.g.
+`find_partgraph_instances`'s `ps --all` enumeration,
+`_stop_unit_if_active`'s `systemctl stop`). Deliberately described here by
+FUNCTION NAME and CALL SHAPE, never by line number: an earlier draft of
+this paragraph cited specific line ranges, which were accurate at the
+commit they were written against and became stale prose the very next time
+`lifecycle.py` was edited (Gate 5 review) — a name is far more durable than
+a line number, and
+`test_lifecycle_still_uses_both_the_inline_and_the_separate_variable_run_capture_shape`
+below makes the underlying CLAIM (both shapes are still real, current code)
+something a test verifies on every run, not something prose merely asserts
+once and line numbers can silently falsify. This resolution is SCOPE-PRECISE
 (walked once per function, via `_walk_same_scope`, not once per whole
 file): a bare Name is resolved only against an assignment DIRECTLY in the
 SAME function (or the module level) as the call using it — a same-named
@@ -332,8 +345,10 @@ def _scoped_assignment_fragments(scope_node: ast.AST) -> dict[str, list[str]]:
     ``/``-chain fragments found in its right-hand side — this is what lets
     a bare-Name argument at a dangerous call site (e.g. ``argv = [...]`` one
     line earlier, then ``_run_capture(argv, timeout=...)`` — the shape MOST
-    of this repo's own real call sites actually use, e.g.
-    lifecycle.py:577-579/802-814/902-904) be resolved.
+    of ``_run_capture``'s own real callers use, e.g. ``_mounts_data_volume``,
+    ``unit_state`` and ``volume_exists``) be resolved. Described by name,
+    not by line number — see the module docstring's GATE 3A BLOCKING 1 note
+    for why.
 
     SCOPE-PRECISE: a bare Name is resolved only against an assignment in the
     SAME function (or the module level, for module-level calls) — never a
@@ -498,9 +513,10 @@ def test_scanner_flags_forbidden_term_reached_through_a_local_wrapper_function()
     ``_run_capture``) whose OWN body calls ``subprocess.run(argv, ...)``
     with ``argv`` as a bound PARAMETER — never a literal at that inner call
     site — and a caller that passes a forbidden literal INLINE at the
-    WRAPPER's own call site (exactly how ``_run_capture([_SYSTEMCTL,
-    "--user", "stop", PARTGRAPH_UNIT_NAME], timeout=SYSTEMCTL_TIMEOUT_S)``
-    is written for real, e.g. lifecycle.py:866).
+    WRAPPER's own call site (exactly the shape ``_stop_unit_if_active``'s
+    ``systemctl stop`` call and ``find_partgraph_instances``'s ``ps --all``
+    enumeration are written with for real — described by name, not line
+    number, per the module docstring's GATE 3A BLOCKING 1 note).
     When the scanner runs.
     Then it reports the violation: the wrapper is recognised as dangerous
     because ITS OWN body calls a name already known dangerous.
@@ -520,16 +536,18 @@ def test_scanner_flags_forbidden_term_reached_through_a_local_wrapper_function()
 
 def test_scanner_flags_forbidden_term_reached_through_a_wrapper_call_sites_own_local_variable() -> None:
     """[Positive control — GATE 3A BLOCKING 1, the MORE common real shape]
-    Given the SAME wrapper as above, but called the way MOST real call
-    sites in lifecycle.py actually write it (e.g. lines 577-579, 802-814,
-    902-904): the argv list is built in its OWN assignment statement one
-    line earlier, and the WRAPPER call site passes only a bare variable
-    name — ``argv = [...]; _run_capture(argv, timeout=...)`` — not an
-    inline literal.
+    Given the SAME wrapper as above, but called the way MOST of
+    ``_run_capture``'s own real callers actually write it (e.g.
+    ``_mounts_data_volume``'s S2 inspect, ``unit_state``'s ``systemctl
+    show``, and ``volume_exists`` — described by name, not line number, per
+    the module docstring's GATE 3A BLOCKING 1 note): the argv list is built
+    in its OWN assignment statement one line earlier, and the WRAPPER call
+    site passes only a bare variable name — ``argv = [...];
+    _run_capture(argv, timeout=...)`` — not an inline literal.
     When the scanner runs.
     Then it STILL reports the violation: a bare-Name argument to a
     recognised-dangerous call is resolved against that name's own
-    same-file assignment(s).
+    same-scope assignment(s).
     """
     bad = (
         "import subprocess\n\n"
@@ -717,6 +735,63 @@ def test_no_tracked_src_python_file_executes_a_forbidden_lifecycle_mutation(
         "Forbidden lifecycle-mutation literal(s) found inside an EXECUTABLE call "
         "in src/ (the repo must only ever document/detect this, never execute "
         "it):\n" + "\n".join(violations)
+    )
+
+
+def test_lifecycle_still_uses_both_the_inline_and_the_separate_variable_run_capture_shape(
+    repo_root: pathlib.Path,
+) -> None:
+    """[Docstring-accuracy guard — Gate 5 review] Given this file's own
+    module docstring describes TWO real call shapes ``_run_capture`` (the
+    module-local wrapper around ``subprocess.run`` every real call in
+    ``lifecycle.py`` goes through) is actually invoked with: an INLINE list
+    literal at the call site (e.g. ``find_partgraph_instances``'s ``ps
+    --all`` enumeration), and a SEPARATE ``argv = [...]`` assignment one
+    line earlier (e.g. ``_mounts_data_volume``'s ``container inspect``) — a
+    claim an earlier draft pinned to SPECIFIC line numbers, which rotted the
+    very next time ``lifecycle.py`` was edited and were found stale by
+    review.
+    When ``src/partgraph/util/lifecycle.py``'s real source is parsed and
+    every ``_run_capture(...)`` call site is inspected.
+    Then AT LEAST ONE call site uses each shape — so the docstring's CLAIM
+    stays something THIS TEST verifies on every run, not merely something
+    prose asserts once while line numbers silently drift out from under it.
+    Skips cleanly (not a failure) if the module does not exist.
+    """
+    lifecycle_path = repo_root / "src" / "partgraph" / "util" / "lifecycle.py"
+    if not lifecycle_path.exists():
+        pytest.skip("src/partgraph/util/lifecycle.py does not exist yet (expected pre-PR-A).")
+    tree = ast.parse(lifecycle_path.read_text(encoding="utf-8"), filename=str(lifecycle_path))
+
+    inline_shape_found = False
+    variable_shape_found = False
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_run_capture"
+        ):
+            continue
+        if not node.args:
+            continue
+        first_arg = node.args[0]
+        if isinstance(first_arg, ast.Name):
+            variable_shape_found = True
+        elif isinstance(first_arg, ast.List):
+            inline_shape_found = True
+
+    assert inline_shape_found, (
+        "expected at least one `_run_capture([...])` call site with an INLINE "
+        "list-literal argv in src/partgraph/util/lifecycle.py — the module "
+        "docstring's claim about this shape existing would otherwise be "
+        "stale prose, not a verified fact."
+    )
+    assert variable_shape_found, (
+        "expected at least one `_run_capture(argv, ...)` call site where argv "
+        "was assigned in an earlier, separate statement in "
+        "src/partgraph/util/lifecycle.py — the module docstring's claim "
+        "about this shape existing would otherwise be stale prose, not a "
+        "verified fact."
     )
 
 
