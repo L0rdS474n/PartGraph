@@ -12,6 +12,22 @@ configuration required:
 - stop_grace_period matches STOP_GRACE_SECONDS (Gate 7 — see below)
 - init: true is declared, and only WITH it is stop_grace_period meaningful
   for this image (Gate 8 — see below)
+- restart: "no" (PR-B2, ADR-0022 Section 7, AC B-11 — see below)
+
+PR-B2 addition (AC B-11): `restart` changes from `unless-stopped` to `"no"`.
+Under rootless podman, `unless-stopped` never actually restarts the
+container across a HOST reboot anyway (podman has no boot-time service that
+would revive it — only the SEPARATE quadlet/systemd unit ADR-0021/ADR-0022
+already document does that), so the value was advertising a lifecycle
+guarantee Compose never actually provided on this host. PR-B2 also gives
+every DB-touching `partgraph` command its OWN lazy-start path
+(`ensure_running()`), which makes even an in-session engine-level restart
+unnecessary: the next command that needs the database starts it itself. No
+EXISTING test in this file pinned the previous `unless-stopped` value before
+this addition (confirmed by re-reading this file end to end), so this is a
+new pin, not a change to one — the actual `docker/docker-compose.yml` edit
+is out of scope for this test-only change and is expected to leave this new
+test RED until it lands.
 
 Gate 7 addition: a live 14h-run journal entry first surfaced this
 (`StopSignal SIGTERM failed to stop container partgraph-dgraph in 10
@@ -539,4 +555,69 @@ def test_stop_grace_period_and_init_true_are_declared_together(
     pytest.fail(
         "No dgraph service found in docker-compose.yml — cannot verify the "
         f"stop_grace_period/init relationship. Services: {list(services.keys())}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR-B2 (ADR-0022 Section 7, AC B-11) — restart: "no". Rootless podman gives
+# `unless-stopped` no boot-time reviver on this host at all (that job belongs
+# to the SEPARATE quadlet/systemd unit ADR-0021/ADR-0022 already document),
+# so the previous value advertised a lifecycle guarantee Compose does not
+# provide here; every DB-touching command now starts the database itself via
+# `ensure_running()` when it is needed.
+# ---------------------------------------------------------------------------
+
+def test_dgraph_service_restart_policy_is_no(compose_config: dict) -> None:
+    """AC B-11: Given rootless podman gives `restart: unless-stopped` no
+    boot-time reviver on this host, and every DB-touching `partgraph`
+    command now lazily starts the database itself (ADR-0022 Section 7).
+    When we inspect the dgraph service configuration.
+    Then `restart` is declared EXACTLY as the string `"no"` — never the
+    bare YAML value `no` (which PyYAML would otherwise parse as the
+    boolean `False`, a genuinely different, incorrect Compose value; the
+    Compose file itself must quote it), and never `unless-stopped`,
+    `always`, or `on-failure`.
+    """
+    services = compose_config.get("services", {})
+    assert services, "No services defined in docker-compose.yml"
+
+    for svc_name, svc in services.items():
+        image = svc.get("image", "")
+        if "dgraph" in image.lower():
+            restart = svc.get("restart")
+            assert restart == "no", (
+                f"Service '{svc_name}' restart={restart!r}; expected the "
+                "STRING \"no\" (quoted in the YAML source, so PyYAML parses "
+                "it as the string 'no', never the boolean False)."
+            )
+            return
+
+    pytest.fail(
+        "No dgraph service found in docker-compose.yml — cannot verify "
+        f"restart policy. Services: {list(services.keys())}"
+    )
+
+
+def test_dgraph_service_restart_policy_is_quoted_in_the_raw_yaml_source(
+    compose_raw_text: str,
+) -> None:
+    """AC B-11 [belt-and-suspenders]: Given an UNQUOTED `restart: no` in
+    YAML source parses as the boolean `False`, not the string `"no"` —
+    `docker compose config`'s own canonical-form output (used by
+    `compose_config` when a container engine is on PATH) would silently
+    paper over that mistake by re-serialising it as `"no"` regardless, so
+    the raw source text itself must be checked directly, independent of
+    which loader path `compose_config` took on this run.
+    When docker/docker-compose.yml's raw text is scanned.
+    Then a `restart:` line for the dgraph service is present and its value
+    is the QUOTED string `"no"` (single or double quotes), never the bare,
+    boolean-parsed token `no`.
+    """
+    match = re.search(r'^\s*restart:\s*(\S.*)$', compose_raw_text, flags=re.MULTILINE)
+    assert match, "docker-compose.yml declares no 'restart:' key at all."
+    value = match.group(1).strip()
+    assert value in ('"no"', "'no'"), (
+        f"docker-compose.yml's restart value must be the QUOTED string "
+        f'"no" (never the bare YAML token `no`, which parses as the '
+        f"boolean False): got {value!r}"
     )
