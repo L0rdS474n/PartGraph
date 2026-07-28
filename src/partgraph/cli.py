@@ -20,6 +20,7 @@ Design notes:
 from __future__ import annotations
 
 import math
+import os
 import re
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -46,7 +47,9 @@ from partgraph.util.index_health import check_index_integrity
 from partgraph.util.lifecycle import (
     PARTGRAPH_DATA_VOLUME,
     PARTGRAPH_UNIT_NAME,
+    AutostartTimeoutError,
     DownResult,
+    ensure_running,
     find_partgraph_instances,
     stop_all,
     unit_state,
@@ -94,6 +97,42 @@ _GRPC_MAX_MESSAGE_BYTES = 256 * 1024 * 1024
 #: bounded-constant precedent, extended here to the Compose subprocess).
 COMPOSE_TIMEOUT_S = 1800.0
 COMPOSE_DOWN_TIMEOUT_S = 300.0
+
+#: Watchdog for the AUTOSTART ``compose up -d`` call — deliberately NOT
+#: :data:`COMPOSE_TIMEOUT_S`, because the two invocations differ in the only
+#: dimension that matters here: what the person at the keyboard asked for.
+#:
+#: ``db up`` is an EXPLICIT request to start a database. The operator typed it,
+#: expects provisioning, and on a first run expects an image pull; 1800 s is a
+#: reasonable ceiling for a job they are knowingly waiting on.
+#:
+#: Autostart is IMPLICIT. It fires inside ``partgraph search`` — a command
+#: whose user is looking for a part, not provisioning infrastructure. Inheriting
+#: the 1800 s bound made the worst case (a wedged engine, a hung daemon, a
+#: registry pull that neither completes nor errors) 1800 s of silence followed
+#: by :data:`~partgraph.util.lifecycle.AUTOSTART_READY_TIMEOUT_S` of polling —
+#: about 32 minutes before the first byte of error text. No interactive command
+#: may do that, so the implicit path gets its own, much smaller budget.
+#:
+#: This constant is the SECOND of five additive terms in the autostart gate's
+#: worst case, which totals 249 s: one health probe (4 s) + this (120 s) +
+#: ``AUTOSTART_READY_TIMEOUT_S`` (120 s) + one ``AUTOSTART_POLL_INTERVAL_S``
+#: (1 s) + one more health probe (4 s). The two trailing terms exist because
+#: the readiness deadline is checked AFTER each sleep-and-probe, so an
+#: iteration admitted just under it still runs to completion; a probe costs up
+#: to 2 x ``HEALTH_PROBE_TIMEOUT_S`` because ``requests`` bounds the connect
+#: and read phases separately. The full derivation is in ADR-0022's
+#: "Breaking changes" section — do not restate a rounded figure here.
+#:
+#: What 120 s costs. The steady-state autostart — image already present, volume
+#: already there — is a container create and start, which is seconds. The case
+#: this bound can genuinely cut short is a FIRST-RUN image pull on a slow link,
+#: and the answer there is the right one: the operator is told to run
+#: ``partgraph db up``, the explicit command that keeps the generous budget
+#: precisely because it was asked for. Sizing the implicit path for the rare
+#: provisioning case would have taxed every ordinary invocation's failure mode
+#: to avoid one clear message in an uncommon one.
+AUTOSTART_COMPOSE_TIMEOUT_S = 120.0
 
 #: Absolute path to the Compose file. Resolved three levels up from this file
 #: (src/partgraph/cli.py -> src/partgraph -> src -> <repo root>) so the value
@@ -243,6 +282,162 @@ def _run_compose(
         if result.stderr:
             _err_console.print(result.stderr, end="")
         raise typer.Exit(code=result.returncode)
+
+
+# ---------------------------------------------------------------------------
+# Lazy autostart (ADR-0022 Section 7)
+# ---------------------------------------------------------------------------
+
+#: The environment variable an operator sets to opt out of lazy autostart.
+_AUTOSTART_ENV_VAR = "PARTGRAPH_AUTOSTART"
+
+#: The complete set of values that DISABLE autostart, compared case-insensitively
+#: after stripping surrounding whitespace. Everything else — unset, empty, ``1``,
+#: ``true``, ``yes``, ``on``, or a typo like ``banana`` — leaves autostart ON.
+#:
+#: Why these four and not more, and why not fewer. ADR-0022 names exactly one
+#: spelling (``PARTGRAPH_AUTOSTART=0``); ``false``/``no``/``off`` are the
+#: generic-CLI and systemd vocabularies for the same intent, and an operator
+#: reaching for this variable is overwhelmingly likely to type one of them. The
+#: set stops there because the two directions of error are NOT symmetric:
+#: failing open on an unrecognised value changes nothing (autostart is already
+#: the default), while failing open on a value the operator plainly meant as
+#: "off" would start a container on a host that also runs an unrelated stack —
+#: the exact action this switch exists to withhold. Widening further (``n``,
+#: ``disable``, ``0.0``) reintroduces the opposite failure: a near-miss typo
+#: landing INSIDE the set and silently switching a default-on feature off.
+_AUTOSTART_DISABLED_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+class AutostartComposeError(RuntimeError):
+    """The autostart ``compose up -d`` call itself reported failure.
+
+    Deliberately its own type rather than a bare ``RuntimeError``: the leaf
+    logs the TYPE NAME of whatever ``compose_up`` raises (it cannot log the
+    message, which may carry a path), so a distinct name here is what lets an
+    operator tell "the engine ran and refused" apart from
+    :class:`~partgraph.util.container.ContainerEngineError` ("there is no
+    engine on this host at all").
+
+    Never caught by the CLI: :func:`partgraph.util.lifecycle.ensure_running`
+    absorbs it, and the bounded health poll decides the outcome.
+    """
+
+
+def _autostart_enabled() -> bool:
+    """Return True iff this invocation may start the database implicitly.
+
+    Read from :data:`os.environ` at CALL time, never captured at import time,
+    so the value a test (or an operator's own ``env VAR=... partgraph ...``)
+    sets is the value that applies.
+
+    Parsing lives HERE and not in the leaf on purpose. ``ensure_running()``
+    takes its start decision from injected seams and a health probe only; if it
+    also consulted the environment, the same function would answer differently
+    for identical arguments and every caller would inherit an invisible
+    dependency. This is the CLI's policy, so the CLI owns it.
+    """
+    raw = os.environ.get(_AUTOSTART_ENV_VAR)
+    if raw is None:
+        return True
+    return raw.strip().casefold() not in _AUTOSTART_DISABLED_VALUES
+
+
+def _autostart_compose_up() -> None:
+    """Issue ``db up``'s own argv, printing NOTHING at all.
+
+    Byte-for-byte the same argv, engine detection and ``shell=False``
+    discipline as :func:`up` — but silent, and on a much shorter leash. The
+    silence is the whole reason this is not simply
+    ``_run_compose(["up", "-d"], ...)``.
+
+    ``_run_compose`` prints a red ``Error:`` line before raising on a non-zero
+    exit. ``ensure_running()`` ABSORBS a start failure and proceeds when health
+    recovers, which is exactly what happens to the losing side of a
+    start-vs-start race. Reusing ``_run_compose`` verbatim would therefore make
+    that losing invocation print a frightening error and then complete
+    successfully with exit 0 — the message would be describing something that
+    did not go wrong. Failure is signalled by raising instead; whether it
+    matters is the health poll's decision, and only if it does does anything
+    reach the operator.
+
+    The watchdog is :data:`AUTOSTART_COMPOSE_TIMEOUT_S`, NOT the
+    :data:`COMPOSE_TIMEOUT_S` ``db up`` uses: this call is implicit, made on
+    behalf of somebody who typed ``partgraph search``. It holds the whole
+    autostart gate's worst case to 249 s (the five-term derivation is on
+    :data:`AUTOSTART_COMPOSE_TIMEOUT_S` and in ADR-0022) instead of the ~32
+    minutes the generous bound would have allowed against a wedged engine.
+    This call is NOT charged against the readiness budget:
+    ``ensure_running()`` starts its deadline only after it returns.
+
+    Raises:
+        partgraph.util.container.ContainerEngineError: No usable engine on
+            PATH. Uncaught here — the leaf absorbs and logs it, so a host with
+            no container engine surfaces as an autostart timeout rather than as
+            an unrelated-looking detection error.
+        AutostartComposeError: The engine ran and exited non-zero.
+        subprocess.TimeoutExpired: The call exceeded
+            :data:`AUTOSTART_COMPOSE_TIMEOUT_S`.
+    """
+    argv = [*compose_command(), "-f", str(COMPOSE_FILE), "up", "-d"]
+    # shell=False with a list argv, exactly as _run_compose does: no string is
+    # ever handed to a shell. check=False so the return code is inspected here.
+    result = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        shell=False,
+        timeout=AUTOSTART_COMPOSE_TIMEOUT_S,
+        check=False,
+    )
+    if result.returncode != 0:
+        # Neither stdout nor stderr is printed or interpolated: engine output
+        # routinely quotes the compose file path, and this path is reached in
+        # the benign race case too.
+        raise AutostartComposeError(
+            f"the container engine exited with code {result.returncode}"
+        )
+
+
+def _autostart_database() -> None:
+    """Start the database if this invocation is allowed to and it is not up.
+
+    The single gate every autostart-capable command goes through. A no-op when
+    :func:`_autostart_enabled` is False, so the escape hatch costs not even a
+    health probe.
+
+    ``probe_health`` is passed as this module's OWN module-level reference so
+    the CLI's patch point stays the CLI's, and so the injected seam is the same
+    object ``db status`` uses — one health contract, not two.
+
+    On timeout it renders the leaf's message AND, when the start command itself
+    failed, a second line naming that failure's TYPE. The leaf also logs the
+    absorbed failure, but that record reaches a terminal only through
+    ``logging.lastResort`` — nothing in ``src/partgraph/`` configures logging,
+    so any future logging setup could silently redirect or drop it. The reason
+    a start attempt failed is operator-facing, so it goes through the same
+    console the rest of this CLI's errors use rather than depending on that.
+
+    Only the type, never the exception's message: engine output routinely
+    quotes a compose file path, and every line this CLI prints on an error path
+    is path-free. And only on the TIMEOUT path — on the recovered path (a lost
+    start race whose winner brought the database up) nothing is printed at all,
+    because nothing went wrong.
+    """
+    if not _autostart_enabled():
+        return
+    try:
+        ensure_running(probe_health=probe_health, compose_up=_autostart_compose_up)
+    except AutostartTimeoutError as exc:
+        # The leaf's message is already a single, path-free, complete line;
+        # printing it verbatim is the same treatment ContainerEngineError gets.
+        _err_console.print(f"[red]Error:[/red] {exc}")
+        if exc.__cause__ is not None:
+            _err_console.print(
+                "The start command itself failed first "
+                f"({type(exc.__cause__).__name__}); see `partgraph db doctor`."
+            )
+        raise typer.Exit(code=1) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +673,12 @@ def apply_schema() -> None:
         _err_console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
+    # This command talks to Dgraph over its OWN gRPC path, not through
+    # _connect_dgraph(), so the autostart gate is wired explicitly here. Placed
+    # AFTER the schema file is read: a missing or malformed local schema is a
+    # local error and must be reported without starting a container for it.
+    _autostart_database()
+
     try:
         schema_module.apply_schema(schema_text, DGRAPH_GRPC_ADDR)
     except ImportError as exc:
@@ -510,11 +711,28 @@ def check_index() -> None:
     ``embedding`` predicate match ``schema/partgraph.dql`` and whether a sample of
     embedded parts, replayed through ``similar_to`` at k=1000, self-matches at or
     above the rate threshold.
-    Like ``db status`` (ADR-0018) this is engine-independent — it never calls a
-    container engine. Exits 0 iff the database is reachable, the schema matches,
-    and the self-similarity probe passed (or there is nothing embedded yet to
-    check); otherwise 1.
+
+    The CHECK itself is engine-independent: it reaches Dgraph over HTTP and
+    never asks a container engine anything. The COMMAND is not, and no longer
+    claims to be — since ADR-0022 Section 7 it first runs the autostart gate,
+    so on a host where autostart is enabled (the default) and the database is
+    down it will invoke ``<engine> compose ... up -d`` before probing. Set
+    ``PARTGRAPH_AUTOSTART=0`` to get the older, strictly engine-free behaviour.
+
+    This is the distinction ``db status`` does NOT have: it is absent from the
+    autostart allowlist entirely and remains engine-free unconditionally
+    (ADR-0018), because a probe that starts what it measures cannot report on
+    it.
+
+    Exits 0 iff the database is reachable, the schema matches, and the
+    self-similarity probe passed (or there is nothing embedded yet to check);
+    otherwise 1.
     """
+    # Like `db apply-schema`, this command reaches Dgraph without going through
+    # _connect_dgraph() (it queries the HTTP endpoint directly), so the
+    # autostart gate is wired explicitly here rather than inherited.
+    _autostart_database()
+
     try:
         result = check_index_integrity(schema_text=schema_module.load_schema(SCHEMA_FILE))
     except typer.Exit:
@@ -822,6 +1040,31 @@ def _build_dgraph_client():
     return client, stub
 
 
+def _connect_dgraph():
+    """Autostart the database when enabled, then build the client for it.
+
+    THE call site every DB-touching command uses, so lazy autostart is wired in
+    ONE place instead of once per command (ADR-0022 Section 7). Seven of the
+    nine autostart-capable commands reach the database exclusively through
+    here; `db apply-schema` and `db check-index` bypass it (they use their own
+    gRPC/HTTP paths) and therefore call :func:`_autostart_database` explicitly.
+
+    A thin wrapper rather than a gate inside :func:`_build_dgraph_client`
+    itself, for a reason that outlives the tests which pin it: that function's
+    single job is constructing a client with the right gRPC ceiling, and every
+    caller of it — including a future one that already holds a live database —
+    would otherwise inherit a container-start side effect it never asked for.
+    Keeping the two separate leaves "connect to the database" and "make sure
+    there is a database" independently callable, which is what lets
+    `db apply-schema` and `db check-index` take the second without the first.
+
+    Placed at the call sites AFTER every flag has been validated: a bad
+    ``--limit`` must be reported without starting anything.
+    """
+    _autostart_database()
+    return _build_dgraph_client()
+
+
 def _read_staged_parts(staged_path: Path) -> list:
     """Read a JSONL staging file into a list of StagedPart records."""
     from partgraph.normalize.model import StagedPart  # noqa: PLC0415
@@ -1005,7 +1248,7 @@ def _stage_load() -> int:
     LOAD_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
     stub = None
     try:
-        client, stub = _build_dgraph_client()
+        client, stub = _connect_dgraph()
         with Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -1069,7 +1312,7 @@ def stats() -> None:
 
     stub = None
     try:
-        client, stub = _build_dgraph_client()
+        client, stub = _connect_dgraph()
         counts: dict[str, int] = {}
         for node_type in _STATS_NODE_TYPES:
             query = f"{{ q(func: type({node_type})) {{ count(uid) }} }}"
@@ -1460,8 +1703,10 @@ def search(  # noqa: PLR0913, PLR0917 — Typer command surface: one option per 
       partgraph search "1.2V MAX232"
       partgraph search --semantic "rs232 transceiver"
 
-    All reads are read-only; this command never modifies the database. Use
-    --limit to bound the result count and --no-truncate to print full URLs.
+    All reads are read-only; this command never modifies the database. It can,
+    however, START it: if the database is down, the search first brings it up
+    and waits for it (ADR-0022). Set PARTGRAPH_AUTOSTART=0 to disable that.
+    Use --limit to bound the result count and --no-truncate to print full URLs.
     The command searches related parts by MPN similarity.
     """
     # Shared structured-filter validation (AC-SF-28): validate every new filter
@@ -1526,7 +1771,7 @@ def search(  # noqa: PLR0913, PLR0917 — Typer command surface: one option per 
 
     stub = None
     try:
-        client, stub = _build_dgraph_client()
+        client, stub = _connect_dgraph()
 
         # Pass 1 (hard): full parametric + text filter + all structured filters.
         query_text, variables = build_search_dql(parsed, limit=limit, **filter_kwargs)
@@ -1715,7 +1960,7 @@ def _run_semantic_search(  # noqa: PLR0913 — keyword-only filter passthrough
     stub = None
     probe_hint: str | None = None
     try:
-        client, stub = _build_dgraph_client()
+        client, stub = _connect_dgraph()
         query_text, variables = build_semantic_dql(
             query_vector,
             candidate_k,
@@ -1793,7 +2038,9 @@ def show(
     Looks the part up by its normalised MPN and prints manufacturer, package,
     category, stock, promoted key parameters, the long-tail attributes, all
     datasheet URLs and related parts found by MPN similarity. This is a
-    read-only operation; it never modifies the database.
+    read-only operation; it never modifies the database. It can, however,
+    START it: if the database is down, this command first brings it up and
+    waits for it (ADR-0022). Set PARTGRAPH_AUTOSTART=0 to disable that.
     """
     from partgraph.normalize.model import normalize_mpn  # noqa: PLC0415
     from partgraph.query.dql_builder import build_show_dql  # noqa: PLC0415
@@ -1803,7 +2050,7 @@ def show(
 
     stub = None
     try:
-        client, stub = _build_dgraph_client()
+        client, stub = _connect_dgraph()
         query_text, variables = build_show_dql(mpn_norm)
         data = _run_block_query(client, query_text, variables)
     except typer.Exit:
@@ -2309,7 +2556,7 @@ def embed(
     reembedded_total = 0
     embedded_total = 0
     try:
-        client, stub = _build_dgraph_client()
+        client, stub = _connect_dgraph()
         # None (no --limit) drives the pages unbounded — to exhaustion over the
         # whole eligible catalogue; a finite --limit N bounds each pass to N rows
         # exactly, never re-capped at any default (ADR-0011). --changed runs the
@@ -2684,7 +2931,7 @@ def refresh_links(
     stub = None
     totals = dict.fromkeys(_REFRESH_SUMMARY_KEYS, 0)
     try:
-        client, stub = _build_dgraph_client()
+        client, stub = _connect_dgraph()
         remaining = parsed_limit if parsed_limit is not None else _REFRESH_SELECT_DEFAULT
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -3056,7 +3303,7 @@ def refresh(
     stub = None
     totals = dict.fromkeys(_REFRESH_STOCK_SUMMARY_KEYS, 0)
     try:
-        client, stub = _build_dgraph_client()
+        client, stub = _connect_dgraph()
         remaining = (
             parsed_limit if parsed_limit is not None else _REFRESH_STOCK_SELECT_DEFAULT
         )

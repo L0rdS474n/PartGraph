@@ -1,4 +1,4 @@
-"""Stop every PartGraph database lifecycle owner, not just Compose (ADR-0021).
+"""The PartGraph database lifecycle: stop every owner, start it on demand.
 
 This is a **leaf** module: its top-level imports are the Python standard library
 plus :mod:`partgraph.util.container` (engine detection, ADR-0009). It imports
@@ -8,6 +8,28 @@ layers — so the CLI and future callers can all import it without a cycle
 (mirrors :mod:`partgraph.util.container` / :mod:`partgraph.util.health` /
 :mod:`partgraph.util.index_health`). ``lifecycle`` is deliberately **not**
 re-exported from ``partgraph/util/__init__.py``, following the same precedent.
+
+Two responsibilities, and one deliberate asymmetry between them
+--------------------------------------------------------------
+- **Stopping** — :func:`stop_all` (ADR-0021). Everything from "Why this exists"
+  down to the end of this docstring is about that half: which containers count
+  as PartGraph's, and what may be done to them.
+- **Starting** — :func:`ensure_running` (ADR-0022 § 7, PR-B2). Return if the
+  database is already healthy; otherwise issue the caller's start command ONCE
+  and poll the health endpoint until it answers or
+  :data:`AUTOSTART_READY_TIMEOUT_S` is spent, raising
+  :class:`AutostartTimeoutError` if it never does.
+
+The asymmetry between the two injected Compose seams is load-bearing and is
+NOT an oversight. ``stop_all``'s ``compose_down`` propagates: a failed teardown
+must never be reported as a successful one. ``ensure_running``'s ``compose_up``
+is ABSORBED (logged, never raised): a second ``partgraph`` invocation that
+loses a start race gets a genuine "container name already in use" failure from
+the engine while the database it raced against is coming up perfectly well.
+Only the health probe is authoritative there — no fabricated lock, health is
+the truth — so a real start failure and a lost race are separated by whether
+the bounded poll goes on to observe health, not by what the start command
+reported.
 
 Why this exists
 ---------------
@@ -69,6 +91,8 @@ from typing import Any
 from partgraph.util.container import engine_command
 
 __all__ = [
+    "AUTOSTART_POLL_INTERVAL_S",
+    "AUTOSTART_READY_TIMEOUT_S",
     "ENUMERATE_TIMEOUT_S",
     "INSPECT_SWEEP_BUDGET_S",
     "INSPECT_TIMEOUT_S",
@@ -82,9 +106,11 @@ __all__ = [
     "STOP_TIMEOUT_S",
     "SYSTEMCTL_TIMEOUT_S",
     "VOLUME_INSPECT_TIMEOUT_S",
+    "AutostartTimeoutError",
     "DownResult",
     "Instance",
     "UnitState",
+    "ensure_running",
     "find_partgraph_instances",
     "stop_all",
     "unit_state",
@@ -227,6 +253,52 @@ SYSTEMCTL_TIMEOUT_S = 20.0
 #: container at generation time. Fixing that needs host-side unit changes
 #: (PR-B1), not anything in this repository.
 STOP_GRACE_SECONDS = 60
+
+#: Wall-clock budget for :func:`ensure_running`'s readiness poll: how long it
+#: keeps asking the health endpoint AFTER the start command was issued, before
+#: giving up with :class:`AutostartTimeoutError`. Extends ADR-0007's
+#: bounded-constant discipline to the start path, exactly as
+#: :data:`INSPECT_SWEEP_BUDGET_S` and :data:`STOP_TIMEOUT_S` do elsewhere here.
+#:
+#: 120 is a JUDGEMENT CALL, not a measured requirement — and unlike
+#: :data:`STOP_GRACE_SECONDS`, whose 0.2s/60.2s figures came from live runs on
+#: the affected host, PartGraph has NO measurement of Dgraph's first-run
+#: readiness time at all. What is known bounds the choice from both sides:
+#:
+#: - It must not be so small that a genuinely-starting database is declared
+#:   dead. Badger has to open and replay its write-ahead log against a store
+#:   that reached 613,396 ``Part`` nodes on this host, and the failure mode of
+#:   being too small is the worst one available — the command fails while the
+#:   database it asked for comes up seconds later, and the operator is told the
+#:   opposite of what happened.
+#: - It must not be so large that a database which will NEVER come up (no
+#:   engine on PATH, a port already taken, a corrupt volume) holds a
+#:   foreground command a human just typed for minutes. Being too large costs
+#:   only that wait, which is why the budget errs upward.
+#:
+#: Image PULL time is deliberately NOT inside this budget: pulling happens
+#: inside the injected ``compose_up`` call, which returns before the deadline
+#: is even computed, and the CLI gives that call its own SEPARATE watchdog
+#: (``AUTOSTART_COMPOSE_TIMEOUT_S``). The two are ADDED, not multiplied, and
+#: the sum is the ceiling on how long an implicit start can hold a foreground
+#: command — which is why the CLI sizes its half for someone waiting at a
+#: prompt rather than reusing ``db up``'s far more generous pull budget.
+#: This budget covers only "the container exists — is Dgraph answering yet?".
+AUTOSTART_READY_TIMEOUT_S = 120.0
+
+#: Delay between two readiness polls. Bounded below by the health probe's OWN
+#: per-request timeout (``HEALTH_PROBE_TIMEOUT_S = 2.0``,
+#: :mod:`partgraph.util.health`): polling much faster than that would queue
+#: requests against a socket that is not listening yet and buy nothing, since a
+#: database that is not ready cannot become ready in the gap. 1 second keeps
+#: the perceived start latency close to the true one (the poll adds at most one
+#: interval to it) while leaving :data:`AUTOSTART_READY_TIMEOUT_S` room for
+#: dozens of attempts rather than a handful.
+#:
+#: MUST stay strictly below :data:`AUTOSTART_READY_TIMEOUT_S`: an interval at
+#: or above the whole budget would collapse the bounded RETRY loop into a
+#: single bounded WAIT, which is a different (and much worse) contract.
+AUTOSTART_POLL_INTERVAL_S = 1.0
 
 #: Finite ceiling (4 MiB) on how much ``ps`` stdout the parser will even
 #: attempt to decode. Output at or beyond this bound is treated as malformed
@@ -1140,6 +1212,18 @@ def _still_serving_health(probe_health: Callable[[], Any] | None) -> bool:
         )
 
         probe = default_probe
+    return _probe_reports_healthy(probe)
+
+
+def _probe_reports_healthy(probe: Callable[[], Any]) -> bool:
+    """Return True iff *probe* answers something whose ``.healthy`` is truthy.
+
+    ``getattr(..., False)`` rather than attribute access: the seam is injected,
+    so a caller (or a future ``HealthResult`` variant) that answers without a
+    ``healthy`` attribute degrades to "not healthy" instead of raising. For
+    :func:`ensure_running` that degradation is the safe direction — it costs a
+    start attempt and a bounded wait, never a false "the database is up".
+    """
     return bool(getattr(probe(), "healthy", False))
 
 
@@ -1227,3 +1311,160 @@ def stop_all(  # noqa: PLR0913 — one keyword-only seam per injected dependency
         still_serving_health=_still_serving_health(probe_health),
         undetermined=undetermined,
     )
+
+
+# ---------------------------------------------------------------------------
+# Start side — ensure_running (ADR-0022 Section 7)
+# ---------------------------------------------------------------------------
+
+
+class AutostartTimeoutError(RuntimeError):
+    """The database never reported healthy within the readiness budget.
+
+    A ``RuntimeError`` subclass, mirroring
+    :class:`partgraph.util.container.ContainerEngineError`'s precedent: a leaf
+    raises it, ``partgraph.cli`` catches it and turns it into a clean exit —
+    never a traceback in an operator's terminal.
+
+    Its ``str()`` IS the complete user-facing message. It is a SINGLE line, it
+    is path-free (it names no compose file, no volume and no repository
+    location), it states the budget it actually spent, and it names the one
+    command that can answer the question the operator is left with — did the
+    database come up after ``partgraph`` stopped waiting for it?
+    """
+
+
+def _resolve_sleep(sleep: Callable[[float], None] | None) -> Callable[[float], None]:
+    """Return the delay callable to use, resolved at CALL time.
+
+    Never captured as a parameter default, mirroring :func:`_resolve_which`:
+    binding ``time.sleep`` at definition time would make a test that patches
+    the real :mod:`time` module silently sleep for real seconds.
+    """
+    return sleep if sleep is not None else time.sleep
+
+
+def _resolve_monotonic(monotonic: Callable[[], float] | None) -> Callable[[], float]:
+    """Return the clock callable to use, resolved at CALL time.
+
+    Monotonic on purpose: the readiness deadline must survive a wall-clock step
+    (an NTP correction mid-start would otherwise either cut the wait short or
+    extend it indefinitely). Same call-time resolution rule as
+    :func:`_resolve_sleep`.
+    """
+    return monotonic if monotonic is not None else time.monotonic
+
+
+def ensure_running(
+    *,
+    probe_health: Callable[[], Any],
+    compose_up: Callable[[], None],
+    sleep: Callable[[float], None] | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> None:
+    """Make sure the database is answering, starting it once if it is not.
+
+    Three steps, in this order:
+
+    1. Probe health. If it is already healthy, RETURN — *compose_up* is never
+       called and nothing is ever slept on. This is the common case and it
+       costs exactly one local HTTP probe: since *compose_up* is the only seam
+       that can reach a container engine at all, a healthy database means ZERO
+       engine subprocesses.
+    2. Otherwise call *compose_up* EXACTLY once. Any exception it raises is
+       ABSORBED — logged, never propagated, never retried.
+    3. Poll: sleep :data:`AUTOSTART_POLL_INTERVAL_S`, probe again, return as
+       soon as it is healthy, and raise :class:`AutostartTimeoutError` once
+       :data:`AUTOSTART_READY_TIMEOUT_S` has been spent. The deadline is
+       computed ONCE, after step 2, so the start command's own duration (an
+       image pull, say) is not charged against the readiness budget.
+
+    **Why step 2 absorbs, when ``stop_all``'s ``compose_down`` propagates.**
+    A start command's own exit status is not evidence about the database. Two
+    ``partgraph`` invocations can race; the loser is told the container name is
+    already in use, by an engine that is at that moment starting the very
+    database the loser wants. Treating that as authoritative would fail a
+    command that is about to succeed. So the start attempt is best-effort and
+    the health probe is the sole verdict — no lock is invented, and a genuine,
+    unrecoverable start failure is still reported, one bounded wait later, by
+    step 3. The absorbed exception is not discarded silently: its TYPE is
+    logged at WARNING (see below), which is what separates "no container engine
+    on this host" from "somebody else got there first" for an operator reading
+    the log of a database that stayed down.
+
+    Success is signalled by returning None; failure only ever by raising.
+    There is no boolean return, because a caller that ignored a False would
+    proceed to talk to a database that is not there.
+
+    Args:
+        probe_health: REQUIRED, keyword-only, no default. Returns an object
+            whose ``.healthy`` is truthy iff the database is answering.
+        compose_up: REQUIRED, keyword-only, no default. Issues the start
+            command. Both seams follow :func:`stop_all`'s ``compose_down``
+            precedent: a caller must decide EXPLICITLY how health is checked
+            and how the database is started, rather than silently inheriting a
+            permissive default that would make this function a no-op.
+        sleep: Delay seam; defaults to :func:`time.sleep`, resolved at call
+            time so tests never sleep for real.
+        monotonic: Clock seam; defaults to :func:`time.monotonic`, resolved at
+            call time.
+
+    Raises:
+        AutostartTimeoutError: If the database never reported healthy within
+            :data:`AUTOSTART_READY_TIMEOUT_S` of the start command being
+            issued. This is the ONLY exception this function raises — anything
+            *compose_up* itself raises is absorbed at step 2.
+    """
+    if _probe_reports_healthy(probe_health):
+        return
+
+    #: The absorbed start failure, kept so the eventual timeout can CHAIN it.
+    #: Absorbing for control flow is right (a lost race must proceed); throwing
+    #: the diagnosis away is not. If the poll goes on to fail, ``__cause__``
+    #: carries WHY the start attempt failed, and ``partgraph.cli`` renders its
+    #: type — so the operator gets the reason on the one path where it matters,
+    #: not only in a log record that depends on how logging happens to be
+    #: configured. On the RECOVERED path nothing is rendered at all: the
+    #: failure turned out not to be one.
+    absorbed: BaseException | None = None
+
+    try:
+        compose_up()
+    except Exception as exc:  # noqa: BLE001 — see the docstring: the start
+        # command's outcome is deliberately NOT authoritative, so every failure
+        # mode it can present (a non-zero engine exit, a missing engine, a
+        # wedged call) is absorbed identically and left for the poll to judge.
+        #
+        # Only the exception's TYPE NAME is recorded. A class name cannot
+        # contain a path separator, whereas the message very well might: engine
+        # stderr routinely quotes a compose file location, and this module's
+        # logging discipline is that no record may leak one. The type is still
+        # enough to tell a fatal misconfiguration (a ContainerEngineError: no
+        # engine on PATH) from a benign lost race (a non-zero exit from an
+        # engine that is running perfectly well).
+        _LOGGER.warning(
+            "The database start command failed (%s); it was absorbed, and the "
+            "bounded health poll alone now decides whether the database came "
+            "up.",
+            type(exc).__name__,
+        )
+        absorbed = exc
+
+    delay = _resolve_sleep(sleep)
+    clock = _resolve_monotonic(monotonic)
+    deadline = clock() + AUTOSTART_READY_TIMEOUT_S
+    while True:
+        delay(AUTOSTART_POLL_INTERVAL_S)
+        if _probe_reports_healthy(probe_health):
+            return
+        if clock() >= deadline:
+            # ``from absorbed``: the start failure, if there was one, becomes
+            # this exception's ``__cause__``. ``absorbed`` is None when the
+            # start command reported success and the database simply never
+            # answered — ``raise ... from None`` is correct there too, since
+            # there is no active exception context inside this loop to suppress.
+            raise AutostartTimeoutError(
+                f"the database did not become healthy within "
+                f"{AUTOSTART_READY_TIMEOUT_S:.0f}s of the start command; run "
+                f"`partgraph db status` to check whether it came up after all."
+            ) from absorbed

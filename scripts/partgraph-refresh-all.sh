@@ -19,6 +19,8 @@
 #     path is baked in; override PARTGRAPH_BIN to point at a specific binary.
 #   * Set PARTGRAPH_REFRESH_FETCH to any non-empty value to add --fetch to
 #     phase 1 (re-download the ~1 GB source snapshot); unset/empty = no fetch.
+#   * PARTGRAPH_AUTOSTART is FORCED to 0 below and is deliberately NOT
+#     overridable from the environment. See the block above the export.
 #
 # This wrapper assumes the database is already running and reachable; it never
 # starts, stops, or health-checks it, and it opens no network ports itself.
@@ -27,6 +29,28 @@
 set -euo pipefail
 
 PARTGRAPH_BIN="${PARTGRAPH_BIN:-partgraph}"
+
+# --- the scheduling layer never starts the database (ADR-0014 D1) -----------
+# `partgraph refresh` and `partgraph refresh-links` are BOTH autostart-capable
+# when a human runs them (ADR-0022 Section 7). On a schedule they must not be:
+# a weekly timer that silently starts a container is precisely the unattended,
+# nobody-asked-for-it resource use ADR-0022 exists to eliminate.
+#
+# THIS export is the authoritative mechanism, not the unit's own
+# `Environment=PARTGRAPH_AUTOSTART=0`. systemd.exec(5) states, verbatim, of
+# EnvironmentFile=: "Settings from these files override settings made with
+# Environment=." That is unconditional — it does NOT depend on the order the
+# two directives appear in, so the unit's line loses to ANY value the optional
+# operator env file (~/.config/partgraph/refresh-all.env) sets for this key,
+# and no reordering can change that. A shell assignment here is applied AFTER
+# systemd has finished assembling the environment and before `partgraph` is
+# ever exec'd, so it is the last word by construction.
+#
+# Hard-coded on purpose: it is not read from the environment, because the
+# environment is the exact channel that cannot be trusted to carry it. An
+# operator who genuinely wants a scheduled run to start the database edits
+# THIS line, visibly, in a file they installed.
+export PARTGRAPH_AUTOSTART=0
 
 command -v "$PARTGRAPH_BIN" >/dev/null 2>&1 || {
     echo "partgraph-refresh-all: required command not found: ${PARTGRAPH_BIN}" >&2

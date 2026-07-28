@@ -25,10 +25,25 @@ host's scheduler (a **systemd timer** or **cron**), wrapping the shipped
 > **These schedules assume the database is already running** — i.e. you have run
 > **`partgraph db up`** and it stays up. This scheduling layer only runs the
 > refresh commands; it **does not start, stop, or health-check the database**.
-> If the database is down when a job fires, the refresh commands exit non-zero
-> with a path-free "is the database running?" hint and the wrapper propagates
-> that failure to your scheduler — nothing is corrupted, the run is simply
-> logged as failed.
+> That holds even though `partgraph refresh`/`refresh-links` are, when invoked
+> interactively, autostart-capable commands (ADR-0022 Section 7): the shipped
+> wrapper `scripts/partgraph-refresh-all.sh` does
+> `export PARTGRAPH_AUTOSTART=0` before it invokes `partgraph`, so a scheduled
+> run never implicitly starts a container — an unattended, schedule-triggered
+> container start is exactly the kind of unattended resource use ADR-0022
+> exists to eliminate, not reintroduce through the timer. The export lives in
+> the **wrapper**, not only in the unit, on purpose: `systemd.exec(5)` states
+> that `EnvironmentFile=` settings *override* those made with `Environment=`,
+> unconditionally and regardless of the order the two directives appear in, so
+> the unit's own `Environment=PARTGRAPH_AUTOSTART=0` would lose to any
+> `PARTGRAPH_AUTOSTART=` line in your optional
+> `~/.config/partgraph/refresh-all.env`. A shell `export` is applied after
+> systemd has assembled the environment, so it cannot be overridden that way.
+> The unit keeps its `Environment=` line as a second layer, for the case where
+> the wrapper is bypassed. If the database is down when a job fires, the refresh commands exit
+> non-zero with a path-free "is the database running?" hint and the wrapper
+> propagates that failure to your scheduler — nothing is corrupted, the run is
+> simply logged as failed.
 
 ---
 

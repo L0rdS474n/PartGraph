@@ -129,6 +129,42 @@ def dgraph_pydgraph_client(dgraph_available):
 # Marker-node cleanup helper
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Autostart hermeticity (PR-B2, ADR-0022 Section 7, AC B-10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _partgraph_autostart_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force PARTGRAPH_AUTOSTART=0 for every test unless a test opts in.
+
+    Given: PR-B2 makes autostart ON by default for every DB-touching command
+        (`ensure_running()`, called from `partgraph.cli`), and autostart means a
+        real (albeit hermetically faked, in tests) container-engine subprocess
+        can be invoked as a side effect of an otherwise read-only command like
+        `partgraph search`.
+    When: any test in this suite runs, WITHOUT that test itself overriding
+        `PARTGRAPH_AUTOSTART`.
+    Then: `PARTGRAPH_AUTOSTART` reads as `"0"` (the documented escape hatch),
+        so a test that does not know about autostart at all — and forgets to
+        patch `subprocess.run`/`partgraph.cli.ensure_running` — can never
+        accidentally start a real container while `pytest` runs.
+
+    Tests that specifically exercise the autostart-ON path (e.g.
+    `tests/unit/test_cli_autostart.py`) opt back in explicitly, by calling
+    `monkeypatch.setenv("PARTGRAPH_AUTOSTART", ...)` themselves inside the test
+    body — which simply overrides the SAME `monkeypatch` fixture instance this
+    autouse fixture already used (function-scoped, cached per test node), so
+    both the autouse default and the test's own override are correctly undone
+    together when the test ends, regardless of which one ran last.
+
+    Uses `monkeypatch`, not a raw `os.environ` mutation: monkeypatch guarantees
+    the original value (or absence) is restored after the test, even if the
+    test raises.
+    """
+    monkeypatch.setenv("PARTGRAPH_AUTOSTART", "0")
+
+
 @pytest.fixture
 def cleanup_marker_nodes(dgraph_pydgraph_client):
     """Delete all nodes tagged with TEST_MARKER_PREDICATE after each test.
