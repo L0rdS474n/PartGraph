@@ -6,7 +6,10 @@
 # docs/scheduling.md for the install steps.
 #
 # It assumes the database is already up (`partgraph db up`); this unit does NOT
-# start or stop it.
+# start or stop it. It sets PARTGRAPH_AUTOSTART=0 below so that guarantee holds
+# even now that `partgraph refresh`/`refresh-links` are, when invoked
+# interactively, autostart-capable commands (ADR-0022 Section 7) — the
+# scheduled path deliberately opts back out of that lazy start.
 
 [Unit]
 Description=PartGraph refresh (stock/price + datasheet links), one-shot
@@ -22,6 +25,16 @@ ExecStart=%h/.local/bin/partgraph-refresh-all.sh
 # weekly ~1 GB snapshot re-download in phase 1). The leading '-' makes a missing
 # file non-fatal.
 EnvironmentFile=-%h/.config/partgraph/refresh-all.env
+
+# Keep the database lifecycle out of the scheduled path (ADR-0014 D1), even
+# though `refresh`/`refresh-links` are autostart-capable commands when run
+# interactively (ADR-0022 Section 7). Placed AFTER the optional
+# EnvironmentFile above so it always wins if that file is ever edited to also
+# set PARTGRAPH_AUTOSTART: systemd applies same-key Environment=/
+# EnvironmentFile= directives in file order, last one wins, and this line is
+# the last word on this variable in this unit — an operator override cannot
+# silently reintroduce an implicit container start on a scheduled run.
+Environment=PARTGRAPH_AUTOSTART=0
 
 # Hardening. The default (no-fetch) run writes nothing to the filesystem — it
 # only talks to the local database over the network — and needs no privileges.

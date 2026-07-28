@@ -25,10 +25,16 @@ host's scheduler (a **systemd timer** or **cron**), wrapping the shipped
 > **These schedules assume the database is already running** — i.e. you have run
 > **`partgraph db up`** and it stays up. This scheduling layer only runs the
 > refresh commands; it **does not start, stop, or health-check the database**.
-> If the database is down when a job fires, the refresh commands exit non-zero
-> with a path-free "is the database running?" hint and the wrapper propagates
-> that failure to your scheduler — nothing is corrupted, the run is simply
-> logged as failed.
+> That holds even though `partgraph refresh`/`refresh-links` are, when invoked
+> interactively, autostart-capable commands (ADR-0022 Section 7): the shipped
+> `partgraph-refresh-all.service` unit sets `PARTGRAPH_AUTOSTART=0` explicitly,
+> so a scheduled run never implicitly starts a container — an unattended,
+> schedule-triggered container start is exactly the kind of unattended
+> resource use ADR-0022 exists to eliminate, not reintroduce through the
+> timer. If the database is down when a job fires, the refresh commands exit
+> non-zero with a path-free "is the database running?" hint and the wrapper
+> propagates that failure to your scheduler — nothing is corrupted, the run is
+> simply logged as failed.
 
 ---
 

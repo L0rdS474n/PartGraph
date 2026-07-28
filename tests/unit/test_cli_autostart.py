@@ -40,20 +40,29 @@ ModuleNotFoundError"):
     re-deriving the argv).
   - `PARTGRAPH_AUTOSTART` parsing (pinned here, not dictated by any AC): read
     via `os.environ`, case-insensitively, stripped. The ONLY recognised "off"
-    tokens are `"0"`, `"false"` and `"no"` — matching any of those (in any
-    case) disables autostart for that invocation. UNSET, EMPTY STRING, and any
-    OTHER value (`"1"`, `"true"`, `"yes"`, or a genuinely unrecognised typo
-    like `"banana"`) all mean autostart stays ON — the documented default.
-    Rationale: the ADR names exactly ONE escape-hatch spelling
-    (`PARTGRAPH_AUTOSTART=0`); accepting a couple of obvious synonyms
-    ("false"/"no") is a reasonable robustness concession, but a value that
-    matches NONE of the three recognised off-tokens is far more likely to be a
-    typo than a deliberate, mis-spelled attempt to disable a feature the
-    operator wants ON by default — so an ambiguous/garbage value fails OPEN
-    (autostart stays on) rather than silently and surprisingly disabling
-    autostart on a typo. This keeps the escape hatch UNAMBIGUOUS in the
-    direction that matters most: there is exactly one well-documented way to
-    turn it off, and everything else does not.
+    tokens are `"0"`, `"false"`, `"no"` and `"off"` — matching any of those (in
+    any case) disables autostart for that invocation. UNSET, EMPTY STRING, and
+    any OTHER value (`"1"`, `"true"`, `"yes"`, `"on"`, or a genuinely
+    unrecognised typo like `"banana"`) all mean autostart stays ON — the
+    documented default.
+
+    Rationale, and why `"off"` is in the disable set while a typo like
+    `"banana"` is not (coordinator + security-gate ruling, decisive on the
+    asymmetry): the ADR names exactly ONE escape-hatch spelling
+    (`PARTGRAPH_AUTOSTART=0`); `"false"`/`"no"`/`"off"` are the numeric,
+    generic-CLI and systemd-style vocabularies for the SAME concept an
+    operator setting this variable is overwhelmingly likely to reach for, so
+    accepting all three is a reasonable robustness concession — but the set
+    stops there. Failing OPEN on `"banana"` or `"on"` changes nothing,
+    because autostart is ALREADY the default; failing open on `"off"` would
+    do the OPPOSITE of what the operator explicitly typed, and the guarded
+    action is starting a container on a host that also runs an unrelated
+    cve-graph stack — the asymmetry between "a typo does nothing" and "a
+    typo starts an unwanted container" is what makes `"off"` mandatory and
+    everything past these four tokens still a deliberate non-goal: widening
+    further (e.g. recognising `"n"`/`"disable"`) reintroduces the OTHER
+    failure this design avoids — a near-miss typo landing INSIDE the disable
+    set and silently switching a default-on feature off.
 
 HERMETICITY: every test in this file EITHER (a) patches
 `partgraph.cli.ensure_running` directly as a spy — for the B-6/B-7/B-8/B-9/
@@ -76,6 +85,7 @@ test in this file that needs the ON path opts back in explicitly via
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from unittest.mock import MagicMock, patch
@@ -170,6 +180,125 @@ def _which_systemctl_present(name: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# [BLOCKING 1 fix] Shared helpers making the B-6 allowlist tests able to
+# distinguish "ensure_running called correctly, before the work" from
+# "ensure_running called uselessly, anywhere, with any arguments" — the gap
+# Gate 3a flagged: a bare `mock_ensure.assert_called()` is satisfied by a call
+# with dummy arguments, after the DB work already ran, or from dead code.
+#
+# Two mechanisms, used TOGETHER by every B-6 test below (except `search`,
+# which is exempted per the coordinator's ruling: it already gets a FULL,
+# non-spy, subprocess-level proof of both ordering and argv-correctness from
+# the real `ensure_running()` via B-1/B-2/B-3):
+#   1. ORDERING: the command's own DB-touching mock (`_build_dgraph_client`,
+#      `apply_schema`, `check_index_integrity`) is wired to RAISE unless
+#      `ensure_running` has already fired (recorded in a shared `order` list)
+#      — a hard, fail-fast ordering requirement, not a call-count coincidence.
+#   2. IDENTITY: `ensure_running`'s own call kwargs are captured, and
+#      `probe_health` is asserted to be `partgraph.cli.probe_health` BY
+#      IDENTITY (`is`, not equality) — proving the CLI's real module-level
+#      reference was threaded through, not a dummy — while `compose_up` is
+#      actually INVOKED (in isolation, with its own subprocess/compose_command
+#      patches) and asserted to issue `db up`'s own argv exactly, with
+#      `shell=False` and a finite, bounded `timeout=` — proving it is wired to
+#      the real start path, not a no-op lambda.
+# ---------------------------------------------------------------------------
+
+
+def _assert_compose_up_issues_db_up_argv(compose_up) -> None:
+    """Invoke *compose_up* IN ISOLATION and assert it issues db up's own argv.
+
+    Proves the seam captured from a real `ensure_running(...)` call is wired
+    to the genuine `<engine> compose -f <abs COMPOSE_FILE> up -d` start path
+    — never a dummy `lambda: None` that would keep every B-6 test green while
+    shipping a feature that starts nothing.
+    """
+    assert callable(compose_up), f"compose_up must be a callable, got: {compose_up!r}"
+    calls: list[list[str]] = []
+    call_kwargs: list[dict] = []
+
+    def _fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        call_kwargs.append(kwargs)
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with (
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("subprocess.run", side_effect=_fake_run),
+    ):
+        compose_up()
+
+    assert calls == [["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d"]], (
+        f"compose_up must issue exactly db up's own argv, never a dummy or "
+        f"no-op: {calls!r}"
+    )
+    # [SHOULD-FIX: subprocess kwargs] the one place a container gets started
+    # implicitly must not have WEAKER kwarg coverage than a read-only probe
+    # like volume_exists() (ADR-0022) — shell=False and a finite, bounded
+    # timeout are checked here, reused by every B-6 caller of this helper.
+    kwargs = call_kwargs[0]
+    assert kwargs.get("shell") is False, (
+        f"the compose up subprocess call must carry shell=False: {kwargs!r}"
+    )
+    timeout = kwargs.get("timeout")
+    assert isinstance(timeout, int | float) and math.isfinite(timeout) and timeout > 0, (
+        f"the compose up subprocess call must carry a finite, bounded "
+        f"timeout=, mirroring volume_exists()'s own discipline: {kwargs!r}"
+    )
+
+
+def _assert_ensure_running_called_with_real_seams(captured_kwargs: dict) -> None:
+    """Assert *captured_kwargs* (an `ensure_running(...)` call's own kwargs)
+    thread through the REAL `probe_health` (by identity) and a genuine
+    `compose_up` (by actually invoking it — see
+    `_assert_compose_up_issues_db_up_argv`).
+    """
+    assert captured_kwargs.get("probe_health") is cli_mod.probe_health, (
+        "ensure_running must be called with the CLI's own module-level "
+        f"probe_health reference, not a dummy: {captured_kwargs.get('probe_health')!r}"
+    )
+    _assert_compose_up_issues_db_up_argv(captured_kwargs.get("compose_up"))
+
+
+def _make_ordered_ensure_running(order: list[str], captured_kwargs: dict) -> MagicMock:
+    """Return a MagicMock ensure_running() that records an "ensure_running"
+    marker in *order* and captures its own call kwargs into *captured_kwargs*
+    for the identity/argv assertions above.
+    """
+
+    def _fn(*args, **kwargs):
+        order.append("ensure_running")
+        captured_kwargs.update(kwargs)
+
+    return MagicMock(side_effect=_fn)
+
+
+def _make_ordered_touch(
+    order: list[str], name: str, *, return_value: object = None, side_effect=None
+) -> MagicMock:
+    """Return a MagicMock DB-touch stand-in that RAISES unless "ensure_running"
+    is already present in *order* — the "downstream mock raises unless
+    autostart already ran" pattern, making ordering a hard, fail-fast
+    requirement rather than a call-count coincidence.
+    """
+
+    def _fn(*args, **kwargs):
+        assert "ensure_running" in order, (
+            f"{name} was invoked before ensure_running fired — autostart "
+            "must run BEFORE the command's own DB-touching work; this mock "
+            "is deliberately wired to fail fast when it does not, so a "
+            "call anywhere else in the body (or after the work already "
+            "ran) cannot pass this test"
+        )
+        order.append(name)
+        if side_effect is not None:
+            return side_effect(*args, **kwargs)
+        return return_value
+
+    return MagicMock(side_effect=_fn)
+
+
+# ---------------------------------------------------------------------------
 # B-1 / B-2 / B-3 — the real ensure_running(), driven end-to-end through
 # `search` (the representative command). ONE deep, subprocess-level test per
 # acceptance criterion; the remaining 8 allowlisted commands are covered by
@@ -210,16 +339,21 @@ def test_b2_unhealthy_start_argv_equals_db_up_argv_exactly_invoked_once(
     When `partgraph search MAX232` runs with autostart ON.
     Then EXACTLY ONE `compose ... up -d` subprocess call is made, and its
     argv equals `db up`'s own argv byte-for-byte: `<engine> compose -f
-    <abs COMPOSE_FILE> up -d`; the search's own DB work (the mock client's
-    txn) still runs afterward, proving the command's DB work begins only
-    after ensure_running() reports healthy.
+    <abs COMPOSE_FILE> up -d`, carrying `shell=False` and a finite, bounded
+    `timeout=` [SHOULD-FIX: this is the one place a container gets started
+    implicitly; it must not have weaker kwarg coverage than a read-only probe
+    like `volume_exists()`, ADR-0022]; the search's own DB work (the mock
+    client's txn) still runs afterward, proving the command's DB work begins
+    only after ensure_running() reports healthy.
     """
     _autostart_on(monkeypatch)
     mock_client = _make_empty_search_client()
     calls: list[list[str]] = []
+    call_kwargs: list[dict] = []
 
     def _fake_run(argv, **kwargs):
         calls.append(list(argv))
+        call_kwargs.append(kwargs)
         return MagicMock(returncode=0, stdout="", stderr="")
 
     with (
@@ -233,10 +367,20 @@ def test_b2_unhealthy_start_argv_equals_db_up_argv_exactly_invoked_once(
         result = _invoke(["search", "MAX232"])
 
     assert result.exit_code == 0, result.output
-    up_calls = [argv for argv in calls if "compose" in argv and "up" in argv]
-    assert len(up_calls) == 1, f"expected exactly one compose up call, got: {calls!r}"
-    assert up_calls[0] == ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d"], (
-        f"the autostart argv must equal `db up`'s own argv exactly: {up_calls[0]!r}"
+    up_indices = [i for i, argv in enumerate(calls) if "compose" in argv and "up" in argv]
+    assert len(up_indices) == 1, f"expected exactly one compose up call, got: {calls!r}"
+    up_argv = calls[up_indices[0]]
+    up_kwargs = call_kwargs[up_indices[0]]
+    assert up_argv == ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d"], (
+        f"the autostart argv must equal `db up`'s own argv exactly: {up_argv!r}"
+    )
+    assert up_kwargs.get("shell") is False, (
+        f"the autostart compose up call must carry shell=False: {up_kwargs!r}"
+    )
+    timeout = up_kwargs.get("timeout")
+    assert isinstance(timeout, int | float) and math.isfinite(timeout) and timeout > 0, (
+        f"the autostart compose up call must carry a finite, bounded "
+        f"timeout=, mirroring volume_exists()'s own discipline: {up_kwargs!r}"
     )
     assert mock_client.txn.called, (
         "the search's own DB query must still run once the database is healthy"
@@ -288,20 +432,42 @@ def test_b3_never_becomes_healthy_exits_one_names_budget_and_db_status_no_traceb
 
 
 # ---------------------------------------------------------------------------
-# B-6 — the allowlist, exactly: one parametrized case per command. Uses a
-# SPY on partgraph.cli.ensure_running (never exercising its real internals,
-# which the B-1/B-2/B-3 section and test_lifecycle_ensure_running.py already
+# B-6 — the allowlist, exactly: one case per command. Uses a SPY on
+# partgraph.cli.ensure_running (never exercising its real internals, which
+# the B-1/B-2/B-3 section and test_lifecycle_ensure_running.py already
 # cover), and mocks only what each command needs to reach its own DB-touching
 # point without erroring for an UNRELATED reason.
+#
+# [Gate 3a BLOCKING 1 fix] Every case except `search` (exempted by the
+# coordinator's own ruling: it already gets a FULL, non-spy, subprocess-level
+# proof of both ordering and argv-correctness from the REAL ensure_running()
+# via B-1/B-2/B-3) now asserts, via the shared helpers just above, BOTH (a)
+# strict ordering — the command's own DB-touching mock is wired to RAISE if
+# invoked before "ensure_running" is recorded — and (b) argument identity —
+# `probe_health` is the CLI's own real reference, and `compose_up`, when
+# actually invoked, issues `db up`'s argv exactly. A bare
+# `mock_ensure.assert_called()` (the PRIOR, weaker shape) is satisfied by a
+# call anywhere in the body, with any arguments, in any order, including
+# after the DB work already ran; none of that is true of the assertions
+# below.
 # ---------------------------------------------------------------------------
 
 
-def test_b6_stats_triggers_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
-    """B-6: Given `partgraph stats`, a DB-touching command.
+def test_b6_stats_triggers_autostart_before_db_work_with_real_seams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-6 [BLOCKING 1 fix]: Given `partgraph stats`, a DB-touching command.
     When it runs with autostart ON.
-    Then `ensure_running` is called before the command's own DB work.
+    Then `ensure_running` fires strictly BEFORE `_build_dgraph_client`
+    (`_build_dgraph_client` is wired to raise otherwise — a fail-fast
+    ordering check, not a call-count coincidence), and it is called with the
+    CLI's own REAL `probe_health` (by identity) and a `compose_up` that, when
+    actually invoked, issues `db up`'s own argv exactly — proving the
+    wiring cannot be satisfied by a dummy placed after the DB work.
     """
     _autostart_on(monkeypatch)
+    order: list[str] = []
+    captured: dict = {}
 
     def _fake_query(dql, *a, **kw):
         resp = MagicMock()
@@ -315,12 +481,22 @@ def test_b6_stats_triggers_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
     mock_client.txn.return_value = mock_txn
 
     with (
-        patch("partgraph.cli.ensure_running") as mock_ensure,
-        patch.object(cli_mod, "_build_dgraph_client", return_value=(mock_client, MagicMock())),
+        patch("partgraph.cli.ensure_running", _make_ordered_ensure_running(order, captured)),
+        patch.object(
+            cli_mod,
+            "_build_dgraph_client",
+            _make_ordered_touch(
+                order, "_build_dgraph_client", return_value=(mock_client, MagicMock())
+            ),
+        ),
     ):
-        _invoke(["stats"])
+        result = _invoke(["stats"])
 
-    mock_ensure.assert_called()
+    assert result.exit_code == 0, result.output
+    assert order == ["ensure_running", "_build_dgraph_client"], (
+        f"ensure_running must fire strictly before _build_dgraph_client: {order!r}"
+    )
+    _assert_ensure_running_called_with_real_seams(captured)
 
 
 def test_b6_search_triggers_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -340,12 +516,19 @@ def test_b6_search_triggers_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
     mock_ensure.assert_called()
 
 
-def test_b6_show_triggers_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
-    """B-6: Given `partgraph show`, a read-only DB-touching command.
+def test_b6_show_triggers_autostart_before_db_work_with_real_seams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-6 [BLOCKING 1 fix]: Given `partgraph show`, a read-only DB-touching
+    command.
     When it runs with autostart ON.
-    Then `ensure_running` is called.
+    Then `ensure_running` fires strictly before `_build_dgraph_client`, with
+    the CLI's real `probe_health` and a `compose_up` that genuinely issues
+    `db up`'s argv (see `_assert_ensure_running_called_with_real_seams`).
     """
     _autostart_on(monkeypatch)
+    order: list[str] = []
+    captured: dict = {}
 
     def _fake_query(dql, *a, **kw):
         resp = MagicMock()
@@ -359,20 +542,35 @@ def test_b6_show_triggers_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
     mock_client.txn.return_value = mock_txn
 
     with (
-        patch("partgraph.cli.ensure_running") as mock_ensure,
-        patch.object(cli_mod, "_build_dgraph_client", return_value=(mock_client, MagicMock())),
+        patch("partgraph.cli.ensure_running", _make_ordered_ensure_running(order, captured)),
+        patch.object(
+            cli_mod,
+            "_build_dgraph_client",
+            _make_ordered_touch(
+                order, "_build_dgraph_client", return_value=(mock_client, MagicMock())
+            ),
+        ),
     ):
-        _invoke(["show", "MAX232"])
+        result = _invoke(["show", "MAX232"])
 
-    mock_ensure.assert_called()
+    assert result.exit_code == 0, result.output
+    assert order == ["ensure_running", "_build_dgraph_client"], (
+        f"ensure_running must fire strictly before _build_dgraph_client: {order!r}"
+    )
+    _assert_ensure_running_called_with_real_seams(captured)
 
 
-def test_b6_embed_triggers_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
-    """B-6: Given `partgraph embed`.
+def test_b6_embed_triggers_autostart_before_db_work_with_real_seams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-6 [BLOCKING 1 fix]: Given `partgraph embed`.
     When it runs with autostart ON.
-    Then `ensure_running` is called.
+    Then `ensure_running` fires strictly before `_build_dgraph_client`, with
+    the CLI's real `probe_health` and a genuine `compose_up`.
     """
     _autostart_on(monkeypatch)
+    order: list[str] = []
+    captured: dict = {}
 
     def _fake_query(dql, *a, **kw):
         resp = MagicMock()
@@ -389,21 +587,36 @@ def test_b6_embed_triggers_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
         return lambda texts: [[0.0] for _ in texts]
 
     with (
-        patch("partgraph.cli.ensure_running") as mock_ensure,
-        patch.object(cli_mod, "_build_dgraph_client", return_value=(mock_client, MagicMock())),
+        patch("partgraph.cli.ensure_running", _make_ordered_ensure_running(order, captured)),
+        patch.object(
+            cli_mod,
+            "_build_dgraph_client",
+            _make_ordered_touch(
+                order, "_build_dgraph_client", return_value=(mock_client, MagicMock())
+            ),
+        ),
         patch.object(cli_mod, "get_encoder", _fake_get_encoder, create=True),
     ):
-        _invoke(["embed"])
+        result = _invoke(["embed"])
 
-    mock_ensure.assert_called()
+    assert result.exit_code == 0, result.output
+    assert order == ["ensure_running", "_build_dgraph_client"], (
+        f"ensure_running must fire strictly before _build_dgraph_client: {order!r}"
+    )
+    _assert_ensure_running_called_with_real_seams(captured)
 
 
-def test_b6_refresh_links_triggers_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
-    """B-6: Given `partgraph refresh-links`.
+def test_b6_refresh_links_triggers_autostart_before_db_work_with_real_seams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-6 [BLOCKING 1 fix]: Given `partgraph refresh-links`.
     When it runs with autostart ON.
-    Then `ensure_running` is called.
+    Then `ensure_running` fires strictly before `_build_dgraph_client`, with
+    the CLI's real `probe_health` and a genuine `compose_up`.
     """
     _autostart_on(monkeypatch)
+    order: list[str] = []
+    captured: dict = {}
 
     def _fake_query(dql, *a, **kw):
         resp = MagicMock()
@@ -417,27 +630,43 @@ def test_b6_refresh_links_triggers_autostart(monkeypatch: pytest.MonkeyPatch) ->
     mock_client.txn.return_value = mock_txn
 
     with (
-        patch("partgraph.cli.ensure_running") as mock_ensure,
-        patch.object(cli_mod, "_build_dgraph_client", return_value=(mock_client, MagicMock())),
+        patch("partgraph.cli.ensure_running", _make_ordered_ensure_running(order, captured)),
+        patch.object(
+            cli_mod,
+            "_build_dgraph_client",
+            _make_ordered_touch(
+                order, "_build_dgraph_client", return_value=(mock_client, MagicMock())
+            ),
+        ),
     ):
-        _invoke(["refresh-links"])
+        result = _invoke(["refresh-links"])
 
-    mock_ensure.assert_called()
+    assert result.exit_code == 0, result.output
+    assert order == ["ensure_running", "_build_dgraph_client"], (
+        f"ensure_running must fire strictly before _build_dgraph_client: {order!r}"
+    )
+    _assert_ensure_running_called_with_real_seams(captured)
 
 
-def test_b6_refresh_stock_triggers_autostart(
+def test_b6_refresh_stock_triggers_autostart_before_db_work_with_real_seams(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """B-6: Given `partgraph refresh` (the stock/price refresh command),
-    with an existing dummy source file and a stubbed source-loading seam so
-    it reaches its own DB-touching point.
+    """B-6 [BLOCKING 1 fix]: Given `partgraph refresh` (the stock/price
+    refresh command), with an existing dummy source file and a stubbed
+    source-loading seam so it reaches its own DB-touching point.
+    `_load_stock_index` is a LOCAL file read (not a DB touch), so it is
+    deliberately left OUTSIDE the ordering check — only
+    `_build_dgraph_client` is the ordering marker here.
     When it runs with autostart ON.
-    Then `ensure_running` is called.
+    Then `ensure_running` fires strictly before `_build_dgraph_client`, with
+    the CLI's real `probe_health` and a genuine `compose_up`.
     """
     _autostart_on(monkeypatch)
     dummy = tmp_path / "dummy-jlcpcb-components.sqlite3"
     dummy.write_bytes(b"")
     monkeypatch.setattr(cli_mod, "RAW_DB_PATH", dummy)
+    order: list[str] = []
+    captured: dict = {}
 
     def _fake_query(dql, *a, **kw):
         resp = MagicMock()
@@ -451,53 +680,93 @@ def test_b6_refresh_stock_triggers_autostart(
     mock_client.txn.return_value = mock_txn
 
     with (
-        patch("partgraph.cli.ensure_running") as mock_ensure,
-        patch.object(cli_mod, "_build_dgraph_client", return_value=(mock_client, MagicMock())),
+        patch("partgraph.cli.ensure_running", _make_ordered_ensure_running(order, captured)),
+        patch.object(
+            cli_mod,
+            "_build_dgraph_client",
+            _make_ordered_touch(
+                order, "_build_dgraph_client", return_value=(mock_client, MagicMock())
+            ),
+        ),
         patch.object(cli_mod, "_load_stock_index", return_value={}, create=True),
     ):
-        _invoke(["refresh"])
+        result = _invoke(["refresh"])
 
-    mock_ensure.assert_called()
+    assert result.exit_code == 0, result.output
+    assert order == ["ensure_running", "_build_dgraph_client"], (
+        f"ensure_running must fire strictly before _build_dgraph_client: {order!r}"
+    )
+    _assert_ensure_running_called_with_real_seams(captured)
 
 
-def test_b6_db_apply_schema_triggers_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
-    """B-6: Given `partgraph db apply-schema` — this command does NOT go
-    through `_build_dgraph_client()` (it uses `schema_module.apply_schema`
-    over its own gRPC path), so autostart must be wired here EXPLICITLY,
-    not merely inherited from a shared helper.
+def test_b6_db_apply_schema_triggers_autostart_before_db_work_with_real_seams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-6 [BLOCKING 1 fix]: Given `partgraph db apply-schema` — this command
+    does NOT go through `_build_dgraph_client()` (it uses
+    `schema_module.apply_schema` over its own gRPC path), so autostart must
+    be wired here EXPLICITLY, not merely inherited from a shared helper —
+    exactly the divergent-wiring risk Gate 3a flagged for this command by
+    name. `schema_module.load_schema` is a LOCAL file read (not a DB touch),
+    so it is deliberately left OUTSIDE the ordering check; only
+    `schema_module.apply_schema` (the actual gRPC call) is the marker.
     When it runs with autostart ON.
-    Then `ensure_running` is called.
+    Then `ensure_running` fires strictly before `schema_module.apply_schema`,
+    with the CLI's real `probe_health` and a genuine `compose_up`.
     """
     _autostart_on(monkeypatch)
+    order: list[str] = []
+    captured: dict = {}
 
     with (
-        patch("partgraph.cli.ensure_running") as mock_ensure,
+        patch("partgraph.cli.ensure_running", _make_ordered_ensure_running(order, captured)),
         patch.object(cli_mod.schema_module, "load_schema", return_value="type Part {}"),
-        patch.object(cli_mod.schema_module, "apply_schema", return_value=None),
+        patch.object(
+            cli_mod.schema_module,
+            "apply_schema",
+            _make_ordered_touch(order, "schema_module.apply_schema"),
+        ),
     ):
-        _invoke(["db", "apply-schema"])
+        result = _invoke(["db", "apply-schema"])
 
-    mock_ensure.assert_called()
+    assert result.exit_code == 0, result.output
+    assert order == ["ensure_running", "schema_module.apply_schema"], (
+        f"ensure_running must fire strictly before apply_schema: {order!r}"
+    )
+    _assert_ensure_running_called_with_real_seams(captured)
 
 
-def test_b6_db_check_index_triggers_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
-    """B-6: Given `partgraph db check-index` — like `db apply-schema`, this
-    does NOT go through `_build_dgraph_client()` (it calls
-    `check_index_integrity()` directly), so it needs its OWN explicit
-    autostart wiring too.
+def test_b6_db_check_index_triggers_autostart_before_db_work_with_real_seams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-6 [BLOCKING 1 fix]: Given `partgraph db check-index` — like
+    `db apply-schema`, this does NOT go through `_build_dgraph_client()` (it
+    calls `check_index_integrity()` directly), so it needs its OWN explicit
+    autostart wiring too — the second of the two commands Gate 3a named as
+    most likely to diverge.
     When it runs with autostart ON.
-    Then `ensure_running` is called.
+    Then `ensure_running` fires strictly before `check_index_integrity`,
+    with the CLI's real `probe_health` and a genuine `compose_up`.
     """
     _autostart_on(monkeypatch)
+    order: list[str] = []
+    captured: dict = {}
     healthy_result = MagicMock(reachable=True, schema_ok=True, self_similarity_ok=True, message="ok")
 
     with (
-        patch("partgraph.cli.ensure_running") as mock_ensure,
-        patch("partgraph.cli.check_index_integrity", return_value=healthy_result),
+        patch("partgraph.cli.ensure_running", _make_ordered_ensure_running(order, captured)),
+        patch(
+            "partgraph.cli.check_index_integrity",
+            _make_ordered_touch(order, "check_index_integrity", return_value=healthy_result),
+        ),
     ):
-        _invoke(["db", "check-index"])
+        result = _invoke(["db", "check-index"])
 
-    mock_ensure.assert_called()
+    assert result.exit_code == 0, result.output
+    assert order == ["ensure_running", "check_index_integrity"], (
+        f"ensure_running must fire strictly before check_index_integrity: {order!r}"
+    )
+    _assert_ensure_running_called_with_real_seams(captured)
 
 
 def _existing_dummy_sqlite(tmp_path) -> os.PathLike[str]:
@@ -508,13 +777,18 @@ def _existing_dummy_sqlite(tmp_path) -> os.PathLike[str]:
     return dummy
 
 
-def test_b6_ingest_jlcparts_load_stage_triggers_autostart(
+def test_b6_ingest_jlcparts_load_stage_triggers_autostart_before_db_work_with_real_seams(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """B-6: Given `partgraph ingest jlcparts` reaches the LOAD stage (the
-    source file exists, and both fetch/normalize are stubbed to succeed).
+    """B-6 [BLOCKING 1 fix]: Given `partgraph ingest jlcparts` reaches the
+    LOAD stage (the source file exists, and both fetch/normalize are
+    stubbed to succeed). `partgraph.normalize.run.normalize` is a LOCAL,
+    non-DB stage and is deliberately left OUTSIDE the ordering check; only
+    `_build_dgraph_client` (reached inside `_stage_load`) is the marker.
     When it runs with autostart ON.
-    Then `ensure_running` is called during the load stage.
+    Then `ensure_running` fires strictly before `_build_dgraph_client`
+    during the load stage, with the CLI's real `probe_health` and a genuine
+    `compose_up`.
     """
     _autostart_on(monkeypatch)
     import pathlib
@@ -526,18 +800,29 @@ def test_b6_ingest_jlcparts_load_stage_triggers_autostart(
         cli_mod, "LOAD_CHECKPOINT_PATH", pathlib.Path(tmp_path) / "state" / "load_checkpoint.json"
     )
 
+    order: list[str] = []
+    captured: dict = {}
     mock_client = MagicMock()
 
     with (
-        patch("partgraph.cli.ensure_running") as mock_ensure,
-        patch.object(cli_mod, "_build_dgraph_client", return_value=(mock_client, MagicMock())),
+        patch("partgraph.cli.ensure_running", _make_ordered_ensure_running(order, captured)),
+        patch.object(
+            cli_mod,
+            "_build_dgraph_client",
+            _make_ordered_touch(
+                order, "_build_dgraph_client", return_value=(mock_client, MagicMock())
+            ),
+        ),
         patch("partgraph.normalize.run.normalize", return_value=None),
         patch("partgraph.load.loader.Loader.load", return_value=None),
     ):
         result = _invoke(["ingest", "jlcparts"])
 
     assert result.exit_code == 0, result.output
-    mock_ensure.assert_called()
+    assert order == ["ensure_running", "_build_dgraph_client"], (
+        f"ensure_running must fire strictly before _build_dgraph_client: {order!r}"
+    )
+    _assert_ensure_running_called_with_real_seams(captured)
 
 
 def test_b6_ingest_jlcparts_fetch_stage_never_triggers_autostart(
@@ -743,11 +1028,22 @@ def test_b7_version_never_autostarts_and_spawns_no_subprocess() -> None:
         ["db", "down", "--help"],
         ["db", "up", "--help"],
         ["db", "doctor", "--help"],
+        ["db", "apply-schema", "--help"],
+        ["db", "check-index", "--help"],
         ["ingest", "jlcparts", "--help"],
+        ["refresh", "--help"],
+        ["refresh-links", "--help"],
     ],
 )
 def test_b7_help_never_autostarts_and_spawns_no_subprocess(args: list[str]) -> None:
-    """B-7: Given `--help` on the top-level app or on any subcommand.
+    """B-7 [SHOULD-FIX: --help symmetry]: Given `--help` on the top-level app
+    or on any subcommand — now covering ALL NINE allowlisted commands'
+    `--help`, not just five of them. `db apply-schema --help` and
+    `db check-index --help` are the two commands that do NOT go through
+    `_build_dgraph_client()` (see the B-6 tests above) and therefore need
+    BESPOKE autostart wiring — i.e. the two most likely for `--help` to
+    diverge from the others if that bespoke wiring is placed carelessly
+    ahead of Typer's own `--help` short-circuit.
     When it runs.
     Then `ensure_running` is never called and no subprocess is spawned.
     """
@@ -825,6 +1121,84 @@ def test_b8_ingest_jlcparts_full_never_autostarts(monkeypatch: pytest.MonkeyPatc
     assert result.exit_code != 0, result.output
     assert "not yet implemented" in result.output.lower()
     mock_ensure.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# [SHOULD-FIX: validation-before-autostart for the SHARED validator] B-8
+# above proves ordering for `search` and `ingest jlcparts --full` only —
+# both go through validation paths specific to those commands.
+# `_validate_limit()` is a SEPARATE, SHARED helper called at four other
+# sites (`cli.py`: embed, refresh, refresh-links, plus ingest jlcparts
+# itself, already covered), with no paired test proving THOSE three commands
+# reject a bad --limit before autostart. Naive wiring at the top of any of
+# these three function bodies would start a container before ever reporting
+# the bad flag.
+# ---------------------------------------------------------------------------
+
+
+def test_b8_embed_limit_zero_never_autostarts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B-8 [SHOULD-FIX]: Given `embed --limit 0` (an invalid --limit value,
+    validated by the SAME shared `_validate_limit()` helper as `search`/
+    `ingest jlcparts`, but at embed's own call site).
+    When it runs with autostart ON.
+    Then `ensure_running` is never called and no subprocess is spawned —
+    the validation error is reached and reported before autostart.
+    """
+    _autostart_on(monkeypatch)
+    with (
+        patch("partgraph.cli.ensure_running") as mock_ensure,
+        patch.object(cli_mod, "_build_dgraph_client") as mock_build,
+        patch("subprocess.run", side_effect=_forbid_any_subprocess),
+    ):
+        result = _invoke(["embed", "--limit", "0"])
+
+    assert result.exit_code != 0, result.output
+    assert "--limit must be a positive integer" in result.output
+    mock_ensure.assert_not_called()
+    mock_build.assert_not_called()
+
+
+def test_b8_refresh_limit_zero_never_autostarts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B-8 [SHOULD-FIX]: Given `refresh --limit 0` (the stock/price refresh
+    command's own use of the SAME shared `_validate_limit()` helper) —
+    `_validate_limit(limit)` is the FIRST statement in `refresh()`'s body,
+    before the source file / `_load_stock_index`/`_build_dgraph_client`
+    path is ever touched.
+    When it runs with autostart ON.
+    Then `ensure_running` is never called and no subprocess is spawned.
+    """
+    _autostart_on(monkeypatch)
+    with (
+        patch("partgraph.cli.ensure_running") as mock_ensure,
+        patch.object(cli_mod, "_build_dgraph_client") as mock_build,
+        patch("subprocess.run", side_effect=_forbid_any_subprocess),
+    ):
+        result = _invoke(["refresh", "--limit", "0"])
+
+    assert result.exit_code != 0, result.output
+    assert "--limit must be a positive integer" in result.output
+    mock_ensure.assert_not_called()
+    mock_build.assert_not_called()
+
+
+def test_b8_refresh_links_limit_zero_never_autostarts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B-8 [SHOULD-FIX]: Given `refresh-links --limit 0` (the datasheet-link
+    command's own use of the SAME shared `_validate_limit()` helper).
+    When it runs with autostart ON.
+    Then `ensure_running` is never called and no subprocess is spawned.
+    """
+    _autostart_on(monkeypatch)
+    with (
+        patch("partgraph.cli.ensure_running") as mock_ensure,
+        patch.object(cli_mod, "_build_dgraph_client") as mock_build,
+        patch("subprocess.run", side_effect=_forbid_any_subprocess),
+    ):
+        result = _invoke(["refresh-links", "--limit", "0"])
+
+    assert result.exit_code != 0, result.output
+    assert "--limit must be a positive integer" in result.output
+    mock_ensure.assert_not_called()
+    mock_build.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +1281,10 @@ def test_b9_escape_hatch_stats_no_subprocess_and_todays_exact_hint(
         pytest.param("No", False, "mixed_case_no"),
         pytest.param("NO", False, "upper_no"),
         pytest.param(" 0 ", False, "zero_with_whitespace"),
+        pytest.param("off", False, "lower_off"),
+        pytest.param("Off", False, "mixed_case_off"),
+        pytest.param("OFF", False, "upper_off"),
+        pytest.param(" off ", False, "off_with_whitespace"),
         pytest.param("", True, "empty_string_treated_as_unset"),
         pytest.param("1", True, "one"),
         pytest.param("true", True, "true"),
@@ -918,12 +1296,12 @@ def test_b9_escape_hatch_stats_no_subprocess_and_todays_exact_hint(
 def test_partgraph_autostart_env_var_parsing_table(
     monkeypatch: pytest.MonkeyPatch, raw_value: str, expect_autostart_called: bool, case_id: str
 ) -> None:
-    """Given the PARTGRAPH_AUTOSTART parsing table pinned in this file's own
-    module docstring.
+    """[BLOCKING 2 fix] Given the PARTGRAPH_AUTOSTART parsing table pinned in
+    this file's own module docstring.
     When `partgraph search MAX232` runs with PARTGRAPH_AUTOSTART set to
     *raw_value*.
     Then `ensure_running` is called iff *expect_autostart_called* — the
-    ONLY recognised off-tokens are "0"/"false"/"no" (case-insensitively,
+    ONLY recognised off-tokens are "0"/"false"/"no"/"off" (case-insensitively,
     surrounding whitespace stripped); every other value, including unset
     (not exercised here — covered by the suite's own autouse-fixture-off
     default plus the B-1..B-3/B-6/B-7 tests above, which all run WITHOUT
@@ -960,3 +1338,71 @@ def test_partgraph_autostart_unset_defaults_to_on(monkeypatch: pytest.MonkeyPatc
         _invoke(["search", "MAX232"])
 
     mock_ensure.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# [SHOULD-FIX: no stderr leak on an absorbed failure] Gate 3b found that
+# `_run_compose` (cli.py) prints a red `Error:` line BEFORE raising, on a
+# non-zero compose exit. `ensure_running()`'s own contract absorbs a
+# `compose_up()` failure and recovers if health comes up afterward (B-5 —
+# the losing side of a start-vs-start race). If `_run_compose` were reused
+# VERBATIM as the `compose_up` seam, a losing racer would print a visible
+# "Error: failed to start the Dgraph database..." line and then still exit 0
+# — a confusing, false-alarm error message on a command that actually
+# succeeded. This drives the REAL end-to-end path (like B-1/B-2/B-3, not a
+# spy), so it only turns green once the implementer supplies a print-free
+# `compose_up` seam — reusing `_run_compose` verbatim will NOT satisfy it.
+# ---------------------------------------------------------------------------
+
+
+def test_absorbed_start_failure_followed_by_health_recovery_prints_no_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[SHOULD-FIX] Given the compose `up -d` call itself exits non-zero
+    (modelling "container name already in use" — the losing side of a
+    start-vs-start race, B-5's own scenario), but `probe_health()` reports
+    healthy on the very next poll (the OTHER racer's start is completing).
+    When `partgraph search MAX232` runs with autostart ON.
+    Then the exit code is 0, the search's own results still print normally,
+    and NO `Error` text appears anywhere in the output — an absorbed,
+    recovered-from start failure must never surface a scary, misleading
+    error line for a command that is about to succeed.
+    """
+    _autostart_on(monkeypatch)
+    mock_client = _make_empty_search_client()
+    calls: list[list[str]] = []
+
+    def _fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "compose" in argv and "up" in argv:
+            return MagicMock(
+                returncode=125,
+                stdout="",
+                stderr='Error response from daemon: container name "partgraph-dgraph" is already in use',
+            )
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with (
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy_sequence(False, True)),
+        patch.object(cli_mod, "_build_dgraph_client", return_value=(mock_client, MagicMock())),
+        patch("subprocess.run", side_effect=_fake_run),
+        patch("time.sleep"),
+        patch("time.monotonic", return_value=0.0),
+    ):
+        result = _invoke(["search", "MAX232"])
+
+    up_calls = [argv for argv in calls if "compose" in argv and "up" in argv]
+    assert up_calls, (
+        "the compose up call was never attempted in this scenario — the "
+        "test proves nothing without it"
+    )
+    assert result.exit_code == 0, result.output
+    assert "Error" not in result.output, (
+        f"an absorbed start failure that was later recovered from must "
+        f"never print a visible error line: {result.output!r}"
+    )
+    assert mock_client.txn.called, (
+        "the search's own DB query must still run once the database is "
+        "healthy, despite the losing start attempt"
+    )

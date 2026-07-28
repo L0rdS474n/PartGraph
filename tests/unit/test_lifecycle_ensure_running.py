@@ -28,19 +28,28 @@ ERROR with ImportError until it exists; the correct test-first RED state):
   budget (ADR-0007 bounded-constant precedent, mirrors
   ``INSPECT_SWEEP_BUDGET_S``/``STOP_TIMEOUT_S``) `ensure_running()` will poll
   Dgraph's health endpoint for AFTER issuing the start command, before giving
-  up. Pinned here as "finite, positive, bounded" only — never a specific
-  number: this file has no measured evidence for what Dgraph's real
-  first-run startup time is on any host (unlike ``STOP_GRACE_SECONDS``, which
-  IS backed by a live measurement recorded in ``test_lifecycle.py``), so
-  pinning an exact value here would be exactly the kind of unverified,
-  invented "measured requirement" CONTRIBUTING.md's discipline forbids.
+  up. Pinned here as "finite, positive, bounded, and below a SANITY CEILING"
+  — never an exact number: this file has no measured evidence for what
+  Dgraph's real first-run startup time is on any host (unlike
+  ``STOP_GRACE_SECONDS``, which IS backed by a live measurement recorded in
+  ``test_lifecycle.py``), so pinning an exact value here would be exactly the
+  kind of unverified, invented "measured requirement" CONTRIBUTING.md's
+  discipline forbids. The ceiling itself IS a JUDGEMENT CALL (mirrors
+  ``STOP_GRACE_SECONDS``'s own documented "JUDGEMENT CALL, not a measured
+  minimum"), added because "finite" alone does not catch a typo'd extra zero
+  — a budget in the THOUSANDS of seconds would silently hang every one of
+  PR-B2's nine allowlisted commands for hours while still passing every OTHER
+  assertion this file makes.
 
   ``AUTOSTART_POLL_INTERVAL_S: float`` — the named, finite, bounded delay
-  between two health polls. Pinned as "finite, positive, bounded, and
-  strictly less than AUTOSTART_READY_TIMEOUT_S" (so more than one poll is
-  structurally possible; a poll interval greater than or equal to the whole
-  budget would mean at most one poll ever happens, which defeats the point
-  of a bounded RETRY loop rather than a bounded single wait).
+  between two health polls. Pinned as "finite, positive, bounded, strictly
+  less than AUTOSTART_READY_TIMEOUT_S (so more than one poll is structurally
+  possible; a poll interval greater than or equal to the whole budget would
+  mean at most one poll ever happens, defeating the point of a bounded RETRY
+  loop rather than a bounded single wait), and above a SANITY FLOOR" — a
+  poll interval near zero would hammer the local health endpoint pointlessly
+  relative to its own per-request timeout (``HEALTH_PROBE_TIMEOUT_S = 2.0``,
+  ``partgraph.util.health``).
 
   ``class AutostartTimeoutError(RuntimeError)`` — raised when the readiness
   poll exhausts ``AUTOSTART_READY_TIMEOUT_S`` without Dgraph ever reporting
@@ -112,6 +121,7 @@ constant's value and never depend on real elapsed time.
 from __future__ import annotations
 
 import inspect
+import logging
 import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -170,6 +180,59 @@ def test_autostart_poll_interval_is_a_finite_positive_bounded_float_smaller_than
     assert math.isfinite(AUTOSTART_POLL_INTERVAL_S)
     assert AUTOSTART_POLL_INTERVAL_S > 0
     assert AUTOSTART_POLL_INTERVAL_S < AUTOSTART_READY_TIMEOUT_S
+
+
+#: [SHOULD-FIX: bound the timing constants] A JUDGEMENT CALL, not a measured
+#: requirement — mirrors STOP_GRACE_SECONDS's own documented precedent. A
+#: budget above this is far more likely to be a typo (an extra zero) than a
+#: deliberate choice: it would hang every one of PR-B2's nine allowlisted
+#: commands for HOURS on a database that will never come up, while every
+#: OTHER assertion in this file would still pass.
+_SANITY_CEILING_AUTOSTART_READY_TIMEOUT_S = 300.0
+
+#: [SHOULD-FIX: bound the timing constants] A JUDGEMENT CALL floor: below
+#: this, polling would hammer the local health endpoint pointlessly relative
+#: to its own per-request timeout (HEALTH_PROBE_TIMEOUT_S = 2.0,
+#: partgraph.util.health).
+_SANITY_FLOOR_AUTOSTART_POLL_INTERVAL_S = 0.1
+
+
+def test_autostart_ready_timeout_is_below_a_sanity_ceiling() -> None:
+    """[SHOULD-FIX] Given "finite, positive" alone does not catch a typo'd
+    extra zero (a budget of 600s/6000s is just as "finite and positive" as
+    60s).
+    When AUTOSTART_READY_TIMEOUT_S is read directly.
+    Then it is at or below a documented sanity ceiling
+    (_SANITY_CEILING_AUTOSTART_READY_TIMEOUT_S = 300.0s / 5 minutes) — a
+    JUDGEMENT CALL, not a measured requirement (mirrors STOP_GRACE_SECONDS's
+    own documented precedent), chosen to be generous headroom for a genuine
+    first-run Dgraph startup while still catching a catastrophic typo that
+    would hang all nine allowlisted commands for hours.
+    """
+    assert AUTOSTART_READY_TIMEOUT_S <= _SANITY_CEILING_AUTOSTART_READY_TIMEOUT_S, (
+        f"AUTOSTART_READY_TIMEOUT_S ({AUTOSTART_READY_TIMEOUT_S}) exceeds the "
+        f"documented sanity ceiling "
+        f"({_SANITY_CEILING_AUTOSTART_READY_TIMEOUT_S}s) — if this is "
+        "genuinely intended, raise the ceiling deliberately and document "
+        "why; do not let a typo silently pass a bare 'finite, positive' check."
+    )
+
+
+def test_autostart_poll_interval_is_above_a_sanity_floor() -> None:
+    """[SHOULD-FIX] Given "finite, positive" alone does not catch a typo'd
+    extra zero the OTHER direction (an interval of 0.001s is just as "finite
+    and positive" as 2s, but would hammer the health endpoint).
+    When AUTOSTART_POLL_INTERVAL_S is read directly.
+    Then it is at or above a documented sanity floor
+    (_SANITY_FLOOR_AUTOSTART_POLL_INTERVAL_S = 0.1s) — a JUDGEMENT CALL, not
+    a measured requirement.
+    """
+    assert AUTOSTART_POLL_INTERVAL_S >= _SANITY_FLOOR_AUTOSTART_POLL_INTERVAL_S, (
+        f"AUTOSTART_POLL_INTERVAL_S ({AUTOSTART_POLL_INTERVAL_S}) is below "
+        f"the documented sanity floor "
+        f"({_SANITY_FLOOR_AUTOSTART_POLL_INTERVAL_S}s) — this would poll "
+        "the local health endpoint pointlessly fast."
+    )
 
 
 def test_autostart_timeout_error_is_a_runtime_error_subclass() -> None:
@@ -445,3 +508,138 @@ def test_b5_start_failure_absorbed_when_health_recovers_no_fabricated_lock() -> 
 
     compose_up.assert_called_once_with()
     assert probe_health.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# [SHOULD-FIX: the absorbed exception must be observable] B-4/B-5 make a
+# FATAL compose_up() failure and a BENIGN, name-in-use race converge on
+# identical outward behaviour (a poll loop that either times out or
+# recovers) with nothing about the absorbed exception itself preserved
+# anywhere. Absorbing it for CONTROL FLOW is right (B-5 depends on it); but
+# discarding the diagnosis entirely means an operator debugging a
+# persistently-unhealthy database has no way to learn WHY compose_up()
+# itself failed. This pins that the absorbed exception is recorded
+# somewhere OBSERVABLE (via this module's own `_LOGGER`, mirroring its
+# existing absorbed-failure precedents — `_stop_unit_if_active`,
+# `_mounts_data_volume` — which already log a WARNING rather than silently
+# swallowing), path-free, WITHOUT changing the recover-and-proceed
+# behaviour B-5 already pins.
+# ---------------------------------------------------------------------------
+
+
+def test_absorbed_compose_up_failure_is_recorded_via_logging_path_free(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """[SHOULD-FIX] Given compose_up() raises during ensure_running()'s
+    absorb-and-poll step (the same B-5 scenario: a benign name-in-use race
+    that the health probe goes on to prove was not fatal).
+    When ensure_running() runs with `caplog` capturing WARNING-and-above
+    records from this module's own logger (`partgraph.util.lifecycle`,
+    mirroring `_LOGGER = logging.getLogger(__name__)`'s existing
+    absorbed-failure precedents elsewhere in this module).
+    Then AT LEAST ONE log record is emitted recording the absorbed failure
+    (so an operator who enables logging can see WHY a start attempt did not
+    immediately succeed), every such record's own message is path-free (no
+    '/'), and the function's own recover-and-proceed behaviour is
+    UNCHANGED: it still returns normally once health recovers, and
+    compose_up() is still invoked exactly once.
+    """
+
+    def _compose_up_raises() -> None:
+        raise RuntimeError('container name "partgraph-dgraph" is already in use')
+
+    probe_health = _probe_sequence(_UNHEALTHY, _UNHEALTHY, _HEALTHY)
+    compose_up = MagicMock(side_effect=_compose_up_raises)
+    sleep = MagicMock()
+    monotonic = MagicMock(return_value=0.0)
+
+    with caplog.at_level(logging.WARNING, logger="partgraph.util.lifecycle"):
+        ensure_running(
+            probe_health=probe_health, compose_up=compose_up, sleep=sleep, monotonic=monotonic,
+        )  # must still not raise — recover-and-proceed is unchanged
+
+    compose_up.assert_called_once_with()
+    assert probe_health.call_count == 3
+
+    relevant_records = [
+        record for record in caplog.records if record.name == "partgraph.util.lifecycle"
+    ]
+    assert relevant_records, (
+        "the absorbed compose_up() failure must be recorded via this "
+        "module's own logger, not silently discarded — an operator "
+        "debugging a start failure needs SOME observable trace of it"
+    )
+    for record in relevant_records:
+        message = record.getMessage()
+        assert "/" not in message, f"absorbed-failure log record leaks a path: {message!r}"
+
+
+# ---------------------------------------------------------------------------
+# [SHOULD-FIX: __all__ and the module docstring] Nothing else in this file
+# pins that the four new symbols this file specifies are added to
+# `partgraph.util.lifecycle.__all__`, which
+# `tests/unit/test_lifecycle_architecture.py`'s re-export guard
+# (`test_partgraph_util_package_does_not_reexport_lifecycle_functions`)
+# DERIVES its forbidden-name set from at RUN TIME — an omission here would
+# silently let `partgraph.util` re-export `ensure_running` without that
+# guard ever noticing, since it only ever checks names ALREADY present in
+# `__all__`. And `lifecycle.py`'s module docstring, as of PR-A/PR-B1, is
+# entirely STOP-scoped ("Stop every PartGraph database lifecycle owner, not
+# just Compose") — adding a START-side responsibility without updating it
+# recreates exactly the "docstring claims something that stopped being
+# true" drift PR-B1's own LAST commit (`a848bd9`, "stop docstrings from
+# claiming things that stopped being true") fixed in the opposite direction.
+# ---------------------------------------------------------------------------
+
+
+def test_new_symbols_are_added_to_lifecycle_module_all() -> None:
+    """[SHOULD-FIX] Given `tests/unit/test_lifecycle_architecture.py`'s
+    re-export guard derives its forbidden-name set FROM
+    `partgraph.util.lifecycle.__all__` at run time (never a hardcoded
+    tuple), so a new public symbol not added to `__all__` would be INVISIBLE
+    to that guard — it could be re-exported from `partgraph.util` without
+    any test ever catching it.
+    When `partgraph.util.lifecycle.__all__` is read directly.
+    Then it contains `"ensure_running"`, `"AutostartTimeoutError"`,
+    `"AUTOSTART_READY_TIMEOUT_S"` and `"AUTOSTART_POLL_INTERVAL_S"` — every
+    new public name this file specifies.
+    """
+    import partgraph.util.lifecycle as lifecycle_mod
+
+    for name in (
+        "ensure_running",
+        "AutostartTimeoutError",
+        "AUTOSTART_READY_TIMEOUT_S",
+        "AUTOSTART_POLL_INTERVAL_S",
+    ):
+        assert name in lifecycle_mod.__all__, (
+            f"{name!r} must be added to partgraph.util.lifecycle.__all__ — "
+            "the re-export guard in test_lifecycle_architecture.py derives "
+            "its forbidden-name set FROM __all__, so an omission here would "
+            "silently let partgraph.util re-export it unnoticed."
+        )
+
+
+def test_lifecycle_module_docstring_mentions_ensure_running() -> None:
+    """[SHOULD-FIX] Given `lifecycle.py`'s module docstring, as of PR-A/PR-B1,
+    is entirely STOP-scoped ("Stop every PartGraph database lifecycle
+    owner, not just Compose (ADR-0021)") — it describes `stop_all()` and its
+    supporting functions in detail and says nothing about a start-side
+    responsibility.
+    When the module's own `__doc__` is read directly.
+    Then it mentions `ensure_running` — proving the docstring was updated to
+    describe the module's NEW start-side responsibility, not left
+    describing only the stop-side one. This is the same class of drift
+    PR-B1's own last commit (`a848bd9`, "stop docstrings from claiming
+    things that stopped being true") fixed in the opposite direction: a
+    docstring asserting something that is not (or, here, no longer fully)
+    true.
+    """
+    import partgraph.util.lifecycle as lifecycle_mod
+
+    docstring = lifecycle_mod.__doc__ or ""
+    assert "ensure_running" in docstring, (
+        "partgraph/util/lifecycle.py's module docstring does not mention "
+        "ensure_running() at all — it remains entirely stop-scoped despite "
+        "gaining a start-side responsibility (ADR-0022 Section 7)."
+    )
