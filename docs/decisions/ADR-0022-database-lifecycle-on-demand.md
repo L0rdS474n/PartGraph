@@ -537,13 +537,52 @@ Commands that must **never** autostart, and why:
 `restart: unless-stopped` became `restart: "no"` (quoted: bare `no` is YAML's
 boolean `False`, a different and invalid Compose value).
 
-Under rootless podman nothing revives a container at boot — there is no
-user-session daemon running then — so the old policy advertised a lifecycle
-guarantee it could not keep on this host. What actually restarted the database
-was the quadlet unit, and removing that is the entire point of § 5. With every
-command now able to start the database itself, an engine-level restart policy
-has nothing left to contribute. `container_name`, the loopback port bindings,
-`init: true` and `stop_grace_period` are untouched.
+The value matters on **both** engines this repository can run on (ADR-0009),
+but for two different reasons, and an earlier revision of this section gave
+only the first — which read, to anyone on Docker, as somebody else's problem.
+
+**Rootless podman (the engine measured here).** Nothing revives a container at
+boot — there is no user-session daemon running then — so the old policy
+advertised a lifecycle guarantee it could not keep on this host. What actually
+restarted the database was the quadlet unit, and removing that is the entire
+point of § 5. Here `"no"` is cleanup of a misleading value.
+
+**A real Docker daemon.** There `"no"` is not cleanup; it is the *primary*
+lever, and reverting it would reintroduce the very complaint ADR-0021 and this
+ADR exist to end. Docker's restart policies are enforced by the daemon itself:
+they control whether containers start "when they exit, or when Docker
+restarts", `unless-stopped` restarts a container after the daemon restarts
+unless it was explicitly stopped, and `no` is documented as "Don't
+automatically restart the container." Since `dockerd` is commonly an enabled
+system service — Docker's Linux post-installation guide states the Docker
+service starts on boot by default on Debian and Ubuntu, and is `systemctl
+enable`d on other systemd distributions — an `unless-stopped` database that
+nobody explicitly stopped is started again at **every host boot**, with no
+quadlet and no second lifecycle owner anywhere in the picture. That is the same
+"the database is always running" outcome as the podman incident, produced by a
+completely different mechanism, and it is why the value is pinned by a test
+rather than left as a preference.
+
+> **Honesty boundary — the Docker paragraph above is documentation-derived, not
+> measured.** No Docker daemon exists on the host this ADR was written on:
+> `/usr/bin/docker` there is a small shell script that execs podman, and no
+> `dockerd` binary is present, so no statement in this ADR about Docker's
+> runtime behaviour has been observed on a real Docker engine. It is read off
+> Docker's own documentation — Docker Engine, "Start containers automatically"
+> and "Linux post-installation steps for Docker Engine"
+> (<https://docs.docker.com/engine/containers/start-containers-automatically/>,
+> <https://docs.docker.com/engine/install/linux-postinstall/>, both checked
+> 2026-07-28). Nothing here should be read as Docker support having been
+> exercised or validated. The test that pins the corresponding comment in
+> `docker/docker-compose.yml`
+> (`tests/unit/test_docker_compose.py::test_restart_no_comment_also_explains_the_docker_daemon_case_not_only_podman`)
+> is a documentation check over that file's text; like everything in
+> § "Verification" it starts no container, and it cannot and does not
+> demonstrate that a Docker daemon behaves as described.
+
+On either engine, with every command now able to start the database itself, an
+engine-level restart policy has nothing left to contribute. `container_name`,
+the loopback port bindings, `init: true` and `stop_grace_period` are untouched.
 
 ## Breaking changes
 

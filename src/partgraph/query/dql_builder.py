@@ -22,7 +22,7 @@ Security model (ADR-INJECT):
   ``--basic``/``--extended`` flag is emitted as the fixed boolean literal
   ``eq(is_basic, true)``/``eq(is_basic, false)`` — never derived from or bound to
   user text.
-- The package code is re-validated against ``^[A-Z0-9][A-Z0-9\\-]{0,19}$`` and a
+- The package code is re-validated against ``^[A-Z0-9][A-Z0-9\\-]{0,19}\\Z`` and a
   failure raises :class:`ValueError` (defence in depth on top of the parser). The
   manufacturer/category terms use a separate *permissive* validator
   (:func:`_validate_filter_term`) — they legitimately contain spaces and exceed
@@ -139,7 +139,9 @@ _FLOAT_LITERAL_RE = re.compile(r"[0-9.eE+\-]+")
 _INT_LITERAL_RE = re.compile(r"[0-9]+")
 
 #: Package validation regex (ADR-INJECT). Mirrors the parser's final check.
-_PACKAGE_VALID_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-]{0,19}$")
+#: Anchored with ``\Z``, never ``$``: Python's ``$`` also matches just before a
+#: trailing newline, so ``^...$`` would admit ``"SOIC-16\n"`` into query text.
+_PACKAGE_VALID_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-]{0,19}\Z")
 
 #: Maximum length of a ``--manufacturer``/``--category`` free-text filter term
 #: (ADR-0016 / ADR-0007-style DoS bound). Must comfortably exceed real names
@@ -211,16 +213,16 @@ def validate_package(package: str) -> str:
 
     PUBLIC (ADR-0017): the CLI imports this directly (``--package`` boundary
     re-validation) rather than reaching for a private name. The charset
-    (``^[A-Z0-9][A-Z0-9\\-]{0,19}$``) and logic are unchanged from the original
-    private ``_validate_package``.
+    (``^[A-Z0-9][A-Z0-9\\-]{0,19}\\Z``) and logic are unchanged from the
+    original private ``_validate_package``.
 
     Raises:
-        ValueError: If *package* does not match ``^[A-Z0-9][A-Z0-9\\-]{0,19}$``.
+        ValueError: If *package* does not match ``^[A-Z0-9][A-Z0-9\\-]{0,19}\\Z``.
     """
     if not _PACKAGE_VALID_RE.match(package):
         raise ValueError(
             f"Invalid package code {package!r}: must match "
-            r"^[A-Z0-9][A-Z0-9\-]{0,19}$ (ADR-INJECT)."
+            r"^[A-Z0-9][A-Z0-9\-]{0,19}\Z (ADR-INJECT)."
         )
     return package
 

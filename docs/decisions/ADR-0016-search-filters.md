@@ -48,7 +48,9 @@ oriented CLI filter, and it is why package uses exact `eq` instead (next point).
 ### 2. Package — exact `eq`, one rendering path, collision rejected
 
 `--package` upper-cases its value, re-validates it against the package charset
-`^[A-Z0-9][A-Z0-9\-]{0,19}$`, and renders the **exact** `in_package
+`^[A-Z0-9][A-Z0-9\-]{0,19}\Z` (recorded here originally with a `$` anchor; the
+charset is unchanged and only the end-anchor is now stricter — see ADR-0021
+§ 8's 2026-07-28 amendment), and renders the **exact** `in_package
 @filter(eq(name, $pkg))` — byte-identical to the existing query-derived
 `parsed.package` path (the builder treats the `package=` kwarg and
 `parsed.package` as one "effective package"). A package code is a precise,

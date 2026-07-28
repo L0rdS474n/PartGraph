@@ -319,7 +319,18 @@ _SYSTEMCTL = "systemctl"
 #: both names and IDs. Anything failing it is excluded before classification
 #: and never reaches a subprocess argv (a deny-list of hostile characters could
 #: never be exhaustive).
-_IDENTIFIER_GRAMMAR = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+#:
+#: Anchored with ``\Z``, NEVER ``$``: in Python ``$`` also matches just before a
+#: trailing newline, so ``^...$`` accepted exactly one ``"\n"`` at the end of an
+#: otherwise-valid identifier (``"partgraph-dgraph\n"`` passed). That defeated
+#: the promise made by :func:`_accepted_identifier` — a name carrying a real
+#: line break reached rendered diagnostic output, where ``markup=False``
+#: suppresses Rich markup but does not strip control characters. ``\Z`` matches
+#: at end of string ONLY. Every ``$``-anchored allow-list in ``src/`` was swept
+#: for the same quirk when this was fixed; the anchor belongs in the pattern
+#: rather than in a ``.fullmatch()`` at one call site, so it cannot be lost by
+#: a future caller reaching for ``.match()``.
+_IDENTIFIER_GRAMMAR = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*\Z")
 
 #: Finite ceiling on an accepted container name/ID length.
 _MAX_IDENTIFIER_LENGTH = 255
@@ -341,7 +352,8 @@ _STOPPABLE_OWNERS = frozenset({_OWNER_NAME_MATCH, _OWNER_VOLUME_MATCH})
 
 #: Host-port grammar for a Docker-shaped ``Ports`` string. Strict ASCII digits
 #: only — ``str.isdigit()`` would also accept non-ASCII digit characters.
-_HOST_PORT_GRAMMAR = re.compile(r"^[0-9]+$")
+#: ``\Z``, not ``$``, for the reason given on :data:`_IDENTIFIER_GRAMMAR`.
+_HOST_PORT_GRAMMAR = re.compile(r"^[0-9]+\Z")
 
 #: The separator Docker puts between the host side and the container side of a
 #: published port, e.g. ``0.0.0.0:8081->8080/tcp``.

@@ -86,11 +86,14 @@ after the previous page's max uid. The embed loop:
   `max("0x9", "0x10")` on raw strings wrongly yields `"0x9"` (the character
   `'9'` sorts after `'1'`). The winning uid's original `0x...` string is kept as
   the next cursor;
-- **validates every uid** against `^0x[0-9a-fA-F]+$` before it can reach query
+- **validates every uid** against `^0x[0-9a-fA-F]+\Z` before it can reach query
   text (validate-before-interpolate, mirroring
   `partgraph.query.dql_builder`'s ADR-INJECT convention) — a missing or
   malformed uid is excluded from cursor computation and is never inlined raw
-  into DQL (no injection vector via the cursor, no literal `None` cursor);
+  into DQL (no injection vector via the cursor, no literal `None` cursor)
+  *(this ADR originally recorded the anchor as `$`, which in Python also matches
+  just before a trailing newline; the charset is unchanged and only the anchor
+  is now stricter — see ADR-0021 § 8's 2026-07-28 amendment)*;
 - **terminates** on any of: (a) a zero-row page, (b) a short page (fewer rows
   than requested — Dgraph has no more matches), (c) a cursor that fails to
   strictly advance (a defensive guard against a stale/misbehaving server

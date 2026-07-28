@@ -219,7 +219,15 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
     mounts_by_id = mounts_by_id or {}
     unit_lines = unit_lines if unit_lines is not None else _UNIT_NOT_FOUND_LINES
     inspect_fails_ids_by_pass = inspect_fails_ids_by_pass or {}
-    live: dict[str, dict] = {row["Id"]: row for row in initial_rows}
+    # `.get("Id") or .get("ID")` (never a bare `row["Id"]`): this fixture's
+    # OWN bookkeeping key must accept a Docker-shaped row (id key spelled
+    # 'ID') exactly like the production `_row_id()` it is standing in for —
+    # otherwise a Docker-shaped `initial_rows` entry raises `KeyError`
+    # before the scenario under test even runs. Backward compatible: every
+    # existing caller here only ever sets "Id", so this is additive.
+    live: dict[str, dict] = {
+        (row.get("Id") or row.get("ID")): row for row in initial_rows
+    }
     calls: list[tuple[list[str], dict]] = []
     ps_call_count = 0
 
@@ -1402,3 +1410,71 @@ def test_down_messages_are_single_line_path_free(scenario: str) -> None:
     for line in result.output.splitlines():
         assert "/home" not in line, f"line leaks an operator home path: {line!r}"
         assert not line.strip().startswith("/"), f"line leaks a raw filesystem path: {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# [Docker-parity investigation] `db down` consuming a Docker-shaped `ps` row
+# end to end — not just at the `find_partgraph_instances()` leaf level
+# (tests/unit/test_lifecycle.py already pins the parser itself).
+#
+# Every scenario in THIS file, including A10/A11's own "systemctl absent" /
+# "unit not-found" honest-degradation cases, has always built its `ps` rows
+# with `_ps_row()` — podman's own shape (`"Id"`, `"Names"` as a list) —
+# regardless of which engine name a test passes as `engine_prefix`/
+# `compose_command`. So `db down` end to end, through the CLI, has never once
+# been driven by a row shaped the way Docker's OWN `ps --format json` reports
+# it (`"ID"`, `"Names"` as a comma-joined string) — only the leaf function
+# had that coverage, and only for the `Ports` field (Gate 5 Finding B).
+#
+# HERMETIC SIMULATION ONLY: this pins the row shape `partgraph.util.lifecycle`
+# already documents Docker as using (see tests/unit/test_lifecycle.py's own
+# section note, immediately above its Docker-parity tests, for the same
+# disclosure in full) — never validated against a real Docker daemon, which
+# does not exist on this host.
+# ---------------------------------------------------------------------------
+
+
+def test_docker_shaped_survivor_stopped_by_its_ID_key_container_id_end_to_end() -> None:
+    """[Docker parity, HERMETIC SIMULATION — see section note above] Given
+    the SOLE running PartGraph instance is reported by a Docker-shaped `ps`
+    row — id key `ID` (not podman's `Id`), `Names` a comma-joined string
+    naming `partgraph-dgraph` first (not a list) — and Compose itself does
+    NOT remove it (so the engine-level stop-by-id sweep must fire, exactly
+    like a container the quadlet unit created).
+    When `partgraph db down` runs.
+    Then the engine `stop` call targets the id taken from the Docker-shaped
+    row's `ID` key, the verification pass sees it gone, the success line
+    names `partgraph-dgraph` (the first, comma-split name), and the command
+    exits 0 — byte-for-byte the same outcome A2/A8's podman-shaped scenarios
+    already pin.
+    """
+    docker_row = {
+        "ID": "cid-docker-down",
+        "Names": f"{PARTGRAPH_CONTAINER_NAME},compose-alias",
+        "Image": "dgraph/standalone:v25.3.4",
+        "State": "running",
+        "Ports": "127.0.0.1:8081->8080/tcp, 127.0.0.1:9081->9080/tcp, 127.0.0.1:8001->8000/tcp",
+    }
+    fake_run, calls = _make_scripted_run(
+        initial_rows=[docker_row],
+        mounts_by_id={"cid-docker-down": []},
+        compose_removes_ids=frozenset(),
+    )
+    with (
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "down"])
+
+    assert result.exit_code == 0, result.output
+    stop_calls = [argv for argv, _k in calls if _is_engine_stop_call(argv)]
+    assert len(stop_calls) == 1, f"expected exactly one engine stop call: {calls!r}"
+    assert stop_calls[0][-1] == "cid-docker-down", (
+        "the stop target must be the container id taken from the Docker-shaped "
+        f"row's 'ID' key: {stop_calls[0]!r}"
+    )
+    assert PARTGRAPH_CONTAINER_NAME in result.output
+    assert "compose-alias" not in result.output

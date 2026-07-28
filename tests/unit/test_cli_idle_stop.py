@@ -234,7 +234,15 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
     be scripted without failing every stop in the scenario."""
     mounts_by_id = mounts_by_id or {}
     unit_lines = unit_lines if unit_lines is not None else _UNIT_NOT_FOUND_LINES
-    live: dict[str, dict] = {row["Id"]: row for row in initial_rows}
+    # `.get("Id") or .get("ID")` (never a bare `row["Id"]`): this fixture's
+    # OWN bookkeeping key must accept a Docker-shaped row (id key spelled
+    # 'ID') exactly like the production `_row_id()` it is standing in for —
+    # otherwise a Docker-shaped `initial_rows` entry raises `KeyError`
+    # before the scenario under test even runs. Backward compatible: every
+    # existing caller here only ever sets "Id", so this is additive.
+    live: dict[str, dict] = {
+        (row.get("Id") or row.get("ID")): row for row in initial_rows
+    }
     calls: list[tuple[list[str], dict]] = []
 
     def _fake(argv, **kwargs):
@@ -825,3 +833,65 @@ def test_idle_stop_never_autostarts_regardless_of_partgraph_autostart_env(
         result = _invoke(["db", "idle-stop"])
 
     assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# [Docker-parity investigation] `db idle-stop` consuming a Docker-shaped `ps`
+# row end to end — the THIRD consumer of `find_partgraph_instances()`'s row
+# parsing (alongside `db down` and `db doctor`), sharing the exact same
+# `stop_all()` leaf call as `db down`. Like the other two, every scenario in
+# this file has only ever built rows with `_ps_row()` (podman's own shape).
+#
+# HERMETIC SIMULATION ONLY: pins the row shape `partgraph.util.lifecycle`'s
+# own docstrings already document Docker as using (see
+# tests/unit/test_lifecycle.py's Docker-parity section note for the full
+# disclosure) — not validated against a real Docker daemon, which does not
+# exist on this host.
+# ---------------------------------------------------------------------------
+
+
+def test_idle_stop_end_to_end_stops_a_docker_shaped_ps_row_by_its_ID_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """[Docker parity] Given one genuine PartGraph instance reported by a
+    Docker-shaped `ps` row (id key `ID`, comma-joined `Names` string naming
+    `partgraph-dgraph` first), a stale activity stamp, and no lease.
+    When `partgraph db idle-stop` runs.
+    Then the underlying engine `stop` call targets the id taken from the
+    row's `ID` key (never some other value), and idle-stop exits 0 — the same
+    outcome the existing podman-shaped end-to-end test above already pins.
+    """
+    monkeypatch.delenv("PARTGRAPH_IDLE_TIMEOUT_MINUTES", raising=False)
+    state_dir = tmp_path / "state"
+    _seed_state_dir_stale_no_lease(state_dir)
+
+    docker_row = {
+        "ID": "cid-docker-idle",
+        "Names": f"{PARTGRAPH_CONTAINER_NAME},compose-alias",
+        "Image": "dgraph/standalone:v25.3.4",
+        "State": "running",
+        "Ports": "127.0.0.1:8081->8080/tcp, 127.0.0.1:9081->9080/tcp, 127.0.0.1:8001->8000/tcp",
+    }
+    fake_run, calls = _make_scripted_run(
+        initial_rows=[docker_row],
+        mounts_by_id={"cid-docker-idle": _mounts(PARTGRAPH_DATA_VOLUME)},
+    )
+
+    with (
+        patch.object(cli_mod, "ACTIVITY_STATE_DIR", state_dir),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(True)),
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+        patch("partgraph.cli.ensure_running", side_effect=_forbid_ensure_running),
+    ):
+        result = _invoke(["db", "idle-stop"])
+
+    assert result.exit_code == 0, result.output
+    stop_calls = [argv for argv, _k in calls if _is_engine_stop_call(argv)]
+    assert len(stop_calls) == 1, f"expected exactly one engine stop call: {calls!r}"
+    assert stop_calls[0][-1] == "cid-docker-idle", (
+        "the stop target must be the container id taken from the Docker-shaped "
+        f"row's 'ID' key: {stop_calls[0]!r}"
+    )

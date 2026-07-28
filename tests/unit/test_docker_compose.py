@@ -621,3 +621,79 @@ def test_dgraph_service_restart_policy_is_quoted_in_the_raw_yaml_source(
         f'"no" (never the bare YAML token `no`, which parses as the '
         f"boolean False): got {value!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# [Docker-parity investigation, documentation honesty] The `restart: "no"`
+# comment's reasoning is currently PODMAN-ONLY and reads as inapplicable on a
+# genuine Docker host.
+#
+# This is NOT a runtime/behavioural check — `restart: "no"` is plain YAML and
+# applies identically to whichever engine reads it, which is already pinned
+# above. It is a DOCUMENTATION-HONESTY check: the comment immediately above
+# `restart: "no"` (as of this test being written) justifies the choice with
+# EXACTLY one reason — "under rootless podman nothing revives a container at
+# boot ... What actually restarted the database was the separate quadlet
+# unit" — and ADR-0022 §7f repeats the identical, podman-only framing. Read on
+# its own by someone running Docker rather than podman, that reasoning states
+# a fact about podman that is simply true and, taken at face value, implies
+# `restart: "no"` is a podman-specific workaround that does not concern them.
+#
+# It is not a workaround for podman alone. On a real Docker host — HERMETIC
+# CLAIM, not measured on this host (there is no `dockerd` here; see this
+# file's own `_load_compose_yaml` fallback and PartGraph's central Docker
+# constraint, documented in tests/unit/test_container.py) — `dockerd` is
+# commonly itself an ENABLED systemd (or init) service, so `restart:
+# unless-stopped` genuinely DOES revive the container at every host boot,
+# with NO quadlet or second lifecycle owner involved at all. That is a
+# DIFFERENT mechanism producing the SAME "the database is always running"
+# complaint this entire lifecycle body of work exists to fix (ADR-0021,
+# ADR-0022) — so `restart: "no"` is independently necessary for a Docker user
+# too, not merely inherited collateral from a podman-specific fix. A
+# Docker-only reader who trusts the comment as written has no reason to
+# believe reverting to `unless-stopped` would reintroduce the exact problem
+# this repository's history is built around solving.
+# ---------------------------------------------------------------------------
+
+
+def test_restart_no_comment_also_explains_the_docker_daemon_case_not_only_podman(
+    compose_raw_text: str,
+) -> None:
+    """[Docker-parity, documentation honesty — see section note above] Given
+    the comment block preceding `restart: "no"` in docker/docker-compose.yml.
+    When that comment (from its "Quoted on purpose" opening line through the
+    `restart: "no"` line itself) is scanned.
+    Then it must ALSO name Docker's own daemon-level restart mechanism — the
+    word "Docker" together with "daemon" or "boot", in that same window — not
+    only rootless podman's lack of a boot-time reviver, so a Docker-only
+    reader is told the value is necessary for their engine too, and why,
+    rather than reading a reason that appears to be someone else's problem.
+
+    Currently RED: the comment (docker/docker-compose.yml, the block ending
+    at `restart: "no"`) mentions "rootless podman" and the quadlet unit only;
+    it never once mentions Docker or a real daemon's own restart behaviour.
+    ADR-0022 §7f repeats the identical gap in prose form (out of scope for
+    this test — no test in this repository pins ADR markdown content
+    directly; only docs/db-lifecycle.md, the operator runbook, is
+    content-pinned, by tests/unit/test_db_lifecycle_docs.py).
+    """
+    restart_match = re.search(r'restart:\s*"no"', compose_raw_text)
+    assert restart_match, 'docker-compose.yml declares no restart: "no" line to anchor this check on.'
+    anchor = compose_raw_text.find("Quoted on purpose")
+    assert anchor != -1 and anchor < restart_match.start(), (
+        "expected the 'Quoted on purpose' comment to precede restart: \"no\" "
+        "in docker/docker-compose.yml; the comment this test scans may have "
+        "moved or been reworded."
+    )
+    window = compose_raw_text[anchor:restart_match.start()]
+    low = window.lower()
+    mentions_docker = "docker" in low
+    mentions_daemon_or_boot_mechanism = "daemon" in low or "boot" in low
+    assert mentions_docker and mentions_daemon_or_boot_mechanism, (
+        "the comment preceding restart: \"no\" must explain why the value is "
+        "ALSO necessary on a genuine Docker daemon (which commonly restarts "
+        "containers at boot via its own enabled systemd/init service), not "
+        "only for rootless podman's lack of a boot-time reviver — otherwise "
+        "a Docker-only reader is given a reason that reads as inapplicable "
+        f"to their engine. Window scanned:\n{window!r}"
+    )

@@ -114,9 +114,20 @@ appears in the table).
 
 `_validate_package` → `validate_package` and `_MAX_FILTER_TERM_LEN` →
 `MAX_FILTER_TERM_LEN` are promoted to public names (both added to `__all__`),
-with the exact `^[A-Z0-9][A-Z0-9\-]{0,19}$` charset, the `128` cap and all logic
+with the exact `^[A-Z0-9][A-Z0-9\-]{0,19}\Z` charset, the `128` cap and all logic
 **unchanged**. `cli.py`'s two lazy imports now import the public names, so the
 CLI no longer reaches for an underscore-private symbol across a module boundary.
+
+> **Note on the word "exact" above.** What this section *decided* — that the
+> promotion changed no logic and no charset — remains true exactly as written:
+> the rename was byte-identical at the time. What it *quoted* has since moved.
+> This section originally read `^[A-Z0-9][A-Z0-9\-]{0,19}$`; the end-anchor was
+> later corrected to `\Z` (ADR-0021 § 8's 2026-07-28 amendment) because Python's
+> `$` also matches just before a trailing newline. The pattern above is updated
+> so "exact" stays a true statement about what is **enforced today**, which is
+> how a reader will use it — but the correction was not part of this ADR's
+> decision, and is flagged here rather than folded silently into it. The
+> **charset is unchanged**; only the anchor is stricter.
 
 ## Consequences
 

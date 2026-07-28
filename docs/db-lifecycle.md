@@ -25,6 +25,27 @@ login, whether the data volume exists, and these same steps. It changes
 nothing, and it **always exits 0** — it is a report, not a health check. Use
 `partgraph db status` when you want an exit code that means something.
 
+### Which engine this applies to
+
+**Everything below is Podman-specific.** The second lifecycle owner it removes
+is a *quadlet* unit, and quadlet is a Podman feature: Podman generates the
+`systemd --user` units from a `.container` file
+(`podman-systemd.unit(5)` — "systemd units using Podman Quadlet"). On a host
+running Docker instead, that unit cannot exist, no `systemctl --user` step here
+has anything to act on, and Section 1 is not a procedure you are missing —
+there is simply nothing to remove.
+
+A Docker host can still end up with a database that keeps coming back, but by
+an unrelated route: the Docker daemon enforces the container's own `restart`
+policy, which is why `docker/docker-compose.yml` sets `restart: "no"` and
+[ADR-0022](decisions/ADR-0022-database-lifecycle-on-demand.md) § 7f explains
+that value for both engines separately. If your database returns after a
+reboot on Docker, look at that policy — not for a unit file. *(That Docker
+behaviour is taken from Docker's documentation; this repository has only ever
+been run against rootless Podman, so it is not something anyone here has
+observed. The incident, the measurements and the procedure below are all from a
+Podman host.)*
+
 ---
 
 ## 1. Remove the autostart: `WantedBy=`

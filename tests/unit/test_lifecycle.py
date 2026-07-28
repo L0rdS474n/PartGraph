@@ -441,7 +441,15 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
     mounts_by_id = mounts_by_id or {}
     unit_lines = unit_lines if unit_lines is not None else _UNIT_NOT_FOUND_LINES
     inspect_fails_ids_by_pass = inspect_fails_ids_by_pass or {}
-    live: dict[str, dict] = {row["Id"]: row for row in initial_rows}
+    # `.get("Id") or .get("ID")` (never a bare `row["Id"]`): this fixture's
+    # OWN bookkeeping key must accept a Docker-shaped row (id key spelled
+    # 'ID') exactly like the production `_row_id()` it is standing in for —
+    # otherwise a Docker-shaped `initial_rows` entry raises `KeyError`
+    # before the scenario under test even runs. Backward compatible: every
+    # existing caller here only ever sets "Id", so this is additive.
+    live: dict[str, dict] = {
+        (row.get("Id") or row.get("ID")): row for row in initial_rows
+    }
     calls: list[tuple[list[str], dict]] = []
     ps_call_count = 0
 
@@ -1062,6 +1070,407 @@ def test_docker_shaped_ports_on_s2_container_does_not_change_classification() ->
 
 
 # ---------------------------------------------------------------------------
+# [Docker-parity investigation] Docker's `Id` -> `ID` key spelling and its
+# `Names` comma-joined STRING shape (not podman's list).
+#
+# `_row_id()`'s and `_row_name()`'s OWN docstrings already claim both engine
+# shapes are accepted ("Docker's `ps --format json` spells it 'ID'"; "Docker's
+# `ps --format json` reports [Names] as a single comma-joined string") — and,
+# read directly, the parser genuinely does (`row.get("Id") or row.get("ID")`;
+# `names.split(",")[0]` before allow-listing). But until the tests below were
+# added, NOTHING in this test suite (hermetic or integration) ever built a row
+# using either shape: Gate 5 Finding B closed the identical gap for the
+# `Ports` field only, and every `_ps_row`/`_ps_row_with_ports_field` fixture in
+# this file — including Gate 5 Finding B's own — still hard-codes `"Id"` and
+# `"Names": [name]` regardless of which engine prefix a test passes. So
+# `PARTGRAPH_CONTAINER_ENGINE=docker` on THIS host (or `engine_prefix=
+# ["docker"]` in a test) has only ever exercised podman's OWN row shape,
+# through the podman shim, wearing a "docker" argv[0] label — the exact "false
+# comfort" this investigation was asked to find, one field short of where
+# Gate 5 already found it.
+#
+# HERMETIC SIMULATION ONLY, clearly labelled per that finding: every test
+# below pins the row shape `partgraph.util.lifecycle`'s OWN docstrings already
+# assert Docker uses. None of it is validated against a real Docker daemon —
+# there is none on this host (independently confirmed while writing this
+# file: `dockerd` is not on PATH, `systemctl is-active docker` reports
+# "inactive", and `/usr/bin/docker` is a 228-byte POSIX shell script whose
+# entire body is `exec /usr/bin/podman "$@"`). If that documented shape is
+# ever wrong, these tests pin the WRONG thing convincingly; they cannot prove
+# it right, only that the code does what its own docstrings already claim.
+# ---------------------------------------------------------------------------
+
+
+def _ps_row_with_id_field(id_key: str, container_id: str, name: str, image: str, *,
+                           state: str = "running") -> dict:
+    """Like `_ps_row`, but with the id key spelled EXACTLY as `id_key`
+    ('Id' or 'ID') — isolates the id-key-spelling divergence from the
+    Names/Ports shape, mirroring `_ps_row_with_ports_field`'s isolation of the
+    Ports field alone.
+    """
+    return {
+        id_key: container_id,
+        "Names": [name],
+        "Image": image,
+        "State": state,
+        "Ports": [],
+    }
+
+
+def _ps_row_with_names_field(container_id: str, names_field: object, image: str, *,
+                              state: str = "running") -> dict:
+    """Like `_ps_row`, but with an EXPLICIT, already-shaped `Names` value —
+    Docker's comma-joined string (or a hostile variant of one) — isolating
+    the Names-shape divergence the same way `_ps_row_with_ports_field`
+    isolates Ports.
+    """
+    return {
+        "Id": container_id,
+        "Names": names_field,
+        "Image": image,
+        "State": state,
+        "Ports": [],
+    }
+
+
+def test_docker_shaped_id_key_ID_uppercase_is_accepted_same_as_podmans_Id() -> None:
+    """[Docker parity, HERMETIC SIMULATION — see section note above] Given a
+    `ps --all --format json` row spells the id key `ID` (Docker's own shape,
+    per `_row_id`'s docstring) rather than podman's `Id` — isolated: `Names`/
+    `Ports` stay in podman's own shape so only the id key itself is under
+    test.
+    When find_partgraph_instances() is called.
+    Then the row is still classified (S1, by its exact name) and
+    `Instance.id` is the value taken from the `ID` key.
+    """
+    row = _ps_row_with_id_field(
+        "ID", "cid-docker-id-key", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4",
+    )
+    fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert instances[0].id == "cid-docker-id-key"
+    assert instances[0].owned_by == "S1"
+
+
+def test_docker_shaped_names_comma_joined_string_single_name_matches_podman_list_shape() -> None:
+    """[Docker parity, HERMETIC SIMULATION — see section note above] Given a
+    row's `Names` is a single-element Docker-style comma-joined STRING
+    (`"partgraph-dgraph"`) rather than podman's `["partgraph-dgraph"]` list.
+    When find_partgraph_instances() is called.
+    Then it is classified identically to the podman list-shaped equivalent
+    (S1, by exact name) — the two shapes must be indistinguishable to every
+    downstream consumer.
+    """
+    docker_row = _ps_row_with_names_field(
+        "id-docker-names", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4",
+    )
+    podman_row = _ps_row("id-podman-names", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+
+    for row, cid in [(docker_row, "id-docker-names"), (podman_row, "id-podman-names")]:
+        fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+        with patch("subprocess.run", side_effect=fake_run):
+            instances = find_partgraph_instances(engine_prefix=["docker"])
+        assert len(instances) == 1, f"{cid}: {instances!r}"
+        assert instances[0].id == cid
+        assert instances[0].name == PARTGRAPH_CONTAINER_NAME
+        assert instances[0].owned_by == "S1"
+
+
+def test_docker_shaped_names_multiple_comma_separated_only_first_name_used() -> None:
+    """[Docker parity, HERMETIC SIMULATION — see section note above] Given a
+    Docker-shaped `Names` string carrying TWO comma-separated names — Docker
+    reports every name/alias a container has this way, e.g.
+    `"partgraph-dgraph,some-compose-alias"`.
+    When find_partgraph_instances() is called.
+    Then only the FIRST name is taken as `Instance.name` (mirrors
+    `_row_name`'s documented behaviour); the second name never appears in it.
+    """
+    row = _ps_row_with_names_field(
+        "id-multi-name", f"{PARTGRAPH_CONTAINER_NAME},some-compose-alias",
+        "dgraph/standalone:v25.3.4",
+    )
+    fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert instances[0].name == PARTGRAPH_CONTAINER_NAME
+    assert "some-compose-alias" not in instances[0].name
+
+
+def test_docker_shaped_names_second_segment_never_reaches_a_ps_or_inspect_argv_even_when_hostile() -> None:
+    """[Docker parity, security, HERMETIC SIMULATION — see section note
+    above] Given a Docker-shaped `Names` string whose FIRST segment is
+    PartGraph's own exact name (so the row IS classified and will be
+    inspected) and whose SECOND segment is a string that would fail the
+    allow-list outright on its own (`"; rm -rf /"`).
+    When find_partgraph_instances() is called (READ-ONLY: `ps` + `container
+    inspect` only — this function never issues a `stop`, so this test
+    structurally cannot say anything about a `stop` argv; see
+    `test_docker_shaped_names_second_segment_never_reaches_a_stop_argv_through_a_real_stop_all`
+    immediately below for that claim).
+    Then the row is still classified S1 by its first name, and the hostile
+    second segment is never used for anything: `_row_name` splits on the
+    comma BEFORE allow-listing, so it can never smuggle a second value past
+    validation, and it never reaches the `ps`/`container inspect` argv this
+    read-only sweep issues.
+    """
+    hostile_second = "; rm -rf /"
+    row = _ps_row_with_names_field(
+        "id-hostile-second-name", f"{PARTGRAPH_CONTAINER_NAME},{hostile_second}",
+        "dgraph/standalone:v25.3.4",
+    )
+    fake_run, calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert instances[0].owned_by == "S1"
+    assert instances[0].name == PARTGRAPH_CONTAINER_NAME
+    for argv, _kwargs in calls:
+        assert hostile_second not in argv, f"hostile second name segment reached argv: {argv}"
+
+
+def test_docker_shaped_names_second_segment_never_reaches_a_stop_argv_through_a_real_stop_all() -> None:
+    """[Docker parity, security, HERMETIC SIMULATION — see section note
+    above] [Review finding: the sibling read-only test above only proves the
+    hostile segment is absent from `ps`/`container inspect` argv, which by
+    construction never carry `Names` content at all — a claim its NAME
+    overclaimed and its own docstring now scopes correctly. THIS test closes
+    that gap.] Given the identical Docker-shaped `Names` string — first
+    segment PartGraph's own exact name, second segment
+    `"; rm -rf /"` — for a container that is NOT removed by Compose (so the
+    engine-level `stop` sweep, the ONE call this module ever issues that
+    could plausibly carry rendered container text, must fire).
+    When stop_all() runs its full sweep (the same real function `db down`
+    and `db idle-stop` both call).
+    Then a `stop` call IS issued (proving the sweep genuinely reached the
+    mutating step this test is about, not merely a vacuously-true absence),
+    its target is the container's opaque id, and the hostile second segment
+    never appears in ANY subprocess call this sweep issues — including that
+    `stop` call — nor in `DownResult.stopped`'s display name.
+    """
+    hostile_second = "; rm -rf /"
+    row = _ps_row_with_names_field(
+        "id-hostile-second-stop", f"{PARTGRAPH_CONTAINER_NAME},{hostile_second}",
+        "dgraph/standalone:v25.3.4",
+    )
+    fake_run, calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_run):
+        result = stop_all(
+            engine_prefix=["docker"], compose_down=lambda: None,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
+
+    stop_calls = [argv for argv, _k in calls if _is_engine_stop_call(argv)]
+    assert stop_calls, f"expected at least one engine stop call: {calls!r}"
+    assert stop_calls[0][-1] == "id-hostile-second-stop", (
+        f"stop target must be the container id: {stop_calls[0]!r}"
+    )
+    for argv, _kwargs in calls:
+        assert hostile_second not in argv, (
+            f"hostile second name segment reached a subprocess argv, "
+            f"including possibly the stop call: {argv}"
+        )
+    assert PARTGRAPH_CONTAINER_NAME in result.stopped
+    assert hostile_second not in "".join(result.stopped), (
+        f"hostile second name segment must never surface in DownResult.stopped: "
+        f"{result.stopped!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# [SHOULD, Docker comma-shape boundary cases] Five additional shapes of
+# Docker's comma-joined `Names` string, probed against the real
+# `_row_name()`/`_accepted_identifier()` and found correct — but, until now,
+# pinned only for the UNSPLIT podman list shape (the existing hostile-name
+# table above), never for the Docker STRING path specifically. Each of these
+# exercises a genuinely different code path than the list shape: the split
+# happens BEFORE allow-listing only for the string branch of `_row_name()`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("names_field", "expected_name", "case_id"),
+    [
+        pytest.param(",partgraph-dgraph", None, "empty-first-segment"),
+        pytest.param(",", None, "lone-comma"),
+        pytest.param(",,,", None, "only-separators"),
+        pytest.param(
+            f"{PARTGRAPH_CONTAINER_NAME},-rf", PARTGRAPH_CONTAINER_NAME,
+            "first-still-wins-over-leading-dash-second",
+        ),
+        pytest.param("a" * 300 + f",{PARTGRAPH_CONTAINER_NAME}", None, "oversized-first-segment"),
+    ],
+)
+def test_docker_shaped_names_comma_string_boundary_cases(
+    names_field: str, expected_name: str | None, case_id: str,
+) -> None:
+    """[Docker parity, HERMETIC SIMULATION — see section note above] Given a
+    Docker-shaped `Names` STRING in one of five boundary shapes: an empty
+    first segment before a comma, a lone comma, a string of only commas, a
+    valid first segment followed by a leading-dash (flag-injection-shaped)
+    second segment, and a first segment exceeding
+    `_MAX_IDENTIFIER_LENGTH` (255) followed by a valid second segment.
+    When find_partgraph_instances() is called.
+    Then a `None`-expected case excludes the row entirely (`instances ==
+    ()`), and the `PARTGRAPH_CONTAINER_NAME`-expected case is still
+    classified S1 by its FIRST segment alone — the leading-dash second
+    segment is never consulted, exactly like the hostile-second-segment
+    tests above.
+    """
+    row = _ps_row_with_names_field(
+        f"id-boundary-{case_id}", names_field, "dgraph/standalone:v25.3.4",
+    )
+    fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    if expected_name is None:
+        assert instances == (), (
+            f"names_field={names_field!r} must exclude the row entirely: {instances!r}"
+        )
+    else:
+        assert len(instances) == 1, f"names_field={names_field!r}: {instances!r}"
+        assert instances[0].name == expected_name
+        assert instances[0].owned_by == "S1"
+
+
+def test_docker_shaped_id_key_is_the_container_inspect_target_for_s2_classification() -> None:
+    """[Docker parity, HERMETIC SIMULATION — see section note above] Given a
+    Docker-shaped row (id key `ID`) for a container with an ARBITRARY name
+    that mounts the PartGraph data volume — S2 classification requires a
+    `container inspect` call TARGETING the row's id.
+    When find_partgraph_instances() is called.
+    Then the `container inspect` call issued targets the id taken from the
+    `ID` key (never some other value), and the row is classified S2.
+    """
+    row = {
+        "ID": "cid-docker-s2",
+        "Names": "systemd-partgraph-dgraph-duplicate",
+        "Image": "dgraph/standalone:v25.3.4",
+        "State": "running",
+        "Ports": "",
+    }
+    fake_run, calls = _make_scripted_run(
+        initial_rows=[row], mounts_by_id={"cid-docker-s2": _mounts(PARTGRAPH_DATA_VOLUME)},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert instances[0].owned_by == "S2"
+    inspect_calls = [argv for argv, _kwargs in calls if _is_inspect_call(argv)]
+    assert inspect_calls, f"expected a container inspect call: {calls!r}"
+    assert inspect_calls[0][-1] == "cid-docker-s2"
+
+
+def test_fully_docker_shaped_row_parses_identically_to_the_equivalent_podman_shaped_row() -> None:
+    """[Docker parity, comprehensive, HERMETIC SIMULATION — see section note
+    above] Given ONE row using ALL THREE of Docker's own reported field
+    shapes simultaneously — `ID` (not `Id`), `Names` as a comma-joined string
+    (not a list), and `Ports` as a comma-joined string (not a list of dicts,
+    Gate 5 Finding B's own shape) — versus the SAME container described in
+    podman's own shape.
+    When find_partgraph_instances() is called against each shape separately.
+    Then both produce the SAME classification, the SAME display name and
+    image/status, and the SAME de-duplicated, sorted ports tuple — only the
+    opaque container id legitimately differs (each row is given its own).
+    """
+    docker_row = {
+        "ID": "cid-docker-full",
+        "Names": f"{PARTGRAPH_CONTAINER_NAME},compose-alias",
+        "Image": "dgraph/standalone:v25.3.4",
+        "State": "running",
+        "Ports": _docker_ports_string(8081, 9081, 8001),
+    }
+    podman_row = _ps_row(
+        "cid-podman-full", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4",
+        host_ports=(8081, 9081, 8001),
+    )
+
+    fake_docker, _calls_docker = _make_scripted_run(initial_rows=[docker_row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_docker):
+        docker_instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    fake_podman, _calls_podman = _make_scripted_run(initial_rows=[podman_row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_podman):
+        podman_instances = find_partgraph_instances(engine_prefix=["podman"])
+
+    assert len(docker_instances) == len(podman_instances) == 1
+    docker_instance, podman_instance = docker_instances[0], podman_instances[0]
+    assert docker_instance.name == podman_instance.name == PARTGRAPH_CONTAINER_NAME
+    assert docker_instance.owned_by == podman_instance.owned_by == "S1"
+    assert docker_instance.ports == podman_instance.ports == (8001, 8081, 9081)
+    assert docker_instance.image == podman_instance.image
+    assert docker_instance.status == podman_instance.status
+
+
+def test_id_and_ID_keys_present_together_resolve_to_one_consistent_identity_end_to_end() -> None:
+    """[MUST, identity resolution — review finding] Given a row carries BOTH
+    `Id` AND `ID` with DIFFERENT values — a shape no existing fixture
+    modelled before this test — for a container with an ARBITRARY name (not
+    S1) that mounts the PartGraph data volume (S2, so classification
+    genuinely requires a `container inspect` call).
+
+    The current behaviour is already SAFE: `Id` wins when truthy
+    (`row.get("Id") or row.get("ID")`), and `_row_id()` is called once per
+    row with that single result threaded to both the classification inspect
+    and `Instance.id`. Nothing locked that until this test: a future
+    refactor re-deriving `row.get("Id") or row.get("ID")` inline somewhere
+    else, disagreeing with this one, would silently reopen the exact
+    confused-deputy shape PR-A's own review caught — classification and the
+    stop disagreeing about which opaque id names "this container".
+
+    When stop_all() runs its full sweep — enumeration, the `container
+    inspect` calls in BOTH passes, the engine `stop`, and the verification
+    re-enumeration.
+    Then EVERY subprocess call that targets this container (every
+    `container inspect` call AND the final `stop` call) targets the SAME
+    value — the truthy `Id`, never `ID` — and `DownResult.stopped` agrees.
+    Proven END TO END through the real mutating sweep, not merely at the
+    parser.
+    """
+    row = {
+        "Id": "the-real-id",
+        "ID": "should-never-be-used",
+        "Names": ["systemd-partgraph-dgraph-duplicate"],
+        "Image": "dgraph/standalone:v25.3.4",
+        "State": "running",
+        "Ports": [],
+    }
+    fake_run, calls = _make_scripted_run(
+        initial_rows=[row],
+        mounts_by_id={"the-real-id": _mounts(PARTGRAPH_DATA_VOLUME)},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        result = stop_all(
+            engine_prefix=["docker"], compose_down=lambda: None,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
+
+    inspect_calls = [argv for argv, _k in calls if _is_inspect_call(argv)]
+    stop_calls = [argv for argv, _k in calls if _is_engine_stop_call(argv)]
+    assert inspect_calls, f"expected at least one container inspect call: {calls!r}"
+    assert stop_calls, f"expected at least one engine stop call: {calls!r}"
+    for argv in inspect_calls:
+        assert argv[-1] == "the-real-id", (
+            f"inspect must target the truthy 'Id', never 'ID': {argv}"
+        )
+        assert "should-never-be-used" not in argv
+    for argv in stop_calls:
+        assert argv[-1] == "the-real-id", (
+            f"stop must target the truthy 'Id', never 'ID': {argv}"
+        )
+        assert "should-never-be-used" not in argv
+    assert "systemd-partgraph-dgraph-duplicate" in result.stopped
+    assert "should-never-be-used" not in result.stopped
+
+
+# ---------------------------------------------------------------------------
 # Selector policy (S1 / S2 / S3) — locked
 # ---------------------------------------------------------------------------
 
@@ -1339,6 +1748,7 @@ def test_allowlist_positive_normal_docker_style_name_is_accepted() -> None:
     "hostile_name",
     [
         pytest.param("bad\nname", id="embedded-newline"),
+        pytest.param("bad-name\n", id="trailing-newline"),
         pytest.param("bad`name", id="backtick"),
         pytest.param("bad|name", id="pipe"),
         pytest.param("a" * 300, id="excessively-long"),
@@ -1350,9 +1760,23 @@ def test_allowlist_negative_table_rejects_hostile_shapes(hostile_name: str) -> N
     ``^[a-zA-Z0-9][a-zA-Z0-9_.-]*$``.
     When find_partgraph_instances() is called on a fixture where a container
     otherwise mounting the data volume (an S2 match) carries a name
-    violating that grammar (embedded newline, backtick, pipe, or an
-    excessively long 300-char name).
+    violating that grammar (embedded newline, a SINGLE TRAILING newline,
+    backtick, pipe, or an excessively long 300-char name).
     Then it is excluded entirely and never reaches any subprocess argv.
+
+    [BLOCKING regex review finding] "trailing-newline" is the case the
+    embedded-newline control did NOT cover, and the distinction is not
+    cosmetic: in Python, an UNANCHORED-at-the-end ``$`` also matches just
+    before a trailing newline character (unlike the ``\\Z`` anchor, which
+    matches end of string only), so a name otherwise fully grammar-valid
+    with exactly one trailing newline appended slipped past a
+    ``^...$``-anchored `.match()` even though the allow-list's own charset
+    never lists a newline as accepted — the
+    embedded case (newline in the MIDDLE) never exercises this, because the
+    characters AFTER the embedded newline still have to satisfy the pattern
+    too and don't. `_row_id`'s identical quirk is pinned separately, right
+    after this test, since both go through the same `_accepted_identifier()`
+    validator.
 
     [Gate 3b item 12 / 3a-M8]: the "brackets" case doubles as the
     Rich-`markup=False` regression the amendment asked for — a `[`/`]`
@@ -1372,6 +1796,68 @@ def test_allowlist_negative_table_rejects_hostile_shapes(hostile_name: str) -> N
     for argv, _kwargs in calls:
         for token in argv:
             assert hostile_name not in token
+
+
+def test_row_id_ending_in_a_trailing_newline_is_rejected_not_accepted() -> None:
+    """[BLOCKING regex review finding, the `_row_id` equivalent of the
+    "trailing-newline" name case above] Given a row's container id ends in a
+    single trailing ``"\n"`` — otherwise grammar-valid, and matched through
+    the SAME `_accepted_identifier()` allow-list `_row_name()` uses (the
+    exact quirk this whole fix addresses: an unanchored-at-the-end ``$``
+    also matches just before a trailing newline) — for a container whose
+    NAME is EXACTLY PartGraph's own (S1: an id is never needed to CLASSIFY
+    an S1 row, so a hostile id is the only thing that can make this test
+    fail or pass).
+    When find_partgraph_instances() is called.
+    Then the row is excluded entirely: an unusable container id means there
+    is no target to inspect or stop at all, regardless of how the name
+    classifies — `_row_id()` must reject a trailing-newline id exactly as
+    `_row_name()` must reject a trailing-newline name, since both are
+    validated by the SAME allow-list function.
+    """
+    row = {
+        "Id": "cid-hostile\n",
+        "Names": [PARTGRAPH_CONTAINER_NAME],
+        "Image": "dgraph/standalone:v25.3.4",
+        "State": "running",
+        "Ports": [],
+    }
+    fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert instances == (), (
+        f"a row whose id ends in a trailing newline must be excluded "
+        f"entirely, even when its NAME is an exact S1 match: {instances!r}"
+    )
+
+
+def test_docker_shaped_id_ending_in_a_trailing_newline_is_rejected_not_accepted() -> None:
+    """[BLOCKING regex review finding, Docker-shape variant] Given a row
+    spells the id key `ID` (Docker's own shape) and that value ends in a
+    single trailing ``"\n"`` — combining the `Id`/`ID` key-spelling
+    divergence with the trailing-newline quirk, so a fix that only patches
+    one code path (or is applied to podman's key but not Docker's) is still
+    caught.
+    When find_partgraph_instances() is called.
+    Then the row is excluded entirely, exactly like the podman-keyed case
+    above.
+    """
+    row = {
+        "ID": "cid-docker-hostile\n",
+        "Names": [PARTGRAPH_CONTAINER_NAME],
+        "Image": "dgraph/standalone:v25.3.4",
+        "State": "running",
+        "Ports": [],
+    }
+    fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={})
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert instances == (), (
+        f"a Docker-shaped ('ID') row whose id ends in a trailing newline "
+        f"must be excluded entirely: {instances!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
