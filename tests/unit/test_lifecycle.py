@@ -154,7 +154,10 @@ Frozen dataclasses:
     the names of instances still classified ``"UNKNOWN"`` after the FINAL
     verification pass — a ``container inspect`` failure alone during the
     pre-stop sweep never populates it, since only verification decides the
-    exit code (mirrors A12's phase-1 absorption: "do not over-fire").
+    exit code (mirrors A12's phase-1 absorption: "do not over-fire"); it is
+    ALSO never populated by a container holding none of
+    PARTGRAPH_WATCHED_PORTS (the final Gate 5 review finding 1 scoping —
+    see :func:`find_partgraph_instances` below for the full reasoning).
 
 Public functions (the ONLY public surface; everything else is private):
   - ``find_partgraph_instances(*, engine_prefix: list[str] | None = None,
@@ -172,13 +175,28 @@ Public functions (the ONLY public surface; everything else is private):
     payload). Classifies ownership by EXACT Python string comparison, in this
     PRIORITY order: (1) name == PARTGRAPH_CONTAINER_NAME -> S1; (2) mounts the
     named volume (PARTGRAPH_DATA_VOLUME, never a prefix/suffix/substring
-    match) -> S2; (3) inspect COULD NOT DETERMINE the mount status -> "UNKNOWN"
-    (Gate 5 finding A) — checked BEFORE the port test, regardless of whether
-    the row also holds a watched port: an undetermined mount status is NEVER
-    confidently downgraded to "just a port holder, safe to leave"; (4)
-    positively does not mount the volume AND holds a PARTGRAPH_WATCHED_PORTS
-    host port -> S3; (5) else excluded entirely (not PartGraph's, never
-    returned). ``PARTGRAPH_WATCHED_PORTS`` host ports are extracted from
+    match) -> S2; (3) inspect COULD NOT DETERMINE the mount status AND the row
+    holds a PARTGRAPH_WATCHED_PORTS host port -> "UNKNOWN" (Gate 5 finding A,
+    NARROWED by the final Gate 5 review finding 1: escalation is SCOPED to
+    port holders only — an instance we cannot identify must still be
+    *serving* on one of PartGraph's ports to be the survivor the exit code is
+    about; an un-inspectable container holding NONE of our ports is neither
+    interfering nor PartGraph's business to alarm about, and is EXCLUDED
+    entirely instead, exactly like any other unrelated container — this is
+    what stops a transient `inspect` timeout on, say, an unrelated cve-graph
+    container from making `db down` falsely name it as possibly PartGraph's.
+    The "feared" silent case — a second container quietly mounting
+    PARTGRAPH_DATA_VOLUME without holding our ports — cannot run silently
+    anyway: Badger refuses two writers on one data directory, so it crashes
+    rather than corrupting, and a crashed container is not a
+    ``_is_stoppable`` survivor regardless of this scoping. Substring name
+    matching remains FORBIDDEN as an escalation signal too, exactly as it is
+    forbidden as a stop selector — ports are the only extra signal used, not
+    a "this name looks like ours" heuristic); (4) positively does not mount
+    the volume AND holds a PARTGRAPH_WATCHED_PORTS host port -> S3; (5) else
+    excluded entirely (not PartGraph's, never returned — this now also
+    covers an undetermined mount status on a container holding no watched
+    port). ``PARTGRAPH_WATCHED_PORTS`` host ports are extracted from
     EITHER shape a `ps --format json` ``Ports`` field is observed to take —
     podman's ``list[dict]`` (each entry carrying a ``host_port`` int) OR
     Docker's comma-joined string (e.g. ``"0.0.0.0:8081->8080/tcp"``, Gate 5
@@ -1650,28 +1668,36 @@ def test_stop_all_survivor_and_verification_end_to_end() -> None:
 
 
 # ---------------------------------------------------------------------------
-# [Gate 5 Finding A] An `inspect` failure must never silently manufacture a
-# clean result. `Instance.owned_by` gains a FOURTH tag, "UNKNOWN", for a row
-# that is not S1 (name mismatch) and whose volume-mount status could not be
-# determined (the `container inspect` call failed) — checked BEFORE the port
-# test, so an undetermined mount status is NEVER confidently downgraded to
-# "just a port holder, safe to leave" (mirrors the existing NOT_RUNNING
-# deny-list philosophy: degrade toward suspicion, never toward a silent
-# all-clear). "UNKNOWN" instances are NEVER stopped (same as S3), but
-# DownResult gains `undetermined: tuple[str, ...]` — names of instances still
-# classified UNKNOWN in the FINAL verification pass ONLY (an inspect failure
-# confined to the pre-stop sweep alone is NOT fatal — "do not over-fire",
-# mirrors A12's phase-1 absorption).
+# [Gate 5 Finding A, NARROWED by the final Gate 5 review finding 1] An
+# `inspect` failure must never silently manufacture a clean result, BUT the
+# escalation to `Instance.owned_by == "UNKNOWN"` is SCOPED to containers
+# holding one of PARTGRAPH_WATCHED_PORTS — an instance we cannot identify
+# must still be *serving* on one of PartGraph's own ports to be the survivor
+# the exit code is about; a container holding NONE of our ports, whose
+# inspect merely failed (a transient timeout, say), is EXCLUDED entirely,
+# exactly like any other unrelated container (this is what stops a flaky
+# `inspect` on an unrelated cve-graph container from making `db down`
+# falsely name it as possibly PartGraph's). Substring name matching is
+# FORBIDDEN as an escalation signal, exactly as it is forbidden as a stop
+# selector — only ports narrow the escalation, never a "this name looks
+# like ours" heuristic. "UNKNOWN" instances are NEVER stopped (same as S3),
+# but DownResult gains `undetermined: tuple[str, ...]` — names of instances
+# still classified UNKNOWN in the FINAL verification pass ONLY (an inspect
+# failure confined to the pre-stop sweep alone is NOT fatal — "do not
+# over-fire", mirrors A12's phase-1 absorption).
 # ---------------------------------------------------------------------------
 
 
-def test_inspect_failure_on_non_s1_row_yields_unknown_not_silent_exclusion() -> None:
-    """Gate 5 Finding A: Given a container whose name does NOT match S1 and
-    holds no watched port, whose `container inspect` call FAILS (non-zero
-    exit).
+def test_inspect_failure_on_row_with_no_watched_port_is_excluded_not_unknown() -> None:
+    """[Gate 5 review, Finding 1] Given a container whose name does NOT
+    match S1 and holds NO watched port, whose `container inspect` call
+    FAILS (non-zero exit — e.g. a transient timeout).
     When find_partgraph_instances() is called.
-    Then the row is NOT silently excluded — it is returned with
-    owned_by == "UNKNOWN", never silently dropped as if unrelated.
+    Then the row is EXCLUDED entirely — NOT escalated to "UNKNOWN". An
+    instance we cannot identify must still be serving on one of
+    PartGraph's own ports to be worth alarming about; one that holds none
+    of them is neither interfering nor PartGraph's business, so a flaky
+    inspect on it must never surface in `db down`'s output at all.
     """
     row = _ps_row("id-maybe", "maybe-partgraph-duplicate", "dgraph/standalone:v25.3.4")
     fake_run, _calls = _make_scripted_run(
@@ -1681,21 +1707,23 @@ def test_inspect_failure_on_non_s1_row_yields_unknown_not_silent_exclusion() -> 
     with patch("subprocess.run", side_effect=fake_run):
         instances = find_partgraph_instances(engine_prefix=["docker"])
 
-    assert len(instances) == 1, (
-        f"an inspect failure must not silently exclude the row: {instances!r}"
+    assert instances == (), (
+        "an inspect failure on a port-less, non-S1-named row must be "
+        f"EXCLUDED, never escalated to UNKNOWN: {instances!r}"
     )
-    assert instances[0].id == "id-maybe"
-    assert instances[0].owned_by == "UNKNOWN"
 
 
 def test_inspect_failure_on_row_holding_watched_port_still_unknown_not_s3() -> None:
-    """Gate 5 Finding A: Given a container that ALSO holds a watched port
-    (8081) but whose `inspect` call fails.
+    """Gate 5 Finding A (the POSITIVE half of the Finding 1 scoping): Given
+    a container that DOES hold a watched port (8081) but whose `inspect`
+    call fails.
     When find_partgraph_instances() is called.
-    Then it is classified UNKNOWN, NOT S3 — an undetermined volume-mount
-    status must never be confidently downgraded to "just a port holder,
-    safe to leave"; S3 is reserved for containers POSITIVELY confirmed not
-    to mount our volume.
+    Then it IS classified UNKNOWN (the escalation still fires — holding
+    one of our ports is exactly the condition that makes it worth
+    alarming about), NOT S3: an undetermined volume-mount status must
+    never be confidently downgraded to "just a port holder, safe to
+    leave"; S3 is reserved for containers POSITIVELY confirmed not to
+    mount our volume.
     """
     row = _ps_row("id-maybe-port", "maybe-partgraph-duplicate", "dgraph/standalone:v25.3.4",
                    host_ports=(8081,))
@@ -1710,17 +1738,111 @@ def test_inspect_failure_on_row_holding_watched_port_still_unknown_not_s3() -> N
     assert instances[0].owned_by == "UNKNOWN"
 
 
+def test_stop_all_verification_pass_inspect_failure_on_real_cve_graph_container_stays_clean() -> None:
+    """[Gate 5 review, Finding 1 — HIGHEST PRIORITY NEGATIVE] Given the REAL
+    observed host state (names/images only — the SAME five-container
+    fixture as A6/`test_cve_graph_fixture_selects_nothing`), and a
+    `container inspect` call that FAILS during the VERIFICATION pass ONLY
+    for `cve-alpha` (a transient timeout — cve-alpha holds no watched
+    PartGraph port).
+    When stop_all() runs end-to-end.
+    Then DownResult.undetermined stays EMPTY and cve-alpha is never named
+    as `stopped` or a `survivor` either — a transient inspect failure on a
+    real, unrelated cve-graph container must NEVER make `db down` claim it
+    cannot verify a PartGraph instance. This is the regression pin the
+    review explicitly asked to build from the real host state, not an
+    abstract "plausible duplicate" name.
+    """
+    rows = [
+        _ps_row("cid-minweb", "min-web", "nginx:1.27.3", host_ports=(18080,)),
+        _ps_row("cid-ratel", "cve-ratel", "dgraph/ratel:latest", host_ports=(18000,)),
+        _ps_row("cid-zero", "cve-zero", "dgraph/dgraph:v24.0.0", host_ports=(15080,)),
+        _ps_row("cid-alpha", "cve-alpha", "dgraph/dgraph:v24.0.0", host_ports=(18081, 19081)),
+        _ps_row("cid-loader", "cve-loader", "localhost/cve-loader:latest"),
+    ]
+    mounts_by_id = {
+        "cid-minweb": [],
+        "cid-ratel": [],
+        "cid-zero": _mounts("cve-graph_dgraph_zero", destination="/dgraph"),
+        "cid-alpha": _mounts("cve-graph_dgraph_alpha", destination="/dgraph"),
+        "cid-loader": [],
+    }
+    fake_run, calls = _make_scripted_run(
+        initial_rows=rows, mounts_by_id=mounts_by_id,
+        inspect_fails_ids_by_pass={2: frozenset({"cid-alpha"})},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        result = stop_all(
+            engine_prefix=["docker"], compose_down=lambda: None,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
+
+    assert result.undetermined == (), (
+        "a transient verification-pass inspect failure on a real, "
+        "unrelated cve-graph container holding none of PartGraph's ports "
+        f"must never surface as undetermined: {result!r}"
+    )
+    assert "cve-alpha" not in result.stopped
+    assert "cve-alpha" not in result.survivors
+    for argv, _kwargs in calls:
+        assert not _is_engine_stop_call(argv), (
+            f"cve-alpha must never be a stop target: {argv}"
+        )
+
+
+def test_stop_all_verification_pass_inspect_failure_on_unrelated_port_holder_still_escalates() -> None:
+    """[Gate 5 review, Finding 1 — the scoping's POSITIVE half] Given a
+    container with a perfectly ORDINARY, non-suspicious name (proving the
+    escalation is driven by the PORT, never by "this name looks like
+    ours" — substring name matching is forbidden as an escalation signal,
+    exactly as it is forbidden as a stop selector) that DOES hold one of
+    PARTGRAPH_WATCHED_PORTS, correctly classified S3 (report-only) during
+    the pre-stop sweep, but whose `container inspect` call FAILS during
+    the VERIFICATION pass.
+    When stop_all() runs.
+    Then it STILL escalates to DownResult.undetermined — the port-only
+    narrowing must not silently disable the honesty guarantee Gate 5
+    finding A built: a container actually serving on one of PartGraph's
+    own ports, whose ownership cannot be re-confirmed, must still block a
+    clean result.
+    """
+    row = _ps_row("some-other-service", "some-other-service", "nginx:1.27.3",
+                   host_ports=(8081,))
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row],
+        mounts_by_id={"some-other-service": []},
+        inspect_fails_ids_by_pass={2: frozenset({"some-other-service"})},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        result = stop_all(
+            engine_prefix=["docker"], compose_down=lambda: None,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
+
+    assert result.undetermined == ("some-other-service",), (
+        f"a verification-pass inspect failure on a genuine watched-port "
+        f"holder must still escalate, narrowing or not: {result!r}"
+    )
+    assert "some-other-service" not in result.stopped, (
+        "UNKNOWN is never a stop target, even when it escalates"
+    )
+
+
 def test_stop_all_inspect_fails_both_passes_s2_only_container_marks_undetermined() -> None:
-    """Gate 5 Finding A: Given a container that WOULD classify S2 if inspect
-    succeeded (an "S2-only-named" duplicate — not S1 by name, no watched
-    port), but its `container inspect` call FAILS on BOTH the pre-stop
-    sweep AND the verification pass.
+    """Gate 5 Finding A (narrowed by the final Gate 5 review finding 1):
+    Given a container that WOULD classify S2 if inspect succeeded (an
+    "S2-only-named" duplicate — not S1 by name) and DOES hold one of
+    PartGraph's watched ports (the escalation is now SCOPED to port
+    holders — see the section docstring above), but its `container
+    inspect` call FAILS on BOTH the pre-stop sweep AND the verification
+    pass.
     When stop_all() runs.
     Then DownResult.undetermined contains its name — `db down` must NEVER
     report clean success (empty survivors) while a possibly-still-running
     PartGraph instance's ownership could not be verified.
     """
-    row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4")
+    row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4",
+                   host_ports=(8081,))
     fake_run, _calls = _make_scripted_run(
         initial_rows=[row],
         inspect_fails_ids_by_pass={1: frozenset({"cid-maybe"}), 2: frozenset({"cid-maybe"})},
@@ -1743,14 +1865,18 @@ def test_stop_all_inspect_fails_both_passes_s2_only_container_marks_undetermined
 
 
 def test_stop_all_inspect_fails_only_during_verification_marks_undetermined() -> None:
-    """Gate 5 Finding A: Given the SAME S2-only-named container, but inspect
-    SUCCEEDS during the pre-stop sweep (correctly classified S2, so a
-    `stop` IS attempted and SUCCEEDS) yet FAILS again during the
-    verification pass (a transient re-failure). `db down`'s verb surface
-    is `stop`-only, never `rm` (ADR-0021): a real engine still LISTS a
-    stopped container under `ps --all` — it does not vanish — so the
-    verification pass genuinely re-enumerates and re-inspects this exact
-    row, and THAT inspect call is the one that fails.
+    """Gate 5 Finding A (narrowed by the final Gate 5 review finding 1):
+    Given the SAME S2-only-named container, ALSO holding one of
+    PartGraph's watched ports (each pass independently re-determines mount
+    status, so the verification pass's own escalation must independently
+    satisfy the port-scoping too — pass 1's S2 classification does not
+    carry over), but inspect SUCCEEDS during the pre-stop sweep (correctly
+    classified S2, so a `stop` IS attempted and SUCCEEDS) yet FAILS again
+    during the verification pass (a transient re-failure). `db down`'s
+    verb surface is `stop`-only, never `rm` (ADR-0021): a real engine
+    still LISTS a stopped container under `ps --all` — it does not vanish
+    — so the verification pass genuinely re-enumerates and re-inspects
+    this exact row, and THAT inspect call is the one that fails.
     When stop_all() runs.
     Then the container's name is in BOTH `DownResult.stopped` (a `stop`
     call WAS issued and the engine reported success — that fact is real
@@ -1763,7 +1889,8 @@ def test_stop_all_inspect_fails_only_during_verification_marks_undetermined() ->
     independently verified by the implementer against the (unchanged)
     production contract.
     """
-    row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4")
+    row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4",
+                   host_ports=(8081,))
     fake_run, _calls = _make_scripted_run(
         initial_rows=[row],
         mounts_by_id={"cid-maybe": _mounts(PARTGRAPH_DATA_VOLUME)},

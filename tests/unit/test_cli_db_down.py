@@ -720,25 +720,33 @@ def test_a9_verification_empty_but_health_still_200_exit_zero_with_advisory() ->
 
 
 # ---------------------------------------------------------------------------
-# [Gate 5 Finding A] An `inspect` failure during verification must never
-# silently forge a clean `db down`. Pins the CLI-boundary exit-code/message
-# contract; see tests/unit/test_lifecycle.py for the leaf-level
-# `Instance.owned_by == "UNKNOWN"` / `DownResult.undetermined` contract this
-# is built on.
+# [Gate 5 Finding A, NARROWED by the final Gate 5 review finding 1] An
+# `inspect` failure during verification must never silently forge a clean
+# `db down` — BUT the escalation to "UNKNOWN"/`undetermined` is SCOPED to
+# containers holding one of PARTGRAPH_WATCHED_PORTS, so a transient inspect
+# failure on an unrelated container (e.g. a cve-graph container, holding
+# none of PartGraph's ports) can never false-alarm `db down` by naming it as
+# possibly PartGraph's. Pins the CLI-boundary exit-code/message contract;
+# see tests/unit/test_lifecycle.py for the leaf-level
+# `Instance.owned_by == "UNKNOWN"` / `DownResult.undetermined` / port-scoping
+# contract this is built on.
 # ---------------------------------------------------------------------------
 
 
 def test_finding_a_inspect_fails_both_passes_exit_nonzero_undetermined_message() -> None:
-    """Gate 5 Finding A: Given an S2-only-named container (name != S1, holds
-    no watched port) whose `container inspect` call FAILS on BOTH the
-    pre-stop sweep AND the verification pass.
+    """Gate 5 Finding A (narrowed by finding 1): Given an S2-only-named
+    container (name != S1) that DOES hold one of PartGraph's watched ports
+    — the escalation is now scoped to port holders — whose `container
+    inspect` call FAILS on BOTH the pre-stop sweep AND the verification
+    pass.
     When `partgraph db down` runs.
     Then the exit code is 1, and some output line names the container AND
     contains the phrase "could not verify" — deliberately NOT containing
     "still running", so the message is textually distinguishable from the
     A8 survivor message — and that line is path-free.
     """
-    row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4")
+    row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4",
+                   host_ports=(8081,))
     fake_run, _calls = _make_scripted_run(
         initial_rows=[row],
         inspect_fails_ids_by_pass={1: frozenset({"cid-maybe"}), 2: frozenset({"cid-maybe"})},
@@ -768,13 +776,17 @@ def test_finding_a_inspect_fails_both_passes_exit_nonzero_undetermined_message()
 
 
 def test_finding_a_inspect_fails_only_verification_pass_exit_nonzero() -> None:
-    """Gate 5 Finding A: Given the SAME S2-only-named container, but inspect
-    SUCCEEDS during the pre-stop sweep (correctly classified S2, so a
-    `stop` IS attempted and SUCCEEDS) and FAILS only during the
-    verification pass. `db down`'s verb surface is `stop`-only, never
-    `rm`, so the successfully-stopped row is STILL listed by `ps --all`
-    (now `exited`) — the verification pass genuinely re-enumerates and
-    re-inspects it, and that second inspect call is the one that fails.
+    """Gate 5 Finding A (narrowed by finding 1): Given the SAME
+    S2-only-named container, ALSO holding one of PartGraph's watched ports
+    (each pass independently re-determines mount status, so the
+    verification pass's escalation must independently satisfy the
+    port-scoping too), but inspect SUCCEEDS during the pre-stop sweep
+    (correctly classified S2, so a `stop` IS attempted and SUCCEEDS) and
+    FAILS only during the verification pass. `db down`'s verb surface is
+    `stop`-only, never `rm`, so the successfully-stopped row is STILL
+    listed by `ps --all` (now `exited`) — the verification pass genuinely
+    re-enumerates and re-inspects it, and that second inspect call is the
+    one that fails.
     When `partgraph db down` runs.
     Then the exit code is still 1 with the same "could not verify" message
     — a verification-pass-only failure is sufficient on its own to
@@ -782,7 +794,8 @@ def test_finding_a_inspect_fails_only_verification_pass_exit_nonzero() -> None:
     stopped...") is NOT what the command exits on: the "could not verify"
     branch returns before it, even though a stop genuinely was issued.
     """
-    row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4")
+    row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4",
+                   host_ports=(8081,))
     fake_run, _calls = _make_scripted_run(
         initial_rows=[row],
         mounts_by_id={"cid-maybe": _mounts(PARTGRAPH_DATA_VOLUME)},
@@ -804,6 +817,89 @@ def test_finding_a_inspect_fails_only_verification_pass_exit_nonzero() -> None:
         "the undetermined-ownership exit path must not ALSO print the "
         f"ordinary clean-success line: {result.output!r}"
     )
+
+
+def test_finding_1_verification_pass_inspect_failure_on_real_cve_graph_container_exit_zero() -> None:
+    """[Gate 5 review, Finding 1 — HIGHEST PRIORITY NEGATIVE] Given the REAL
+    observed host state (the SAME five-container cve-graph fixture as A6),
+    and a `container inspect` call that FAILS during the VERIFICATION
+    pass ONLY for `cve-alpha` (a transient timeout; cve-alpha holds none
+    of PartGraph's watched ports).
+    When `partgraph db down` runs.
+    Then the exit code is 0 and NO line in the output names cve-alpha or
+    says "could not verify" — a transient inspect failure on a real,
+    unrelated cve-graph container must never surface in `db down`'s
+    output at all, let alone make it exit non-zero.
+    """
+    rows = [
+        _ps_row("cid-minweb", "min-web", "nginx:1.27.3", host_ports=(18080,)),
+        _ps_row("cid-ratel", "cve-ratel", "dgraph/ratel:latest", host_ports=(18000,)),
+        _ps_row("cid-zero", "cve-zero", "dgraph/dgraph:v24.0.0", host_ports=(15080,)),
+        _ps_row("cid-alpha", "cve-alpha", "dgraph/dgraph:v24.0.0", host_ports=(18081, 19081)),
+        _ps_row("cid-loader", "cve-loader", "localhost/cve-loader:latest"),
+    ]
+    mounts_by_id = {
+        "cid-minweb": [],
+        "cid-ratel": [],
+        "cid-zero": _mounts("cve-graph_dgraph_zero"),
+        "cid-alpha": _mounts("cve-graph_dgraph_alpha"),
+        "cid-loader": [],
+    }
+    fake_run, calls = _make_scripted_run(
+        initial_rows=rows, mounts_by_id=mounts_by_id,
+        inspect_fails_ids_by_pass={2: frozenset({"cid-alpha"})},
+    )
+    with (
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "down"])
+
+    assert result.exit_code == 0, result.output
+    assert "cve-alpha" not in result.output, (
+        f"a transient inspect failure on a real, unrelated cve-graph "
+        f"container must never surface in db down's output: {result.output!r}"
+    )
+    assert "could not verify" not in result.output.lower()
+    for argv, _kwargs in calls:
+        assert not _is_engine_stop_call(argv), f"cve-alpha must never be stopped: {argv}"
+
+
+def test_finding_1_verification_pass_inspect_failure_on_unrelated_port_holder_exit_nonzero() -> None:
+    """[Gate 5 review, Finding 1 — the scoping's POSITIVE half] Given a
+    container with a perfectly ORDINARY, non-suspicious name (proving the
+    escalation is driven by the PORT, never by a "this name looks like
+    ours" heuristic) that DOES hold one of PartGraph's watched ports,
+    correctly classified S3 (report-only) during the pre-stop sweep, but
+    whose `container inspect` call FAILS during the verification pass.
+    When `partgraph db down` runs.
+    Then the exit code is still 1 with the "could not verify" message —
+    the port-only narrowing must not silently disable the honesty
+    guarantee for a container genuinely serving on one of PartGraph's own
+    ports.
+    """
+    row = _ps_row("some-other-service", "some-other-service", "nginx:1.27.3",
+                   host_ports=(8081,))
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row],
+        mounts_by_id={"some-other-service": []},
+        inspect_fails_ids_by_pass={2: frozenset({"some-other-service"})},
+    )
+    with (
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "down"])
+
+    assert result.exit_code == 1, result.output
+    assert "some-other-service" in result.output
+    assert "could not verify" in result.output.lower()
 
 
 def test_finding_a_inspect_fails_only_pre_stop_sweep_not_fatal_exit_zero() -> None:
@@ -859,6 +955,81 @@ def test_finding_a_inspect_succeeds_everywhere_clean_exit_zero_no_new_noise() ->
     assert result.exit_code == 0, result.output
     assert "could not verify" not in result.output.lower()
     assert "undetermined" not in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# [Gate 5 review, Finding 3] When BOTH a genuine survivor AND an
+# unverifiable ("could not verify") container are present simultaneously,
+# `db down`'s current `if result.survivors: ... raise typer.Exit(1)` branch
+# returns before the `if result.undetermined:` branch is ever reached, so
+# the operator only ever hears about the survivor — the undetermined
+# container's name is silently dropped. Exit code is right either way (1),
+# but the information loss is real. Pins that BOTH names are reported when
+# both are non-empty, with the two conditions' phrasing kept textually
+# distinct — "still running" for survivors, "could not verify" for
+# undetermined, never mixed into one sentence — since
+# test_finding_a_inspect_fails_both_passes_exit_nonzero_undetermined_message
+# already relies on that distinction holding.
+# ---------------------------------------------------------------------------
+
+
+def test_finding_3_survivor_and_undetermined_co_occurrence_both_reported() -> None:
+    """[Gate 5 review, Finding 3] Given ONE genuine survivor (its `stop`
+    call fails, so it is still running after verification) AND ONE
+    SEPARATE, unrelated container whose ownership could not be verified (a
+    `container inspect` failure during verification, on a container
+    holding one of PartGraph's watched ports) present SIMULTANEOUSLY.
+    When `partgraph db down` runs.
+    Then BOTH names are reported somewhere in the output — the operator
+    must not silently lose the "could not verify" information just
+    because a genuine survivor also exists — each under its OWN, textually
+    DISTINCT phrasing ("still running" for the survivor's line(s), "could
+    not verify" for the undetermined one's line(s); neither phrase leaks
+    into the other's line), and the exit code is 1.
+    """
+    row_survivor = _ps_row("cid-survivor", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+    row_undetermined = _ps_row("cid-flaky", "some-other-service", "nginx:1.27.3",
+                                host_ports=(9081,))
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row_survivor, row_undetermined],
+        mounts_by_id={"cid-survivor": [], "cid-flaky": []},
+        stop_fails_ids=frozenset({"cid-survivor"}),
+        inspect_fails_ids_by_pass={2: frozenset({"cid-flaky"})},
+    )
+    with (
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "down"])
+
+    assert result.exit_code == 1, result.output
+
+    survivor_lines = [
+        ln for ln in result.output.splitlines() if PARTGRAPH_CONTAINER_NAME in ln
+    ]
+    undetermined_lines = [
+        ln for ln in result.output.splitlines() if "some-other-service" in ln
+    ]
+    assert survivor_lines, (
+        f"the survivor's name must appear in the output: {result.output!r}"
+    )
+    assert undetermined_lines, (
+        "the undetermined container's name must NOT be silently dropped "
+        f"just because a survivor also exists: {result.output!r}"
+    )
+    for ln in survivor_lines:
+        assert "still running" in ln.lower(), f"survivor line missing its phrasing: {ln!r}"
+        assert "could not verify" not in ln.lower(), (
+            f"the two conditions' phrasing must never mix into one sentence: {ln!r}"
+        )
+    for ln in undetermined_lines:
+        assert "could not verify" in ln.lower(), f"undetermined line missing its phrasing: {ln!r}"
+        assert "still running" not in ln.lower(), (
+            f"the two conditions' phrasing must never mix into one sentence: {ln!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
