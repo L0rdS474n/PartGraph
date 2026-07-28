@@ -244,7 +244,7 @@ from partgraph.util.activity import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-def _dt(  # noqa: PLR0913 — a fixed-instant builder needs one arg per field.
+def _dt(  # noqa: PLR0913, PLR0917 — a fixed-instant builder needs one arg per field.
     year, month, day, hour=0, minute=0, second=0, microsecond=0
 ) -> datetime:
     return datetime(year, month, day, hour, minute, second, microsecond, tzinfo=UTC)

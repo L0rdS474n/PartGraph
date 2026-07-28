@@ -82,7 +82,7 @@ SCHEDULING_DOC_REL = "docs/scheduling.md"
 IDLE_STOP_SERVICE_REL = "systemd/partgraph-db-idle-stop.service"
 
 
-def _dt(y, m, d, h=0, mi=0, s=0) -> datetime:  # noqa: PLR0913
+def _dt(y, m, d, h=0, mi=0, s=0) -> datetime:  # noqa: PLR0913, PLR0917
     return datetime(y, m, d, h, mi, s, tzinfo=UTC)
 
 
