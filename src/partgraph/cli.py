@@ -43,7 +43,15 @@ from partgraph.refresh.stock import (
 from partgraph.util.container import ContainerEngineError, compose_command, engine_command
 from partgraph.util.health import DGRAPH_HTTP_HEALTH_URL, probe_health
 from partgraph.util.index_health import check_index_integrity
-from partgraph.util.lifecycle import DownResult, stop_all
+from partgraph.util.lifecycle import (
+    PARTGRAPH_DATA_VOLUME,
+    PARTGRAPH_UNIT_NAME,
+    DownResult,
+    find_partgraph_instances,
+    stop_all,
+    unit_state,
+    volume_exists,
+)
 
 # ``get_encoder`` is imported at module level (not lazily) ON PURPOSE: the test
 # suite patches it as ``patch.object(cli, "get_encoder", ...)`` for both the
@@ -543,6 +551,216 @@ def check_index() -> None:
     else:
         _err_console.print(result.message, markup=False, soft_wrap=True)
     raise typer.Exit(code=0 if exit_ok else 1)
+
+
+# ---------------------------------------------------------------------------
+# db doctor — read-only diagnostic (ADR-0022)
+# ---------------------------------------------------------------------------
+
+#: The two :attr:`partgraph.util.lifecycle.Instance.owned_by` tags that mark a
+#: container as PartGraph's own. Read straight off that field's own documented
+#: value domain (ADR-0021 Section 2's locked S1/S2/UNKNOWN/S3 table); "S3" is a
+#: foreign container merely holding one of our ports and "UNKNOWN" is an
+#: ownership question the enumeration could not answer. Neither is ever
+#: presented as PartGraph's.
+_DOCTOR_OWNED_TAGS = frozenset({"S1", "S2"})
+_DOCTOR_PORT_HOLDER_TAG = "S3"
+
+#: The operator-run remediation, printed on EVERY `db doctor` run rather than
+#: only when autostart happens to be on: it is a static runbook line, and a
+#: reader who has just been told autostart is "unknown" needs it just as much as
+#: one who has been told it is "yes".
+#:
+#: This is DISPLAY TEXT ONLY. `partgraph` never writes into the systemd user
+#: unit directory and never reloads the unit files itself — that directory is
+#: shared with five units belonging to an unrelated stack (ADR-0021), so writing
+#: there would mean mutating files this repository does not own. The rule is
+#: enforced mechanically, not by prose, in
+#: tests/unit/test_repo_never_executes_lifecycle_mutations.py: these strings may
+#: exist because they only ever reach a `print`, never a subprocess or a file
+#: write.
+_DOCTOR_REMEDIATION_LINES: tuple[str, ...] = (
+    "To stop the database starting at every login, remove the unit's",
+    "WantedBy= value with a drop-in (never by editing the generated file):",
+    "  1. mkdir -p ~/.config/containers/systemd/partgraph-dgraph.container.d",
+    "  2. In that directory, create override.conf containing an [Install]",
+    "     section whose only line is an empty WantedBy= (this clears the",
+    "     inherited default.target, which no systemctl subcommand can do for",
+    "     a quadlet-generated unit).",
+    "  3. Apply it with: systemctl --user daemon-reload",
+    "Edit only partgraph-dgraph.container.d there. That directory holds other",
+    "projects' units too; do not touch them.",
+    "Full procedure, and the StopTimeout= caveat: docs/db-lifecycle.md",
+)
+
+
+def _doctor_wanted_by_line(wanted_by_default: bool | None) -> str:
+    """Render the autostart-at-login verdict, never guessing an unknown one.
+
+    Tri-state, mirroring the field it reports: an undeterminable answer prints
+    as "unknown" and asserts NEITHER direction. A diagnostic that turns "I could
+    not tell" into "no" is worse than one that says nothing.
+    """
+    if wanted_by_default is None:
+        return (
+            "Autostart at login (WantedBy=default.target): unknown - systemd "
+            "reported neither answer, so this is left undetermined."
+        )
+    if wanted_by_default:
+        return (
+            "Autostart at login (WantedBy=default.target): yes - the unit "
+            "starts at every login, whether or not partgraph is invoked."
+        )
+    return (
+        "Autostart at login (WantedBy=default.target): the unit is wanted by "
+        "some other target, so it does not start at login."
+    )
+
+
+def _doctor_unit_lines() -> tuple[str, ...]:
+    """Report the quadlet unit's presence, raw systemd states, and autostart.
+
+    ``LoadState``/``ActiveState`` are printed VERBATIM: they are raw, unvalidated
+    text from ``systemctl show``, and paraphrasing them would hide exactly the
+    detail an operator is running this command to see. They are safe to print
+    verbatim only because every ``db doctor`` line goes through the single
+    ``markup=False`` funnel in :func:`doctor`.
+    """
+    state = unit_state()
+    presence = "present" if state.present else "not present on this host"
+    return (
+        f"Unit {PARTGRAPH_UNIT_NAME}: {presence}. "
+        f"LoadState={state.load_state or 'unknown'}. "
+        f"ActiveState={state.active_state or 'unknown'}.",
+        _doctor_wanted_by_line(state.wanted_by_default),
+    )
+
+
+def _doctor_instance_lines(engine_prefix: list[str] | None) -> tuple[str, ...]:
+    """Report what PartGraph's own selector policy (ADR-0021) currently sees.
+
+    Diverges from ``db down`` on purpose: ``db down`` turns a missing engine or
+    a failed enumeration into an exit-1 error, because it cannot do its job
+    without them. ``doctor`` only ever reports, so both are findings it states
+    plainly and keeps going — a diagnostic that refuses to run because the thing
+    it diagnoses is broken is not a diagnostic.
+    """
+    if engine_prefix is None:
+        return (
+            "PartGraph instances: could not be determined - no container "
+            "engine was found on PATH.",
+        )
+    try:
+        instances = find_partgraph_instances(engine_prefix=engine_prefix)
+    except (OSError, subprocess.SubprocessError):
+        # The leaf deliberately does NOT absorb this: an enumeration that never
+        # happened must never degrade to an empty tuple, which would read here
+        # as "nothing is running". Absorbed at THIS layer instead, and reported
+        # as the unknown it is.
+        return (
+            "PartGraph instances: could not be enumerated - the container "
+            "engine did not answer.",
+        )
+
+    lines: list[str] = []
+    owned = [inst for inst in instances if inst.owned_by in _DOCTOR_OWNED_TAGS]
+    if owned:
+        lines.extend(
+            f"Running PartGraph instance: {inst.name} "
+            f"(selector {inst.owned_by}, status {inst.status}, image {inst.image})."
+            for inst in owned
+        )
+    else:
+        lines.append("No PartGraph instance is running.")
+    lines.extend(
+        f"Report-only, never stopped, not PartGraph's: {inst.name} "
+        f"(holds PartGraph host port(s) {', '.join(str(p) for p in inst.ports)})."
+        for inst in instances
+        if inst.owned_by == _DOCTOR_PORT_HOLDER_TAG
+    )
+    lines.extend(
+        f"Ownership could not be verified: {inst.name} holds a PartGraph host "
+        "port, but its volume mounts could not be read."
+        for inst in instances
+        if inst.owned_by not in _DOCTOR_OWNED_TAGS
+        and inst.owned_by != _DOCTOR_PORT_HOLDER_TAG
+    )
+    return tuple(lines)
+
+
+def _doctor_volume_line(engine_prefix: list[str] | None) -> str:
+    """Report whether the named data volume exists, tri-state and never guessed."""
+    if engine_prefix is None:
+        return (
+            f"Data volume {PARTGRAPH_DATA_VOLUME}: unknown - no container "
+            "engine was found on PATH."
+        )
+    exists = volume_exists(engine_prefix=engine_prefix)
+    if exists is None:
+        return (
+            f"Data volume {PARTGRAPH_DATA_VOLUME}: unknown - the engine could "
+            "not be asked."
+        )
+    if exists:
+        return f"Data volume {PARTGRAPH_DATA_VOLUME}: present (db down never removes it)."
+    return (
+        f"Data volume {PARTGRAPH_DATA_VOLUME}: absent - nothing has been "
+        "ingested on this host yet."
+    )
+
+
+@db_app.command("doctor")
+def doctor() -> None:
+    """Report the database's lifecycle state without changing any of it.
+
+    Shows what is running under PartGraph's own selector policy (ADR-0021),
+    whether the quadlet systemd user unit exists and will start the database at
+    the next login, whether the named data volume exists, and the exact
+    operator-run steps for removing that autostart. It reads only: no container
+    is started or stopped, and no systemd file is ever written or reloaded.
+
+    EXIT CODE: always 0 once the command ran. It carries NO health signal, and
+    is deliberately unlike `db status`, `db check-index` and `db down`, whose
+    non-zero exits mean something is wrong. Every finding here — including a
+    missing container engine, an unreachable engine, or a database that is up
+    when you expected it down — is reported in the OUTPUT and still exits 0.
+    Do not wire this command into monitoring expecting otherwise; use
+    `db status` for that.
+    """
+    # Resolved ONCE, mirroring `db down`'s own pattern — but a failure here is a
+    # FINDING, not fatal (see _doctor_instance_lines). A fixed message is used
+    # rather than the exception's own text: `doctor` contracts every line to be
+    # path-free, and the detection error is free to mention a path.
+    try:
+        engine_prefix: list[str] | None = engine_command()
+    except ContainerEngineError:
+        engine_prefix = None
+
+    # ORDER IS LOAD-BEARING, and not merely cosmetic: PARTGRAPH_UNIT_NAME
+    # ("partgraph-dgraph.service") CONTAINS PARTGRAPH_CONTAINER_NAME
+    # ("partgraph-dgraph") as a substring, so a reader (or a test) looking for
+    # the first line that mentions the container would hit the unit line
+    # instead if the unit section came first. Instances -> unit -> volume ->
+    # remediation also happens to read best: what is running now, what will
+    # start it again, what data exists, and what to do about it.
+    lines: list[str] = [
+        *_doctor_instance_lines(engine_prefix),
+        *_doctor_unit_lines(),
+        _doctor_volume_line(engine_prefix),
+        # Blank separator: everything above is a FINDING about this host,
+        # everything below is a fixed runbook. Running them together reads as
+        # if the instructions were themselves a finding.
+        "",
+        *_DOCTOR_REMEDIATION_LINES,
+    ]
+    # ONE print funnel for the whole command, on purpose. Every value above is
+    # raw engine- or systemd-derived text, so `markup=False` must hold for all
+    # of it; a single call makes that structural rather than a per-field habit
+    # that a later line can forget. `soft_wrap=True` keeps each contracted
+    # single line on one line instead of letting Rich fold it at the console
+    # width (same discipline as `db down`/`db check-index`).
+    for line in lines:
+        _console.print(line, markup=False, soft_wrap=True)
 
 
 # ---------------------------------------------------------------------------

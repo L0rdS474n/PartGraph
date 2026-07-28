@@ -84,6 +84,17 @@ a host that has both installed).
 > `default.target` will start again at your next login. See
 > [ADR-0021](docs/decisions/ADR-0021-db-down-all-lifecycle-owners.md).
 
+> [!TIP]
+> **Is the database starting itself at every login?** Run `partgraph db doctor`
+> — a read-only diagnostic that reports what is running, whether that systemd
+> unit exists and will start the database at your next login, whether the data
+> volume exists, and how to stop it. It changes nothing and always exits 0 (use
+> `partgraph db status` when you want an exit code that means something). The
+> autostart itself lives in a unit file on your host, so PartGraph documents the
+> removal rather than doing it for you:
+> **[Database lifecycle](docs/db-lifecycle.md)**, with the reasoning in
+> [ADR-0022](docs/decisions/ADR-0022-database-lifecycle-on-demand.md).
+
 Once the database is up and populated, see **[Connecting to PartGraph](docs/connecting.md)**
 for a full guide to querying the graph from the Dgraph MCP plugin, plain Dgraph
 clients (gRPC / HTTP), AI/LLM query recipes, and the bundled `partgraph` CLI.
