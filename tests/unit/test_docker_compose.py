@@ -10,23 +10,38 @@ configuration required:
 - Host-side port strings "8080:" and "9080:" must NOT appear
 - No "0.0.0.0" anywhere in the file
 - stop_grace_period matches STOP_GRACE_SECONDS (Gate 7 — see below)
+- init: true is declared, and only WITH it is stop_grace_period meaningful
+  for this image (Gate 8 — see below)
 
-Gate 7 addition: live journal evidence on this host proved Compose's own
-10s stop_grace_period DEFAULT (the same default a bare `docker/podman stop`
-without an explicit `-t` uses) insufficient under load — after a 14h run,
-`StopSignal SIGTERM failed to stop container partgraph-dgraph in 10
-seconds, resorting to SIGKILL` (unit exit status 137). Without an explicit
-`stop_grace_period:`, a Compose-started instance inherits that same 10s
-default, so it needs the SAME fix `partgraph.util.lifecycle.
-STOP_GRACE_SECONDS` (our own engine `stop` sweep's budget) already pins.
-`STOP_GRACE_SECONDS` is imported directly (never re-declared as a second
-literal) so the two pins can never silently drift apart — a change to one
-without the other fails this test.
+Gate 7 addition: a live 14h-run journal entry first surfaced this
+(`StopSignal SIGTERM failed to stop container partgraph-dgraph in 10
+seconds, resorting to SIGKILL`, unit exit status 137). Without an explicit
+`stop_grace_period:`, a Compose-started instance inherits Compose's own 10s
+default (the same default a bare `docker/podman stop` without an explicit
+`-t` uses), so it needs the SAME budget
+`partgraph.util.lifecycle.STOP_GRACE_SECONDS` (our own engine `stop`
+sweep's budget) already pins. `STOP_GRACE_SECONDS` is imported directly
+(never re-declared as a second literal) so the two pins can never silently
+drift apart — a change to one without the other fails this test.
 
-HONESTY BOUNDARY: this ONLY covers Compose-started instances. It does NOT
-reach the quadlet/systemd path — that unit's `ExecStop=podman rm -v -f`
-uses whatever stop-timeout was baked in at quadlet-generation time,
-independent of this file, and remains PR-B1 territory.
+Gate 8 CORRECTION: the original "10s is insufficient because Dgraph needs
+more time to flush under load" story was DISPROVEN by a direct
+re-measurement — a container up for barely one minute, essentially nothing
+to flush, ALSO timed out on `podman stop -t 60` and was SIGKILLed (60.2s,
+exit 137). The real, structural cause: dgraph/standalone:v25.3.4's
+`/run.sh` runs `dgraph alpha` in the FOREGROUND under bash as PID 1
+(upstream's own comment: `# TODO properly handle SIGTERM for all three
+processes`), and bash defers delivering a signal to a still-running
+foreground command — SIGTERM is NEVER forwarded to `dgraph alpha`,
+independent of uptime or load. So `stop_grace_period` ALONE, without
+`init: true`, is close to useless for this image — pinned below,
+separately from the raw value match, and pinned TOGETHER.
+
+HONESTY BOUNDARY: this ONLY covers Compose-started instances, and even
+then only once `init: true` is set (see above). It does NOT reach the
+quadlet/systemd path — that unit's `ExecStop=podman rm -v -f` uses
+whatever stop-timeout was baked in at quadlet-generation time, independent
+of this file, and remains PR-B1 territory.
 """
 
 from __future__ import annotations
@@ -377,12 +392,16 @@ def _normalize_duration_seconds(value: object) -> float:
 def test_dgraph_service_declares_stop_grace_period_matching_engine_budget(
     compose_config: dict,
 ) -> None:
-    """Gate 7: Given a Compose-started instance must get the SAME shutdown
-    window as our own engine `stop` sweep
+    """Gate 7 (corrected under Gate 8): Given a Compose-started instance
+    must get the SAME shutdown budget as our own engine `stop` sweep
     (`partgraph.util.lifecycle.STOP_GRACE_SECONDS`) — without an explicit
     `stop_grace_period`, Compose falls back to its own 10s default, the
-    same insufficient window that produced a live SIGKILL (unit exit
-    status 137) after a 14h run on this host.
+    same default that first surfaced this via a live SIGKILL (unit exit
+    status 137) after a 14h run. NOTE: raising this value ALONE does not
+    make shutdown graceful for this image — see
+    `test_dgraph_service_declares_init_true_so_sigterm_can_reach_dgraph`
+    below for why; this test only pins that the NUMBER matches, not that
+    the number is sufficient by itself.
     When we inspect the dgraph service configuration.
     Then it must declare `stop_grace_period` equal to STOP_GRACE_SECONDS
     (imported directly from partgraph.util.lifecycle, never re-declared as
@@ -398,9 +417,7 @@ def test_dgraph_service_declares_stop_grace_period_matching_engine_budget(
             stop_grace_period = svc.get("stop_grace_period")
             assert stop_grace_period is not None, (
                 f"Service '{svc_name}' does not declare 'stop_grace_period'. "
-                "Without it, Compose falls back to its own 10s default — the "
-                "same insufficient window that produced a live SIGKILL (exit "
-                "137) after a 14h run on this host."
+                "Without it, Compose falls back to its own 10s default."
             )
             normalized = _normalize_duration_seconds(stop_grace_period)
             assert normalized == float(STOP_GRACE_SECONDS), (
@@ -414,4 +431,112 @@ def test_dgraph_service_declares_stop_grace_period_matching_engine_budget(
     pytest.fail(
         "No dgraph service found in docker-compose.yml — cannot verify "
         f"stop_grace_period. Services: {list(services.keys())}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate 8 — init: true is required for stop_grace_period to mean anything on
+# this image. Live-verified on this host: WITHOUT init, `podman stop -t 60`
+# on a container up for barely a minute (essentially nothing to flush) still
+# timed out and SIGKILLed (60.2s, exit 137) — disproving the original
+# "Dgraph needs more time to flush under load" hypothesis outright. WITH
+# `init: true`, the SAME stop completed in 0.2s with a genuine SIGTERM exit
+# (143). The experimental compose edit used to measure this was reverted;
+# this test pins the fix as a requirement for the pipeline to apply, not as
+# a record of a host change.
+# ---------------------------------------------------------------------------
+
+def test_dgraph_service_declares_init_true_so_sigterm_can_reach_dgraph(
+    compose_config: dict,
+) -> None:
+    """Gate 8: WHY this flag exists — recorded here so a future reader who
+    does not know the reason does not delete it as noise.
+
+    dgraph/standalone:v25.3.4 has no ENTRYPOINT and no STOPSIGNAL; its
+    CMD is `/run.sh`, which reads (verbatim, upstream's OWN comment):
+
+        # TODO properly handle SIGTERM for all three processes.
+        dgraph zero &
+        dgraph alpha
+
+    PID 1 is bash running that script, with `dgraph alpha` as bash's
+    FOREGROUND command. Bash defers delivering a received signal to its
+    own handling until the foreground command exits — so a SIGTERM sent to
+    PID 1 is NEVER forwarded to `dgraph alpha` at all, regardless of grace
+    period or how long the container has been running. This is why simply
+    raising STOP_GRACE_SECONDS (Gate 7) did not fix graceful shutdown: a
+    container up for barely a minute, with essentially nothing to flush,
+    still failed `podman stop -t 60` and was SIGKILLed (60.2s, exit 137,
+    live-measured on this host) — disproving "needs more time to flush"
+    as the cause.
+
+    `init: true` inserts a real init process (podman's `podman-init`/tini)
+    as PID 1 instead of bash. An init process DOES forward SIGTERM to its
+    child, so `dgraph alpha` actually receives it. With `init: true` set,
+    the SAME stop completed in 0.2s with exit code 143 (a genuine SIGTERM
+    exit, not a SIGKILL) — live-measured on this host. No stop_grace_period
+    value can substitute for this: the signal must physically reach the
+    process first.
+
+    When we inspect the dgraph service configuration.
+    Then it must declare `init: true`.
+    """
+    services = compose_config.get("services", {})
+    assert services, "No services defined in docker-compose.yml"
+
+    for svc_name, svc in services.items():
+        image = svc.get("image", "")
+        if "dgraph" in image.lower():
+            assert svc.get("init") is True, (
+                f"Service '{svc_name}' does not declare 'init: true'. "
+                "Without an init process as PID 1, SIGTERM never reaches "
+                "`dgraph alpha` — bash (dgraph/standalone's own PID 1 via "
+                "/run.sh) defers signal delivery until its foreground "
+                "command exits, and upstream's own /run.sh carries the "
+                "acknowledged TODO 'properly handle SIGTERM for all three "
+                "processes'. No stop_grace_period value can compensate: "
+                "the container will always be SIGKILLed without this."
+            )
+            return
+
+    pytest.fail(
+        "No dgraph service found in docker-compose.yml — cannot verify "
+        f"'init: true'. Services: {list(services.keys())}"
+    )
+
+
+def test_stop_grace_period_and_init_true_are_declared_together(
+    compose_config: dict,
+) -> None:
+    """Gate 8: Given a `stop_grace_period` on this image is close to
+    useless without `init: true` alongside it (SIGTERM never reaches
+    `dgraph alpha` otherwise — see the previous test's docstring for the
+    full mechanism), the two configuration keys are not independent
+    concerns; they are one fix with two parts.
+    When we inspect the dgraph service configuration.
+    Then `init` must be truthy WHENEVER `stop_grace_period` is declared —
+    catches a future regression where one is bumped/removed without the
+    other (e.g. someone raises `stop_grace_period` further, or removes
+    `init: true` during an unrelated edit, without realising the budget is
+    then meaningless again).
+    """
+    services = compose_config.get("services", {})
+    assert services, "No services defined in docker-compose.yml"
+
+    for svc_name, svc in services.items():
+        image = svc.get("image", "")
+        if "dgraph" in image.lower():
+            if svc.get("stop_grace_period") is not None:
+                assert svc.get("init") is True, (
+                    f"Service '{svc_name}' declares 'stop_grace_period' "
+                    "without 'init: true'. For dgraph/standalone, a grace "
+                    "period alone cannot produce a graceful shutdown — "
+                    "SIGTERM never reaches `dgraph alpha` without an init "
+                    "process forwarding it. The two belong together."
+                )
+            return
+
+    pytest.fail(
+        "No dgraph service found in docker-compose.yml — cannot verify the "
+        f"stop_grace_period/init relationship. Services: {list(services.keys())}"
     )

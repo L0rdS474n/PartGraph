@@ -54,26 +54,54 @@ Module constants (frozen, named — never derived at runtime):
     ``None`` (unbounded).
   - ``STOP_GRACE_SECONDS: int`` = 60 — the engine's OWN ``-t`` grace-period
     value passed to ``stop -t <n> <id>`` (distinct from the Python-level
-    subprocess ``timeout=`` kwarg above). Raised from a prior 10 (Gate 7):
-    live journal evidence on this host proved 10s insufficient under load —
-    after a 14h run, ``StopSignal SIGTERM failed to stop container
-    partgraph-dgraph in 10 seconds, resorting to SIGKILL`` (unit exit
-    status 137). Badger's WAL means data survives a SIGKILL (verified,
-    613,396 Part nodes intact), but routinely SIGKILLing a database is not
-    the intended shutdown path and costs recovery work on the next start.
-    60 is a JUDGEMENT CALL, not a measured minimum — the evidence supports
-    "more than 10", not a precise number. ``docker/docker-compose.yml``'s
-    ``stop_grace_period`` must match this SAME budget, so a Compose-started
-    instance gets equal treatment (tests/unit/test_docker_compose.py pins
-    this independently, importing the constant directly so the two can
-    never silently drift apart). ``STOP_TIMEOUT_S`` must exceed it by a
-    MEANINGFUL margin (not a bare "greater than"), or the Python-level
-    subprocess watchdog can fire before the engine finishes waiting out its
-    own grace period, defeating the fix.
+    subprocess ``timeout=`` kwarg above). Raised from a prior 10 (Gate 7).
+
+    GATE 8 CORRECTION — the ORIGINAL causal story was wrong and is recorded
+    here so it is not silently re-inherited: a live 14h-run journal entry
+    (``StopSignal SIGTERM failed to stop container partgraph-dgraph in 10
+    seconds, resorting to SIGKILL``, unit exit status 137) was first read as
+    "Dgraph needs more time to flush under load". A DIRECT re-measurement
+    disproved that: ``podman stop -t 60`` on a container up for barely ONE
+    MINUTE — essentially nothing to flush — STILL timed out and SIGKILLed
+    (60.2s, exit 137). Decoding ``dgraph/standalone:v25.3.4`` explains why:
+    it has no ENTRYPOINT/STOPSIGNAL; ``CMD=[/run.sh]`` runs ``dgraph zero &``
+    then ``dgraph alpha`` in the FOREGROUND under bash as PID 1 — upstream's
+    OWN comment in that script reads ``# TODO properly handle SIGTERM for
+    all three processes``. Bash defers delivering a signal until its
+    foreground command exits, so SIGTERM is NEVER forwarded to ``dgraph
+    alpha`` at all — not "not soon enough", literally never, independent of
+    uptime or load. Adding ``init: true`` to the compose service (a real
+    init process as PID 1, which DOES forward the signal) fixes this
+    outright: the SAME stop then completes in 0.2s with a genuine SIGTERM
+    exit (143), live-measured (docker/docker-compose.yml itself is NOT
+    changed by this test file — see tests/unit/test_docker_compose.py's
+    ``init: true`` pin).
+
+    So ``STOP_GRACE_SECONDS`` was NEVER, by itself, capable of producing a
+    graceful shutdown for this image — no grace-period value can substitute
+    for the signal physically reaching the process. Its role WITH ``init:
+    true`` is different from originally framed: it is an upper BOUND that
+    is almost never actually reached (0.2s observed) rather than a delay
+    that is routinely paid, kept as a genuine safety net for a busy
+    instance with a lot to flush once SIGTERM can actually get through.
+    60 remains a JUDGEMENT CALL, not a measured minimum. Badger's WAL means
+    data survives a SIGKILL regardless (verified, 613,396 Part nodes
+    intact), but routinely SIGKILLing a database is not the intended
+    shutdown path and costs recovery work on the next start.
+    ``docker/docker-compose.yml``'s ``stop_grace_period`` must match this
+    SAME budget, so a Compose-started instance gets equal treatment
+    (tests/unit/test_docker_compose.py pins this independently, importing
+    the constant directly so the two can never silently drift apart, AND
+    pins that ``stop_grace_period`` and ``init: true`` are declared
+    together — a grace period without ``init`` is close to useless for
+    this image). ``STOP_TIMEOUT_S`` must exceed it by a MEANINGFUL margin
+    (not a bare "greater than"), or the Python-level subprocess watchdog
+    can fire before the engine finishes waiting out its own grace period.
 
     HONESTY BOUNDARY (do not overclaim): this budget covers ONLY the
     lifecycle paths PartGraph owns directly — its own engine `stop` sweep
-    and Compose. It does NOT reach the quadlet/systemd path: when
+    and Compose (and even there, only once ``init: true`` is set — see
+    above). It does NOT reach the quadlet/systemd path: when
     :func:`stop_all` stops the ``partgraph-dgraph.service`` unit, the
     unit's OWN ``ExecStop=podman rm -v -f`` applies whatever stop-timeout
     was baked into the container at quadlet-generation time — this repo
@@ -81,7 +109,7 @@ Module constants (frozen, named — never derived at runtime):
     ``StopTimeout=`` drop-in on the host is PR-B1 territory. No test or
     docstring in this file may claim `db down` guarantees a graceful
     shutdown in ALL cases — only that our own two paths (engine sweep,
-    Compose) now share a load-tolerant budget.
+    Compose) now share a load-tolerant budget that can ACTUALLY be met.
   - ``MAX_PS_OUTPUT_BYTES: int`` — a finite, named ceiling on the byte length
     of ``ps``'s stdout the parser will even ATTEMPT to decode (Gate 3a finding
     3a-M5). Extends the same bounded-constant discipline to untrusted engine
@@ -486,20 +514,30 @@ _MEANINGFUL_WATCHDOG_MARGIN_S = 10.0
 
 
 def test_stop_grace_seconds_is_raised_to_a_load_tolerant_budget() -> None:
-    """[Gate 7] Given live journal evidence on this host proved the PRIOR
-    10s grace insufficient under load — after a 14h run, `StopSignal
-    SIGTERM failed to stop container partgraph-dgraph in 10 seconds,
-    resorting to SIGKILL` (unit exit status 137) — while a short-lived
-    instance shut down cleanly within the same window (the failure is
-    LOAD-dependent, not a fixed defect).
+    """[Gate 7, corrected under Gate 8] Given a live 14h-run journal entry
+    first surfaced this (`StopSignal SIGTERM failed to stop container
+    partgraph-dgraph in 10 seconds, resorting to SIGKILL`, unit exit
+    status 137) — but a DIRECT re-measurement disproved "insufficient
+    under load" as the cause: a container up for barely ONE MINUTE, with
+    essentially nothing to flush, ALSO failed `podman stop -t 60` and was
+    SIGKILLed. The real cause is structural, not load-dependent:
+    dgraph/standalone:v25.3.4's `/run.sh` runs `dgraph alpha` in the
+    FOREGROUND under bash as PID 1 (upstream's own TODO: "properly handle
+    SIGTERM for all three processes"), and bash never forwards a signal to
+    a still-running foreground command — so NO grace-period value alone
+    can ever produce a graceful shutdown for this image. `init: true` in
+    the compose service (pinned in tests/unit/test_docker_compose.py, NOT
+    this file) is what actually lets SIGTERM reach `dgraph alpha`; WITH
+    it, the same stop completed in 0.2s (exit 143), live-measured.
     When STOP_GRACE_SECONDS is read directly.
-    Then it is 60 — a JUDGEMENT CALL informed by "10 is proven
-    insufficient", not a measured minimum — and STOP_TIMEOUT_S exceeds it
-    by a MEANINGFUL margin (>= 10s), not by a single second: a thin margin
-    would let the Python-level subprocess watchdog fire before the engine
-    finishes waiting out its own (now-larger) grace period, silently
-    defeating the fix by forcing a SIGKILL at the WATCHDOG layer instead of
-    the engine layer.
+    Then it is 60 — a JUDGEMENT CALL, not a measured minimum, now kept as
+    an upper-bound SAFETY NET for a genuinely busy instance (almost never
+    reached once `init: true` lets SIGTERM through, rather than a delay
+    routinely paid) — and STOP_TIMEOUT_S exceeds it by a MEANINGFUL margin
+    (>= 10s), not by a single second: a thin margin would let the
+    Python-level subprocess watchdog fire before the engine finishes
+    waiting out its own grace period, silently defeating the fix by
+    forcing a SIGKILL at the WATCHDOG layer instead of the engine layer.
     """
     assert STOP_GRACE_SECONDS == 60, (
         "STOP_GRACE_SECONDS must be raised from the proven-insufficient 10s "
