@@ -22,6 +22,7 @@ individually rather than failing collection.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import pathlib
 import re
@@ -69,37 +70,135 @@ def test_ac_p1_lifecycle_source_never_hardcodes_docker_or_podman_argv_literal() 
 # ---------------------------------------------------------------------------
 # [3b-H1] The leaf-discipline rule ("never import partgraph.cli or any
 # embed/query/load module") must be MECHANICALLY enforced, not prose-only.
+#
+# [Gate 5 finding, PR-C mutation run] This guard has been AST-based since
+# PR-C's own fix to `test_activity_architecture.py`'s equivalent, identical
+# gap: the previous regex list here enumerated only `import a.b.c` and
+# `from a.b.c import name`, silently missing the THIRD shape Python's import
+# grammar allows — `from a.b import c` (e.g. `from partgraph import cli`).
+# `test_activity_architecture.py`'s own reviewer proved that exact shape
+# passes an equivalent regex list uncaught; this file enumerated only two of
+# the same three shapes since it landed (PR-A) and has carried the same hole
+# ever since. A single AST-based scanner (a LOCAL copy — CONTRIBUTING.md's
+# "test fixtures stay local to their file" — not imported from
+# `test_activity_architecture.py`) replaces the regex list, because
+# hand-enumerating one pattern per shape per forbidden module is exactly the
+# mistake that created this gap, and the three shapes below are the
+# complete, closed set CPython's import grammar allows — there is no fourth
+# shape to omit next time.
 # ---------------------------------------------------------------------------
 
 
+def _find_forbidden_imports(
+    source: str, label: str, forbidden_modules: frozenset[str]
+) -> list[str]:
+    """Return one message per forbidden import found in *source*, covering:
+      1. `import a.b.c`               (ast.Import)
+      2. `from a.b.c import name`     (ast.ImportFrom, the "from" clause IS
+                                        itself the forbidden module)
+      3. `from a.b import c`          (ast.ImportFrom, the "from" clause is
+                                        the PARENT package and the forbidden
+                                        module is one of the imported NAMES)
+    `node.module is None` (a relative `from . import x`) is skipped: this
+    repo's own style is absolute imports throughout — a stated scope
+    boundary, not a silent one.
+    """
+    tree = ast.parse(source, filename=label)
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in forbidden_modules:
+                    violations.append(f"{label}:{node.lineno}: import {alias.name}")
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            for alias in node.names:
+                if node.module in forbidden_modules:
+                    violations.append(
+                        f"{label}:{node.lineno}: from {node.module} import {alias.name}"
+                    )
+                    continue
+                dotted = f"{node.module}.{alias.name}"
+                if dotted in forbidden_modules:
+                    violations.append(
+                        f"{label}:{node.lineno}: from {node.module} import {alias.name}"
+                    )
+    return list(dict.fromkeys(violations))
+
+
+# ---------------------------------------------------------------------------
+# Self-test: prove the scanner has real teeth for EACH shape, and does not
+# false-positive on a benign import, BEFORE trusting it against the real
+# tree (mirrors test_repo_never_executes_lifecycle_mutations.py's own
+# positive/negative-control discipline).
+# ---------------------------------------------------------------------------
+
+
+def test_scanner_catches_shape_1_plain_dotted_import() -> None:
+    """[Positive control, shape 1] `import a.b.c`."""
+    violations = _find_forbidden_imports(
+        "import partgraph.cli\n", "canary.py", frozenset({"partgraph.cli"}),
+    )
+    assert violations, "shape 1 (`import a.b.c`) must be caught"
+
+
+def test_scanner_catches_shape_2_from_the_forbidden_module_import_a_name() -> None:
+    """[Positive control, shape 2] `from a.b.c import name`."""
+    violations = _find_forbidden_imports(
+        "from partgraph.cli import app\n", "canary.py", frozenset({"partgraph.cli"}),
+    )
+    assert violations, "shape 2 (`from a.b.c import name`) must be caught"
+
+
+def test_scanner_catches_shape_3_from_the_parent_package_import_the_forbidden_module() -> None:
+    """[Gate 5 finding — positive control, shape 3] `from a.b import c` —
+    the shape this file's OWN regex list silently missed since PR-A landed."""
+    violations = _find_forbidden_imports(
+        "from partgraph import cli\n", "canary.py", frozenset({"partgraph.cli"}),
+    )
+    assert violations, "shape 3 (`from a.b import c`) must be caught"
+
+
+def test_scanner_catches_shape_3_for_a_nested_target_too() -> None:
+    """[Positive control, shape 3, nested target] `from partgraph import
+    embed` — the SAME shape 3 hazard for a different forbidden module."""
+    violations = _find_forbidden_imports(
+        "from partgraph import embed\n", "canary.py", frozenset({"partgraph.embed"}),
+    )
+    assert violations, "shape 3 must be caught for every forbidden module, not just one"
+
+
+def test_scanner_does_not_flag_an_unrelated_benign_import() -> None:
+    """[Negative control] Given imports of things that are NOT forbidden.
+    When the scanner runs.
+    Then nothing is flagged — proves the scanner discriminates by the exact
+    forbidden set, not merely "any import at all"."""
+    src = "from partgraph.util import health\nimport os\nimport json\n"
+    violations = _find_forbidden_imports(
+        src, "canary.py", frozenset({"partgraph.cli", "partgraph.embed"}),
+    )
+    assert not violations, violations
+
+
 def test_lifecycle_source_never_imports_partgraph_cli_embed_query_or_load() -> None:
-    """[3b-H1] Given partgraph.util.lifecycle is documented as a LEAF module
-    that must never import partgraph.cli or any embed/query/load module (so
-    both the CLI and future PR-B/PR-C callers can import it without a cycle
-    — mirrors container.py/health.py/index_health.py's own leaf discipline).
-    When src/partgraph/util/lifecycle.py's source text is scanned.
-    Then it contains none of: `import partgraph.cli`, `from partgraph.cli`,
-    `from partgraph.embed`, `from partgraph.query`, `from partgraph.load`
-    (module-level OR lazy/deferred — the grammar-level scan catches both,
-    since a lazy `import partgraph.cli` inside a function body is textually
-    identical to an eager one).
+    """[3b-H1, Gate 5 AST fix] Given partgraph.util.lifecycle is documented
+    as a LEAF module that must never import partgraph.cli or any
+    embed/query/load module (so both the CLI and future PR-B/PR-C callers
+    can import it without a cycle — mirrors
+    container.py/health.py/index_health.py's own leaf discipline).
+    When src/partgraph/util/lifecycle.py's source is AST-parsed and scanned
+    for all three import shapes above, against every forbidden module.
+    Then none is found (module-level OR lazy/deferred — the AST scan
+    catches both, since a lazy `import partgraph.cli` inside a function
+    body is structurally identical to an eager one at the AST level).
 
     Skips cleanly (not error) if the source file does not exist yet, and goes
     green the moment the module lands correctly.
     """
     text = _read_lifecycle_source_or_skip()
-
-    forbidden_patterns = [
-        r"^\s*import\s+partgraph\.cli\b",
-        r"^\s*from\s+partgraph\.cli\b",
-        r"^\s*from\s+partgraph\.embed\b",
-        r"^\s*from\s+partgraph\.query\b",
-        r"^\s*from\s+partgraph\.load\b",
-    ]
-    violations = []
-    for pattern in forbidden_patterns:
-        for match in re.finditer(pattern, text, flags=re.MULTILINE):
-            violations.append(match.group(0).strip())
+    forbidden_modules = frozenset({
+        "partgraph.cli", "partgraph.embed", "partgraph.query", "partgraph.load",
+    })
+    violations = _find_forbidden_imports(text, str(_MODULE_PATH), forbidden_modules)
 
     assert not violations, (
         "partgraph.util.lifecycle must never import partgraph.cli or any "

@@ -161,10 +161,35 @@ genuine `now()` is not "a slightly fast clock", it is **untrustworthy**.
 Ten minutes is a judgement call, disclosed as one (the same standing as
 `STOP_GRACE_SECONDS` and `AUTOSTART_READY_TIMEOUT_S`). It is far larger than any
 plausible ordinary skew — sub-second to a few seconds — so a genuine small
-backward correction is never mistaken for poisoning; and it is strictly smaller
-than the 30-minute default budget, so the worst case of *any* poisoning event
-("the stamp reads fresh for up to the ceiling") stays a fraction of one idle
-cycle rather than being unbounded.
+backward correction is never mistaken for poisoning.
+
+**Bounding the damage, stated precisely rather than generally.** A poisoning
+inside the ceiling suppresses idle-stop until real time passes the poisoned
+value *and then* a full budget elapses — worst case `ceiling + budget`, always
+finite, never the unbounded "forever" the naive rule produced. Whether that is
+*small* depends on the budget, and the ADR should not claim more than it can:
+
+Worst case is a poisoning of the full 10 minutes, so suppression is
+`10 + budget`:
+
+| Budget (`PARTGRAPH_IDLE_TIMEOUT_MINUTES`) | Worst-case suppression | As a multiple of the budget |
+| --- | --- | --- |
+| 30 (default) | 40 min | 1.3x |
+| 60 | 70 min | 1.2x |
+| 5 | 15 min | 3x |
+
+At the **default**, the ceiling is a third of the budget and the overshoot is a
+fraction of one idle cycle — that is the case the constant was sized for, and
+the repository's own test pins `ceiling < DEFAULT_IDLE_TIMEOUT_MINUTES` to keep
+it so. An operator who configures a budget *below* the ceiling inverts that
+relationship: at a 5-minute budget, a stamp poisoned 9 minutes ahead is still
+inside the ceiling, so it is protected rather than healed, and idle-stop stays
+suppressed for `9 + 5 = 14` minutes — nearly three full cycles, not a fraction
+of one. Still bounded, still self-healing, and still never permanent; but "a
+fraction of one idle cycle" is a claim about the **default budget only**, which
+is why it is scoped that way here. Nothing enforces the relationship for a
+configured value, and a budget at or below the ceiling is a supported
+configuration.
 
 ### 4. No stamp at all: bootstrap, do not stop
 
@@ -185,6 +210,26 @@ activity". Instead:
 The alternative — "no stamp means nothing has happened, so stop it" — would make
 the *first* run of a freshly installed timer stop a database somebody had just
 started by hand. Rejected.
+
+**Recorded, not fixed: the bootstrap tag asserts a write it does not observe.**
+`_stamp_decision` calls `touch_activity()` and then reports
+`stamp-bootstrapped` (or `stamp-poison-recovered`) unconditionally, but
+`touch_activity` is contracted to *never raise* — an unwritable `data/state`
+warns once and returns — so the decision cannot see whether the stamp actually
+landed. On a read-only state directory every run therefore reports a bootstrap
+that never happened, and the next run repeats it. The *direction* is safe (it
+never stops anything, and the warn-once line does fire on the first attempt),
+but a tag asserting an unverified write is the same "could not tell" collapsing
+into "checked" that this module forbids for leases — so it is named here rather
+than left to be found.
+
+It is recorded instead of fixed because the honest fix is not free: reporting it
+truthfully needs either a new public reason tag (contract surface no test pins,
+which this PR should not invent unilaterally) or reusing `nothing-to-do`, which
+would conflate "the database is not reachable" with "the database is up but I
+could not record it" — two states this ADR deliberately keeps apart. A follow-up
+should add the distinct tag, wire it to `touch_activity`'s existing internal
+write result, and pin it with its own test.
 
 ### 5. `PARTGRAPH_IDLE_TIMEOUT_MINUTES`
 
@@ -299,6 +344,19 @@ Stated here rather than left to be discovered.
    checks. It is not fixed here because every candidate fix trades a permanent
    block for a heuristic that can stop a database that is genuinely in use, and
    that trade needs its own decision rather than being smuggled in with this one.
+
+   A narrower hardening of the same area is available and was not taken: the
+   recorded `pid` is bounded *below* (a non-positive value is rejected as
+   malformed) but not *above*. An absurd value on its own is harmless — checked
+   against the real psutil, `Process(999999999)` on a host with
+   `pid_max = 4194304` raises `NoSuchProcess`, so the lease is classified DEAD
+   and cleaned, not blocked. Only garbage that *additionally* defeats resolution
+   lands in this limitation. Bounding `pid` against
+   `/proc/sys/kernel/pid_max` would reclassify some such garbage as dead
+   outright rather than leaving it a permanent block; it is a follow-up, not a
+   correctness gap, and it is Linux-specific in a way the rest of this leaf is
+   not.
+
 2. **`psutil` is unpinned and this repository has no lockfile, while PR-C is the
    first change to make it load-bearing for a stop-or-not decision.** It has been
    a declared dependency since the embed pipeline, but only ever *advisorily*:
@@ -315,6 +373,51 @@ Stated here rather than left to be discovered.
    out of scope for a change already spanning a leaf, nine call sites, two unit
    files and two documents; it is named here as a real, accepted risk rather than
    left implicit.
+
+3. **The shipped unit reports `success` even when the command was never
+   found — including on every firing, forever, if the timer is enabled before
+   the CLI is reachable.** `ExecStart=` carries a leading `-`, so systemd
+   ignores the command's exit status. Confirmed directly, with disposable
+   transient units:
+
+   | `ExecStart=` | `Result` | `ExecMainStatus` | `ActiveState` |
+   | --- | --- | --- | --- |
+   | `/nonexistent/…` | `exit-code` | `203` | **`failed`** |
+   | `-/nonexistent/…` | `success` | `0` | `inactive` |
+
+   In both cases the journal carries `Unable to locate executable '…': No such
+   file or directory`, so § "Verification" is literally accurate that every
+   reason a run did nothing is recorded. But what the `-` removes is the
+   **`failed` unit state** — the one signal `systemctl --user status`,
+   `list-timers` and most monitoring ever look at.
+
+   The concrete failure: an operator follows `docs/scheduling.md` § 7 and runs
+   `systemctl --user enable --now` *before* symlinking the CLI into
+   `~/.local/bin`. Nothing enforces that order. The timer then fires every ten
+   minutes, reports success every time, and the 10.2 GB idle cost this ADR
+   exists to remove never goes away. **By this ADR's own standard — silence is
+   how the original problem ran unnoticed for fourteen hours — that is a third
+   permanent, silent no-op mode**, alongside the poisoned stamp (§ 3, fixed) and
+   the undetermined lease (limitation 1, accepted).
+
+   Why the `-` stays anyway. Without it, `systemd-analyze verify` exits non-zero
+   with `Command … is not executable` for every operator who has not yet
+   installed the CLI at that path — a repository whose shipped units do not
+   verify cleanly is a worse and much more likely failure than this one, and the
+   unit test pins the clean, empty-output exit. Dropping the `-` would also
+   contradict this ADR's own "a timer run is never marked failed" ruling for the
+   command's *ordinary* outcomes.
+
+   The mitigation is therefore documentation, and it is now explicit rather than
+   implied: `docs/scheduling.md` § 7 numbers the install steps, states that the
+   symlink step must precede enabling the timer and why, adds a verification
+   command between them, and carries a "When the timer says success but the
+   database never stops" table mapping each journal line — including `Unable to
+   locate executable` — to what it means. A future PR could close it properly by
+   giving the service an `ExecCondition=` that tests for the binary (so a missing
+   CLI leaves the unit *skipped*, which is visible, rather than *successful*), or
+   by having `db doctor` report whether the timer has ever completed a real
+   check.
 
 ## Verification
 
@@ -347,7 +450,15 @@ both injectable seams).
 - `tests/unit/test_systemd_idle_stop_units.py` — the shipped units: no `User=`,
   `%h` only, the named hardening directives, a cadence inside a sane bound,
   nothing in the repository enabling them, and `systemd-analyze verify` exiting 0
-  with empty output against the real files.
+  with empty output against the real files. **The scope of the "nothing enables
+  it" guarantee, stated rather than assumed:** that scan reads tracked `*.py`
+  and `*.sh` files only, so a CI workflow, a Makefile, a container build, or the
+  unit files themselves could enable the timer without the scan noticing. Today
+  nothing does — the only two tracked lines that pair the unit's name with
+  `enable` are `docs/scheduling.md`'s operator instruction and the `.timer`'s own
+  comment quoting it, and the repository has no Makefile — but that is a fact
+  about the current tree, not something this test would catch changing outside
+  those two extensions.
 - `tests/unit/test_scheduling_idle_stop_interaction.py` — the refresh
   interaction of § 6, proven against the real decision function.
 

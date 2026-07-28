@@ -230,22 +230,74 @@ database otherwise stays up indefinitely after the first command that starts it
 — see [ADR-0023](decisions/ADR-0023-database-idle-autostop.md).
 
 The two timers are **independently opt-in**. Installing one neither requires nor
-implies the other, and neither knows the other's schedule:
+implies the other, and neither knows the other's schedule.
+
+> [!IMPORTANT]
+> **Do step 2 before step 4.** The unit's `ExecStart=` is prefixed with `-`, so
+> systemd treats *any* failure of the command — including "the file is not
+> there" — as a successful run. Enable the timer before the CLI is reachable at
+> `$HOME/.local/bin/partgraph` and you get a timer that fires every ten minutes,
+> reports `success` every time, and **stops nothing, forever**. See
+> [When the timer says success but the database never stops](#when-the-timer-says-success-but-the-database-never-stops)
+> for how that looks and how to confirm it.
+
+From the repository root:
 
 ```bash
-# Install (per-user), exactly as for the refresh units above.
+# 1. Install the unit files for your user.
 mkdir -p "$HOME/.config/systemd/user"
 install -m 0644 systemd/partgraph-db-idle-stop.service "$HOME/.config/systemd/user/"
 install -m 0644 systemd/partgraph-db-idle-stop.timer   "$HOME/.config/systemd/user/"
 
-# The unit runs $HOME/.local/bin/partgraph. If your CLI lives in a conda or
-# virtualenv bin, symlink it there (or override ExecStart with
-# `systemctl --user edit partgraph-db-idle-stop.service`):
+# 2. Make the CLI reachable at the path the unit runs. REQUIRED, and required
+#    BEFORE step 4 — the unit runs $HOME/.local/bin/partgraph and nothing else.
+#    If your CLI lives in a conda or virtualenv bin, symlink it there (or
+#    override ExecStart with
+#    `systemctl --user edit partgraph-db-idle-stop.service`):
+mkdir -p "$HOME/.local/bin"
 ln -sf "$(command -v partgraph)" "$HOME/.local/bin/partgraph"
 
+# 3. Confirm step 2 actually worked, before enabling anything. This must print
+#    a usage banner, not "No such file or directory":
+"$HOME/.local/bin/partgraph" db idle-stop --help
+
+# 4. Enable and start the timer.
 systemctl --user daemon-reload
 systemctl --user enable --now partgraph-db-idle-stop.timer
+
+# 5. Confirm the schedule, then the first real run.
 systemctl --user list-timers partgraph-db-idle-stop.timer
+journalctl --user -u partgraph-db-idle-stop.service   # after the first firing
+```
+
+### When the timer says success but the database never stops
+
+`systemctl --user status` and `list-timers` **cannot** tell you about this
+failure, and that is worth knowing before you go looking. Because of the `-`
+prefix the unit reports `Result=success`, `ExecMainStatus=0`,
+`ActiveState=inactive` whether the command ran and decided not to stop anything
+or was never found at all. The journal is the only place the difference shows:
+
+```bash
+journalctl --user -u partgraph-db-idle-stop.service -n 20
+```
+
+| What the journal shows | What it means |
+| --- | --- |
+| `Unable to locate executable '…/partgraph': No such file or directory` | Step 2 was skipped or the symlink is broken. **The check has never run.** Redo steps 2–3; no re-enable is needed. |
+| `Idle auto-stop: leaving the database alone (reason: fresh-stamp)` | Working. The database was used recently. |
+| `Idle auto-stop: leaving the database alone (reason: live-lease)` | Working. A PartGraph command is running right now. |
+| `Idle auto-stop: leaving the database alone (reason: undetermined-lease)` | A lease file cannot be resolved — see ADR-0023's accepted limitation 1. Inspect `data/state/activity_lease.*.json`. |
+| `Idle auto-stop: the database was idle; stopped …` | Working, and it stopped the database. |
+| nothing at all for the service | The timer is not enabled, or has not fired yet. |
+
+The quickest end-to-end confirmation is to run one check by hand and watch what
+it prints — it is the same one-shot command the timer runs, and it never starts
+anything:
+
+```bash
+systemctl --user start partgraph-db-idle-stop.service   # via the unit
+"$HOME/.local/bin/partgraph" db idle-stop               # or directly
 ```
 
 Optional configuration, read from `%h/.config/partgraph/idle-stop.env`:
