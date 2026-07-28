@@ -284,8 +284,15 @@ class _FakePsutilModule:
         return self._processes[pid]
 
 
-def _fake_psutil(**by_pid: _FakeProcess) -> _FakePsutilModule:
-    return _FakePsutilModule(by_pid)
+def _fake_psutil(by_pid: dict[int, _FakeProcess] | None = None) -> _FakePsutilModule:
+    """[Gate 3b defect 1 fix] Takes *by_pid* POSITIONALLY, never via `**`
+    unpacking: `_fake_psutil({4242: proc})` is rejected by CPython at the
+    call site itself ("keywords must be strings"), before any implementation
+    code ever runs — an integer dict key can never be a keyword argument
+    name. `_FakePsutilModule` already accepts a plain mapping, so passing it
+    positionally is both the fix and the simpler call shape.
+    """
+    return _FakePsutilModule(by_pid or {})
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +674,7 @@ def test_lease_content_contains_no_absolute_path(tmp_path) -> None:
         state_dir=state_dir,
         pid=4242,
         now=lambda: _dt(2026, 1, 1),
-        psutil_module=_fake_psutil(**{4242: _FakeProcess(4242, create_time=100.0)}),
+        psutil_module=_fake_psutil({4242: _FakeProcess(4242, create_time=100.0)}),
     )
     raw = lease_path(state_dir, pid=4242).read_bytes().decode("utf-8")
     assert str(state_dir) not in raw
@@ -683,7 +690,7 @@ def test_release_lease_removes_the_file_and_is_idempotent(tmp_path) -> None:
     state_dir = tmp_path / "state"
     acquire_lease(
         state_dir=state_dir, pid=111, now=lambda: _dt(2026, 1, 1),
-        psutil_module=_fake_psutil(**{111: _FakeProcess(111, create_time=1.0)}),
+        psutil_module=_fake_psutil({111: _FakeProcess(111, create_time=1.0)}),
     )
     assert lease_path(state_dir, pid=111).exists()
 
@@ -705,7 +712,7 @@ def test_held_lease_releases_on_normal_exit(tmp_path) -> None:
     When the `with` block completes normally.
     Then the lease file is gone afterward."""
     state_dir = tmp_path / "state"
-    fake = _fake_psutil(**{os.getpid(): _FakeProcess(os.getpid(), create_time=1.0)})
+    fake = _fake_psutil({os.getpid(): _FakeProcess(os.getpid(), create_time=1.0)})
     with held_lease(state_dir=state_dir, now=lambda: _dt(2026, 1, 1), psutil_module=fake):
         assert lease_path(state_dir).exists()
     assert not lease_path(state_dir).exists()
@@ -718,7 +725,7 @@ def test_held_lease_releases_even_when_the_body_raises(tmp_path) -> None:
     Then the original exception still propagates unmodified AND the lease
     file is gone afterward — `finally`, not merely "on the happy path"."""
     state_dir = tmp_path / "state"
-    fake = _fake_psutil(**{os.getpid(): _FakeProcess(os.getpid(), create_time=1.0)})
+    fake = _fake_psutil({os.getpid(): _FakeProcess(os.getpid(), create_time=1.0)})
 
     class _BoomError(RuntimeError):
         pass
@@ -742,7 +749,7 @@ def test_lease_path_is_scoped_per_pid(tmp_path) -> None:
     lease must never overwrite a first, still-live one."""
     state_dir = tmp_path / "state"
     fake = _fake_psutil(
-        **{
+        {
             111: _FakeProcess(111, create_time=1.0),
             222: _FakeProcess(222, create_time=2.0),
         }
@@ -818,11 +825,11 @@ def test_recycled_pid_is_not_mistaken_for_a_live_lease(tmp_path) -> None:
     state_dir = tmp_path / "state"
     acquire_lease(
         state_dir=state_dir, pid=555, now=lambda: _dt(2026, 1, 1),
-        psutil_module=_fake_psutil(**{555: _FakeProcess(555, create_time=1000.0)}),
+        psutil_module=_fake_psutil({555: _FakeProcess(555, create_time=1000.0)}),
     )
     touch_activity(state_dir=state_dir, now=lambda: _dt(2000, 1, 1))
 
-    recycled = _fake_psutil(**{555: _FakeProcess(555, create_time=5000.0)})
+    recycled = _fake_psutil({555: _FakeProcess(555, create_time=5000.0)})
     decision = evaluate_idle(
         state_dir=state_dir,
         idle_timeout_minutes=30.0,
@@ -842,7 +849,7 @@ def test_dead_lease_no_such_process_is_cleaned_and_falls_through_to_stamp(tmp_pa
     state_dir = tmp_path / "state"
     acquire_lease(
         state_dir=state_dir, pid=777, now=lambda: _dt(2026, 1, 1),
-        psutil_module=_fake_psutil(**{777: _FakeProcess(777, create_time=1.0)}),
+        psutil_module=_fake_psutil({777: _FakeProcess(777, create_time=1.0)}),
     )
     touch_activity(state_dir=state_dir, now=lambda: _dt(2000, 1, 1))
 
@@ -873,12 +880,12 @@ def test_zombie_process_is_treated_as_dead_via_the_real_psutil_exception_hierarc
     state_dir = tmp_path / "state"
     acquire_lease(
         state_dir=state_dir, pid=888, now=lambda: _dt(2026, 1, 1),
-        psutil_module=_fake_psutil(**{888: _FakeProcess(888, create_time=1.0)}),
+        psutil_module=_fake_psutil({888: _FakeProcess(888, create_time=1.0)}),
     )
     touch_activity(state_dir=state_dir, now=lambda: _dt(2000, 1, 1))
 
     zombie = _fake_psutil(
-        **{888: _FakeProcess(888, create_time=None, error=psutil.ZombieProcess(888))}
+        {888: _FakeProcess(888, create_time=None, error=psutil.ZombieProcess(888))}
     )
     decision = evaluate_idle(
         state_dir=state_dir,
@@ -906,12 +913,12 @@ def test_access_denied_is_undetermined_not_dead_and_the_lease_is_kept(tmp_path) 
     state_dir = tmp_path / "state"
     acquire_lease(
         state_dir=state_dir, pid=999, now=lambda: _dt(2026, 1, 1),
-        psutil_module=_fake_psutil(**{999: _FakeProcess(999, create_time=1.0)}),
+        psutil_module=_fake_psutil({999: _FakeProcess(999, create_time=1.0)}),
     )
     touch_activity(state_dir=state_dir, now=lambda: _dt(2000, 1, 1))
 
     denied = _fake_psutil(
-        **{999: _FakeProcess(999, create_time=None, error=psutil.AccessDenied(999))}
+        {999: _FakeProcess(999, create_time=None, error=psutil.AccessDenied(999))}
     )
     decision = evaluate_idle(
         state_dir=state_dir,
@@ -976,10 +983,10 @@ def test_two_concurrent_leases_one_dead_one_live_still_blocks_and_cleans_only_th
     222 — 111 being dead must not let the stop through — AND only 111's
     lease file is cleaned; 222's stays exactly because it is still live."""
     state_dir = tmp_path / "state"
-    fake = _fake_psutil(**{222: _FakeProcess(222, create_time=2.0)})
+    fake = _fake_psutil({222: _FakeProcess(222, create_time=2.0)})
     acquire_lease(
         state_dir=state_dir, pid=111, now=lambda: _dt(2026, 1, 1),
-        psutil_module=_fake_psutil(**{111: _FakeProcess(111, create_time=1.0)}),
+        psutil_module=_fake_psutil({111: _FakeProcess(111, create_time=1.0)}),
     )
     acquire_lease(state_dir=state_dir, pid=222, now=lambda: _dt(2026, 1, 1), psutil_module=fake)
     touch_activity(state_dir=state_dir, now=lambda: _dt(2000, 1, 1))
@@ -1046,7 +1053,7 @@ def test_zero_or_negative_timeout_disables_with_zero_further_io(tmp_path, timeou
     state_dir = tmp_path / "state"
     acquire_lease(
         state_dir=state_dir, pid=os.getpid(), now=lambda: _dt(2026, 1, 1),
-        psutil_module=_fake_psutil(**{os.getpid(): _FakeProcess(os.getpid(), create_time=1.0)}),
+        psutil_module=_fake_psutil({os.getpid(): _FakeProcess(os.getpid(), create_time=1.0)}),
     )
     touch_activity(state_dir=state_dir, now=lambda: _dt(2000, 1, 1))
 

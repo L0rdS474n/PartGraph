@@ -1,0 +1,32 @@
+# partgraph-db-idle-stop.timer — periodic trigger for
+# partgraph-db-idle-stop.service.
+#
+# Enable per-user (the repository ships this file and never enables it):
+#   systemctl --user enable --now partgraph-db-idle-stop.timer
+#
+# See docs/scheduling.md and docs/decisions/ADR-0023-database-idle-autostop.md.
+
+[Unit]
+Description=Periodic PartGraph idle database check
+
+[Timer]
+# Cadence, not budget. The CHECK runs every 10 minutes; whether it stops
+# anything is decided by PARTGRAPH_IDLE_TIMEOUT_MINUTES (default 30) and by
+# whether any PartGraph command holds a lease. The two compose: a database goes
+# down at worst one cadence after it goes idle, i.e. within ~40 minutes on the
+# defaults. Ten minutes is deliberately well below the default budget (so the
+# overshoot stays a fraction of it) and well above "constantly" (each firing
+# spawns a real process, and an idle check that costs more than the idling it
+# prevents would defeat its own purpose).
+OnBootSec=10min
+OnUnitActiveSec=10min
+
+# A little jitter, so this never fires at the same instant as another timer.
+RandomizedDelaySec=60
+
+# Persistent= is deliberately NOT set: this is a monotonic timer, not a
+# calendar one. A check missed while the machine was off is not worth catching
+# up on — the database was not running then either.
+
+[Install]
+WantedBy=timers.target

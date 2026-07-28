@@ -49,6 +49,7 @@ import pytest
 
 import partgraph.cli as cli_mod
 from partgraph.cli import app
+from partgraph.embed import EMBED_DIM
 
 # This import is expected to raise ModuleNotFoundError until
 # src/partgraph/util/activity.py exists — the correct test-first red state.
@@ -323,12 +324,26 @@ def _embed_row(uid: str) -> dict:
 
 
 def _make_embed_cursor_read_txn(pages: list[dict]) -> MagicMock:
+    """[Gate 3b defect 3 fix] Mirrors `test_cli_embed.py`'s own
+    `_make_cursor_aware_read_txn` docstring exactly: a selection query is
+    recognised by containing BOTH `"type(Part)"` and `"first:"` (the shape
+    `_select_parts_for_embed` emits) and consumes the next page from
+    *pages*; any OTHER query — namely `embed_write`'s own xid-resolution
+    lookup via `_resolve_uids_by_xid` — must NOT also consume a page, or a
+    real two-page run dies on `StopIteration` once that unrelated query
+    steals page two's payload. Answered with an empty match set instead, a
+    deterministic, side-effect-free stand-in that degrades uid resolution to
+    each part's own `uid` (already set by selection)."""
     remaining = iter(pages)
+    empty_resolve = MagicMock()
+    empty_resolve.json = json.dumps({"q": []}).encode()
 
     def _side_effect(query_text, *a, **kw):
-        resp = MagicMock()
-        resp.json = json.dumps(next(remaining)).encode()
-        return resp
+        if "type(Part)" in query_text and "first:" in query_text:
+            resp = MagicMock()
+            resp.json = json.dumps(next(remaining)).encode()
+            return resp
+        return empty_resolve
 
     txn = MagicMock()
     txn.query.side_effect = _side_effect
@@ -374,7 +389,11 @@ def test_c2_embed_heartbeats_the_activity_stamp_once_per_real_page(
     calls: list[None] = []
 
     def _fake_get_encoder():
-        return lambda texts: [[0.0] for _ in texts]
+        # [Gate 3b defect 3 fix] Must return EMBED_DIM-wide vectors
+        # (384) — `partgraph.embed` validates each vector's width and
+        # raises otherwise; a 1-dimensional stub silently killed the run
+        # before it ever reached a second page.
+        return lambda texts: [[0.0] * EMBED_DIM for _ in texts]
 
     with (
         patch.object(cli_mod, "_build_dgraph_client", return_value=(client, MagicMock())),

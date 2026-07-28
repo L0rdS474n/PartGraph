@@ -510,11 +510,21 @@ def test_idle_stop_stale_no_lease_delegates_to_the_real_stop_all_with_db_downs_o
     ):
         result = _invoke(["db", "idle-stop"])
 
-    assert result.exit_code == 0, result.output
-    mock_stop_all.assert_called_once()
-    assert captured.get("dry_run") is False
-    assert captured.get("engine_prefix") == ["docker"]
-    assert captured.get("probe_health") is cli_mod.probe_health
+        assert result.exit_code == 0, result.output
+        mock_stop_all.assert_called_once()
+        assert captured.get("dry_run") is False
+        assert captured.get("engine_prefix") == ["docker"]
+        # [Gate 3b defect 2 fix] Must be asserted INSIDE this `with` block:
+        # `partgraph.cli.probe_health` is patched here, so `cli_mod.probe_health`
+        # currently IS the same MagicMock `idle_stop()` was called with — proving
+        # the CLI threads through its OWN, live module attribute (never an
+        # import-time-bound copy). Asserted after this block closes, the patch
+        # would already be undone and `cli_mod.probe_health` would be the
+        # restored REAL function — which the captured MagicMock could never be
+        # identical to, making the assertion permanently, silently unwinnable
+        # regardless of what src/ does.
+        assert captured.get("probe_health") is cli_mod.probe_health
+
     _assert_compose_down_issues_db_down_argv(captured.get("compose_down"))
 
 
@@ -659,6 +669,64 @@ def test_idle_stop_exits_zero_but_prints_a_path_free_diagnostic_when_undetermine
     )
     assert "/" not in result.output, (
         f"the diagnostic line(s) must stay path-free: {result.output!r}"
+    )
+
+
+def test_idle_stop_exits_zero_but_prints_a_path_free_diagnostic_when_stop_all_itself_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """[Coordinator follow-up, same always-exit-0-must-not-mean-always-silent
+    property as the two tests above, for a THIRD, distinct path]: Given
+    `stop_all` itself raises an UNEXPECTED exception — not one of its
+    ordinary `DownResult` outcomes (survivors/undetermined), but a genuine
+    failure a wedged engine or an OS-level error could produce, mirroring
+    `down()`'s own defence-in-depth catch around the identical call. The
+    exception's own message deliberately CONTAINS a path-shaped string, so
+    this test also proves the printed diagnostic is a FIXED, clean line —
+    never the raw exception message forwarded verbatim (mirrors `down()`'s
+    own "Turn it into a fixed, path-free message... so no raw traceback can
+    leak an internal path").
+    When `partgraph db idle-stop` runs.
+    Then it still exits 0 (extending idle-stop's own always-exit-0 ruling to
+    this failure mode too — an unattended background command must not look
+    like a failed systemd unit merely because one sweep hit an unexpected
+    error) AND prints a NON-EMPTY, path-free diagnostic. This is the
+    property `except Exception: ...` around `stop_all` could otherwise
+    absorb silently: every OTHER test in this file that reaches `stop_all`
+    supplies either a clean `DownResult` or one of the two SURVIVOR/
+    UNDETERMINED outcomes above, so none of them alone proves this
+    third path — a `_forbid_stop_all`-shaped fake is only ever reachable on
+    a branch that never calls `stop_all` at all, and would not catch a
+    regression here either.
+    """
+    monkeypatch.delenv("PARTGRAPH_IDLE_TIMEOUT_MINUTES", raising=False)
+    state_dir = tmp_path / "state"
+    _seed_state_dir_stale_no_lease(state_dir)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError(
+            "simulated wedged-engine failure, see /some/fake/compose/path/docker-compose.yml"
+        )
+
+    with (
+        patch.object(cli_mod, "ACTIVITY_STATE_DIR", state_dir),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(True)),
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.stop_all", side_effect=_raise),
+        patch("partgraph.cli.ensure_running", side_effect=_forbid_ensure_running),
+    ):
+        result = _invoke(["db", "idle-stop"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() != "", (
+        "a genuine exception raised by stop_all must never be silently absorbed"
+    )
+    assert "Traceback" not in result.output, (
+        f"no raw traceback may reach the operator: {result.output!r}"
+    )
+    assert "docker-compose.yml" not in result.output and "/" not in result.output, (
+        f"the raw exception message (which carried a path) must never be "
+        f"forwarded verbatim: {result.output!r}"
     )
 
 

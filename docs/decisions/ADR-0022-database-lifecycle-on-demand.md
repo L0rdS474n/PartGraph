@@ -724,6 +724,21 @@ What changed is that "never starts the database" is now a property of the
 shipped unit's configuration rather than of the CLI's capabilities, and
 therefore something an operator can undo — deliberately, by editing that line.
 
+**Forward reference: a THIRD timer now exists (ADR-0023).** Everything above
+concerns the two units ADR-0014 shipped. PR-C adds a separate, independently
+opt-in pair — `systemd/partgraph-db-idle-stop.{service,timer}` — which stops the
+database once it has gone unused. A reader arriving here (or at ADR-0014) alone
+should know two things about it before meeting it in the wild. First, it does
+**not** weaken the guarantee above: `db idle-stop` never starts anything, and a
+scheduled `refresh`/`refresh-links` that is actually running holds a lease that
+blocks it outright, so a run in progress cannot be cut short. Second, it does
+create one new, disclosed interaction: **between** scheduled runs it may
+legitimately stop an idle database, and precisely because of the
+`PARTGRAPH_AUTOSTART=0` this section establishes, the next scheduled refresh will
+then fail rather than restart it. That failure is expected, loud and harmless —
+see [ADR-0023](ADR-0023-database-idle-autostop.md) § 6 for why it is left
+un-special-cased, and `docs/scheduling.md` § 7 for an operator's options.
+
 ## Alternatives rejected
 
 - **Have PartGraph edit the unit file itself.** Rejected on ownership grounds,
