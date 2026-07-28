@@ -17,7 +17,18 @@ services:
     # Explicit container name so integration tests can filter by name and never
     # match a foreign container (e.g. a cve-graph stack on the same machine).
     container_name: partgraph-dgraph
-    restart: unless-stopped
+    # Quoted on purpose: a bare `no` is YAML's boolean False, which is a
+    # different (and invalid) Compose value. The string "no" is the policy.
+    #
+    # Why not `unless-stopped`: under rootless podman nothing revives a
+    # container at boot — there is no user-session daemon running then — so the
+    # policy promised a lifecycle guarantee it could not keep here. What
+    # actually restarted the database was the separate quadlet unit
+    # (ADR-0021/ADR-0022), and removing that autostart is the point of
+    # ADR-0022. Every command that needs the database now starts it itself
+    # (`ensure_running()`, ADR-0022 Section 7), so an engine-level restart
+    # policy has nothing left to add.
+    restart: "no"
     # Run a real init process (podman-init / tini) as PID 1. Do NOT remove this
     # as noise — without it, `db down` cannot shut Dgraph down gracefully at
     # all, no matter how large stop_grace_period is.

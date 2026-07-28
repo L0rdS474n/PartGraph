@@ -9,21 +9,29 @@ This ADR spans **two** pull requests. That is a first for this repository —
 every prior ADR landed with one PR — so the split is stated plainly here rather
 than left to be inferred from which sections happen to have code behind them.
 
-| | PR-B1 (this PR) | PR-B2 (not yet written) |
+| | PR-B1 | PR-B2 |
 | --- | --- | --- |
 | `docs/db-lifecycle.md` operator procedures | **shipped** | — |
 | `partgraph db doctor` (read-only diagnostic) | **shipped** | — |
 | `partgraph.util.lifecycle.volume_exists()` | **shipped** | — |
 | Bounded `find_partgraph_instances()` fan-out | **shipped** | — |
 | "documents and detects, never executes" guard | **shipped** | — |
-| `ensure_running()` lazy-start helper | not present | to build |
-| `PARTGRAPH_AUTOSTART=0` escape hatch | not present | to build |
-| Commands that need the database starting it lazily | not present | to build |
+| `ensure_running()` lazy-start helper | — | **shipped** |
+| `PARTGRAPH_AUTOSTART` escape hatch | — | **shipped** |
+| Commands that need the database starting it lazily | — | **shipped** |
+| Compose `restart: "no"` | — | **shipped** |
+| Idle auto-stop | out of scope | out of scope |
 
-Sections 1-6 below describe **shipped** behaviour. Section 7 describes what
-PR-B2 completes and is explicitly **not implemented yet** — no `ensure_running`
-symbol exists in `src/` today, and no command starts the database implicitly.
-An idle-stop policy is out of scope for both and belongs to PR-C.
+Sections 1-6 describe PR-B1. Section 7 describes PR-B2, which is now
+**delivered**: `ensure_running()` exists in
+`src/partgraph/util/lifecycle.py`, nine commands start the database lazily
+through it, and `PARTGRAPH_AUTOSTART` turns that off.
+
+**Idle auto-stop belongs to neither PR.** Stopping a database nobody has used
+for some interval is PR-C's subject and nothing here implements, approximates
+or prepares for it. PR-B2 only ever *starts*: no code path in it stops a
+container, and `db down` remains the only way anything in this repository
+stops one.
 
 ## Context
 
@@ -302,24 +310,304 @@ timeout at all: stop using the quadlet unit (§ 5) and start the database with
 is at risk either way; Badger's write-ahead log meant the earlier SIGKILLs cost
 nothing (613,396 `Part` nodes verified intact).
 
-### 7. What PR-B2 completes — NOT IMPLEMENTED
+### 7. The database starts on first use (PR-B2)
 
-Removing the autostart leaves a gap this ADR opens and does not close: the
-database no longer starts by itself, so a command that needs it must say so, or
-start it. PR-B2 adds:
+Removing the autostart leaves a gap § 5 opens and does not close: the database
+no longer starts by itself, so a command that needs it must say so, or start
+it. PR-B2 closes it — and closes it *only* in the start direction. The
+operator's request was that the database start when `partgraph` is first
+invoked, not that it sit running: 14 h 10 m idle at a 10.2 GB peak is the cost
+being removed, and a lazy start removes it without asking anyone to remember a
+`db up`.
 
-- **`ensure_running()`** in `partgraph.util.lifecycle` — start the database if
-  it is not already up, idempotently, through the Compose path (which gets the
-  init process, § 6), and never through the quadlet unit.
-- **`PARTGRAPH_AUTOSTART=0`** — an explicit escape hatch for operators who want
-  the database started only by hand, and for CI, where an implicit start would
-  be a surprise.
-- **Lazy start** for the commands that genuinely need a live database.
+#### 7a. `ensure_running()` — the contract
 
-None of these exists today. `db doctor` deliberately does not start anything,
-and nothing in PR-B1 depends on them. An **idle-stop** policy (stopping a
-database nobody has used for some interval) is out of scope for both PRs and is
-PR-C's subject.
+```python
+ensure_running(
+    *,
+    probe_health: Callable[[], Any],
+    compose_up: Callable[[], None],
+    sleep: Callable[[float], None] | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> None
+```
+
+Three steps, in order:
+
+1. **Probe health. If healthy, return.** `compose_up` is not called and nothing
+   is slept on. Since `compose_up` is the only seam that can reach a container
+   engine, the common case costs exactly one local HTTP probe and **zero engine
+   subprocesses**. This is not an optimisation; it is the property that makes
+   autostart acceptable on every command rather than a tax on all of them.
+2. **Otherwise call `compose_up` exactly once.** Any exception it raises is
+   absorbed (§ 7b). Never retried.
+3. **Poll**: `sleep(AUTOSTART_POLL_INTERVAL_S)`, probe, return on healthy,
+   raise `AutostartTimeoutError` once `AUTOSTART_READY_TIMEOUT_S` is spent. The
+   deadline is computed **once**, after step 2, so the start command's own
+   duration — a first-run image pull, say — is not charged against the
+   readiness budget.
+
+Success is signalled by returning `None` and failure only by raising. There is
+deliberately no boolean return: a caller who ignored a `False` would go on to
+talk to a database that is not there, and this function exists precisely to
+stop that happening.
+
+`probe_health` and `compose_up` are **required, keyword-only, no default**,
+following `stop_all`'s `compose_down` (ADR-0021): a caller must decide
+explicitly how health is checked and how the database is started, rather than
+silently inheriting a permissive default that would make the whole function a
+no-op. `sleep`/`monotonic` default to `None` and resolve at *call* time to
+`time.sleep`/`time.monotonic`, mirroring `_resolve_which` — so production
+never passes them, and tests never sleep for real.
+
+`AutostartTimeoutError` subclasses `RuntimeError`, like `ContainerEngineError`,
+and its `str()` **is** the complete user-facing message: one line, path-free,
+naming the budget it spent and the one command that answers the question the
+operator is left with (`partgraph db status` — did it come up after all?). The
+CLI prints it verbatim and exits 1, with no traceback.
+
+Two new bounded constants extend ADR-0007's discipline to the start path:
+`AUTOSTART_READY_TIMEOUT_S = 120.0` and `AUTOSTART_POLL_INTERVAL_S = 1.0`.
+
+**Both are judgement calls, and unlike `STOP_GRACE_SECONDS` neither is backed
+by a measurement.** `STOP_GRACE_SECONDS` has live numbers behind it (0.2 s with
+`init: true`, 60.2 s without); Dgraph's *first-run readiness* time on this host
+has never been measured. What bounds the choice is the asymmetry of the two
+errors. Too small is the worse one: the command fails while the database it
+asked for comes up seconds later, and the operator is told the opposite of what
+happened — on a store that reached 613,396 `Part` nodes, Badger's log replay is
+not instant. Too large costs only a wait on a database that will never come up.
+So the budget errs upward, and 120 s is a generous-but-not-absurd landing
+point. The poll interval is floored by the health probe's own per-request
+timeout (`HEALTH_PROBE_TIMEOUT_S = 2.0`): polling faster than that queues
+requests against a socket that is not listening yet and buys nothing.
+
+#### 7b. Absorb-and-poll: why `compose_up` is not `compose_down`
+
+`stop_all`'s `compose_down` **propagates**. `ensure_running`'s `compose_up` is
+**absorbed** — logged, never raised. That asymmetry is the design, not an
+oversight, and it is worth stating why in full because it looks like an
+inconsistency.
+
+A stop command's failure is evidence: if teardown failed, the database may
+still be running, and reporting success would be a lie ADR-0021 exists to
+prevent. A **start** command's failure is not evidence of anything about the
+database. Two `partgraph` invocations can race — the operator runs `search` in
+one terminal and `stats` in another — and the loser is told *"container name
+`partgraph-dgraph` is already in use"* by an engine that is, at that moment,
+starting the very database the loser wants. Treating that exit code as
+authoritative would fail a command that is about to succeed.
+
+So the start attempt is best-effort and **the health probe is the sole
+verdict**. No fabricated lock, no lock file, no PID file, no advisory
+flock — health is the truth. This one decision makes both cases fall out
+correctly with no special-casing:
+
+- a **genuine, unrecoverable** start failure (no engine, port taken, corrupt
+  volume) is still reported — one bounded wait later, by step 3, because health
+  never arrives;
+- a **lost race** proceeds normally, because health does arrive.
+
+The two are separated by what happens next, never by what the start command
+said.
+
+The cost of absorbing is that the diagnosis could be thrown away, and it is
+not: the absorbed exception's **type name** is logged at `WARNING` through the
+module's own `_LOGGER`, alongside `_stop_unit_if_active`'s and
+`_mounts_data_volume`'s existing absorbed-failure records. Only the type, never
+the message — a class name cannot contain a path separator, whereas engine
+stderr routinely quotes a compose file location, and this module's logging rule
+is that no record may leak one. The type is still enough to separate the two
+failures that matter: `ContainerEngineError` ("there is no container engine on
+this host") from `AutostartComposeError` ("the engine ran and refused"). It is
+**not** enough to tell a lost race from a genuine non-zero exit — those share a
+type, and the honest answer is that only the poll's outcome distinguishes them.
+
+#### 7c. The `compose_up` seam does not print
+
+`cli.py`'s `_run_compose` prints a red `Error:` line to stderr *before*
+raising. Reusing it verbatim as the `compose_up` seam would have made the
+losing side of a race print `Error: failed to start the Dgraph database (the
+container engine exited with code 125)` and then complete successfully with
+exit 0 — a message describing something that did not go wrong, on a command
+that worked.
+
+So `_autostart_compose_up()` is a separate, print-free function producing the
+**identical argv** (`<engine> compose -f <abs COMPOSE_FILE> up -d`), the same
+`shell=False` list-argv discipline, the same engine detection through
+`compose_command()`, and the same `COMPOSE_TIMEOUT_S` watchdog `db up` uses —
+because it can pay the same first-run image pull. It signals failure by
+raising; whether that failure matters is the poll's decision, and only if it
+does does anything reach the operator.
+
+#### 7d. `PARTGRAPH_AUTOSTART` — the parsing table
+
+Read from `os.environ` at call time, stripped, compared case-insensitively.
+
+| Value | Autostart |
+| --- | --- |
+| unset | **on** |
+| `""` (empty) | **on** |
+| `0`, `false`, `no`, `off` (any case, any surrounding whitespace) | **off** |
+| `1`, `true`, `yes`, `on` | **on** |
+| anything else (`banana`, `disable`, `n`, …) | **on** |
+
+Three decisions are packed in here.
+
+**Why parsing lives in `cli.py`, not the leaf.** `ensure_running()` decides
+from its injected seams and a health probe only. If it also consulted the
+environment, the same function would answer differently for identical
+arguments, and every future caller would inherit an invisible dependency on a
+variable it never mentions. The environment is CLI policy; the CLI owns it.
+
+**Why `off` is in the disable set.** The ADR names exactly one spelling
+(`PARTGRAPH_AUTOSTART=0`), but `false`/`no`/`off` are the numeric, generic-CLI
+and systemd vocabularies for the identical intent, and an operator reaching for
+this variable is overwhelmingly likely to type one of them. The two directions
+of error are **not** symmetric. Failing open on an unrecognised value changes
+nothing, because autostart is already the default. Failing open on a value the
+operator plainly meant as "off" does the *opposite* of what they typed — and
+the action being withheld is starting a container on a host that also runs an
+unrelated cve-graph stack. That asymmetry is what makes `off` mandatory rather
+than merely nice.
+
+**Why the set stops at four.** The same asymmetry, pointed the other way.
+Every token added to the disable set is a token a typo can land *inside*,
+silently switching a default-on feature off with no diagnostic — the one
+failure mode that is genuinely hard to notice. `n`, `disable`, `0.0` and
+friends are therefore a deliberate non-goal, not an oversight to be fixed
+later.
+
+#### 7e. Where autostart is wired, and where it is not
+
+Nine commands need a live database: `search`, `show`, `stats`, `embed`,
+`refresh`, `refresh-links`, `db apply-schema`, `db check-index`, and
+`ingest jlcparts` — the last **only** once it reaches its load stage, never
+during fetch or normalize, which touch no database at all.
+
+Nine commands, but **three** wiring sites, because seven of them reach Dgraph
+exclusively through one helper:
+
+1. `_connect_dgraph()` — a thin wrapper that runs the autostart gate and then
+   calls the existing `_build_dgraph_client()`. Every one of those seven
+   commands (and `_stage_load`) calls it.
+2. `db apply-schema`, which uses its own gRPC path.
+3. `db check-index`, which queries the HTTP endpoint directly.
+
+A wrapper rather than a gate inside `_build_dgraph_client()` itself: that
+function's single job is constructing a client with the right gRPC ceiling, and
+every caller of it — including a future one that already holds a live database
+— would otherwise inherit a container-start side effect it never asked for.
+Keeping "connect to the database" and "make sure there is a database"
+separately callable is exactly what lets sites 2 and 3 take the second without
+the first.
+
+Both explicit sites are placed **after** their local, non-database work: after
+`load_schema()` reads the schema file, so a missing or malformed local schema is
+reported without starting a container for it. The same rule governs
+`_connect_dgraph()`'s call sites — all of them sit after every flag has been
+validated, so a bad `--limit` never starts anything.
+
+Commands that must **never** autostart, and why:
+
+- **`db status`** — ADR-0018 makes it an engine-independent health probe. A
+  probe that starts what it measures is a broken instrument.
+- **`db down`** — starting what you are trying to stop needs no argument.
+- **`db doctor`** — PR-B1 made it strictly read-only (§ 3a).
+- **`db up`** — its own single `compose up -d` *is* the job.
+- **`version`, every `--help`** — they touch nothing.
+
+#### 7f. `restart: "no"` in `docker/docker-compose.yml`
+
+`restart: unless-stopped` became `restart: "no"` (quoted: bare `no` is YAML's
+boolean `False`, a different and invalid Compose value).
+
+Under rootless podman nothing revives a container at boot — there is no
+user-session daemon running then — so the old policy advertised a lifecycle
+guarantee it could not keep on this host. What actually restarted the database
+was the quadlet unit, and removing that is the entire point of § 5. With every
+command now able to start the database itself, an engine-level restart policy
+has nothing left to contribute. `container_name`, the loopback port bindings,
+`init: true` and `stop_grace_period` are untouched.
+
+## Breaking changes
+
+This is a real contract change, not an internal refactor, and it changes what
+`partgraph` does on a host where the database is down. Three consequences,
+stated plainly:
+
+1. **Read-only commands can now start a container as a side effect.**
+   `search`, `show` and `stats` modify nothing in the database and never will —
+   but from this release they may create and start `partgraph-dgraph` before
+   reading from it. Anyone who relied on "a read-only command touches no
+   container lifecycle" no longer can. `PARTGRAPH_AUTOSTART=0` restores the old
+   behaviour exactly.
+2. **Behaviour and timing change for a down database.** Previously any of the
+   nine commands failed fast with the path-free "Is the database running? Start
+   it with `partgraph db up`." hint. Now, unless `PARTGRAPH_AUTOSTART` is set
+   to a disable token, they attempt a start and then wait — up to
+   `AUTOSTART_READY_TIMEOUT_S` (120 s) plus the start command's own duration,
+   which on a first run includes pulling the image. A script that measured its
+   own runtime, or that treated a fast non-zero exit as "the database is down",
+   sees different timing and a different message
+   (`AutostartTimeoutError`'s, naming `partgraph db status`).
+3. **A host with no container engine now fails slowly instead of fast.** With
+   neither podman nor docker on `PATH`, `compose_command()` raises
+   `ContainerEngineError` — which `ensure_running()` absorbs like any other
+   start failure. The invocation therefore spends the **full readiness budget**
+   before reporting a timeout, where it previously failed immediately. This is
+   the direct, accepted cost of § 7b's rule that the start command's outcome is
+   never authoritative: the same absorption that lets a lost race succeed makes
+   an unstartable host wait. Setting `PARTGRAPH_AUTOSTART=0` restores the fast
+   failure, and that is the documented answer for CI and for scripted use.
+
+The migration for every one of these is one variable, and it is the same
+variable in all three cases.
+
+## Amendment to ADR-0014 D1
+
+ADR-0014 D1 reads *"the DB is never started here … The scheduling layer also
+never manages the database lifecycle."* As written, that is **no longer
+unconditionally true**, and this section amends it rather than leaving the
+contradiction to be discovered.
+
+`partgraph refresh` and `partgraph refresh-links` are both in § 7e's allowlist,
+and `systemd/partgraph-refresh-all.service` — fired weekly by
+`partgraph-refresh-all.timer` — runs exactly those two commands, unattended.
+With autostart default-on and no opt-out, that timer would have started a
+container **on a schedule**: the same unattended, nobody-asked-for-it container
+this ADR exists to eliminate, reintroduced through the scheduling door after
+§ 5 closed the login door.
+
+**The amended guarantee.** D1's promise holds for the scheduling layer, and it
+now holds *because the shipped unit says so explicitly* rather than because the
+CLI is incapable of starting anything. `systemd/partgraph-refresh-all.service`
+sets:
+
+```
+Environment=PARTGRAPH_AUTOSTART=0
+```
+
+placed **after** the optional `EnvironmentFile=-%h/.config/partgraph/refresh-all.env`,
+because systemd applies same-key `Environment=`/`EnvironmentFile=` directives
+in file order and the last one wins. An operator's own env file therefore
+cannot silently reintroduce an implicit container start on a scheduled run.
+The unit's header comment and `docs/scheduling.md`'s `[!WARNING]` block both
+name `PARTGRAPH_AUTOSTART`, so a reader is told *why* the "never manages the
+database lifecycle" claim still holds instead of finding it contradicted by
+`--help`.
+
+An `EnvironmentFile`-only resolution was rejected: the only env file this repo
+references is optional (leading `-`, missing-file-is-non-fatal) and
+operator-created, and most installs will never have one. A guarantee that
+depends on a file most operators do not have is not a guarantee.
+
+**Scope of the amendment.** D1 is amended, not repealed. The scheduling layer
+still runs no daemon, still does not health-check the database, and still
+propagates a failed run to the host scheduler with the existing path-free hint.
+What changed is that "never starts the database" is now a property of the
+shipped unit's configuration rather than of the CLI's capabilities, and
+therefore something an operator can undo — deliberately, by editing that line.
 
 ## Alternatives rejected
 
@@ -335,6 +623,28 @@ PR-C's subject.
   for: it makes the unit unstartable *by any means*, including deliberately, and
   it is easy to forget you did it. Removing `WantedBy=` removes exactly the
   behaviour complained about and leaves `systemctl --user start` working.
+- **A lock file / PID file / advisory flock around the start (PR-B2).** The
+  obvious answer to two invocations racing to start one container, and rejected
+  because it invents state that can outlive the thing it describes: a stale
+  lock after a SIGKILL — and § 6 records that SIGKILL was this container's
+  normal exit until `init: true` landed — blocks a start that should have
+  succeeded, and now needs its own staleness heuristic. Health is already an
+  authoritative, self-cleaning answer to the only question being asked. See
+  § 7b.
+- **Propagating `compose_up`'s failure, for symmetry with `compose_down`
+  (PR-B2).** It reads consistently and is wrong: the loser of a start race gets
+  a genuine non-zero exit from an engine that is starting the database
+  perfectly well, so the command would fail while succeeding. § 7b.
+- **Reusing `_run_compose` as the `compose_up` seam (PR-B2).** Free, and it
+  makes a recovered-from race print a red `Error:` line and then exit 0. § 7c.
+- **Autostarting inside `_build_dgraph_client()` itself (PR-B2).** One fewer
+  function, and it welds "start a container" onto every present and future
+  caller of a helper whose job is constructing a gRPC client — including
+  callers that already have a live database. § 7e.
+- **Making `db status` autostart (PR-B2).** Never seriously considered, and
+  recorded because it is the one that looks helpful: ADR-0018 makes it an
+  engine-independent probe, and a probe that starts what it measures cannot
+  report on it.
 - **Making `db doctor`'s exit code carry a verdict.** Tempting, and rejected:
   there is no non-arbitrary mapping from "the unit exists and autostart is on"
   to "failure". That is a *finding*, and whether it is bad depends entirely on
@@ -348,6 +658,51 @@ container, or reads a real clock. `subprocess.run`, `shutil.which` and cli.py's
 own `engine_command`/`probe_health` are the only patch points, so the real
 `unit_state()`, `find_partgraph_instances()` and `volume_exists()` run
 end-to-end through the CLI.
+
+### PR-B2
+
+`tests/unit/test_lifecycle_ensure_running.py` pins `ensure_running()`: the
+healthy short-circuit calling neither `compose_up` nor `sleep` nor `monotonic`;
+exactly one `compose_up` followed by polling until healthy; the bounded wait,
+driven entirely by an injected clock scripted as fractions of the real
+constants rather than hard-coded seconds, so no test depends on elapsed time; a
+start failure that never recovers timing out cleanly; a start failure that
+*does* recover returning normally; the absorbed failure appearing in this
+module's own logger, path-free; the timeout message naming the budget and
+`partgraph db status` on one path-free line; both required seams keyword-only
+with no default; `sleep`/`monotonic` defaulting to `None` and resolving to the
+patched `time` module at call time; and the four new names present in
+`__all__`, which is where `test_lifecycle_architecture.py`'s re-export guard
+derives its forbidden set from at run time.
+
+`tests/unit/test_cli_autostart.py` drives the real `ensure_running()`
+end-to-end through `search` for the argv-level contract — the autostart argv
+equals `db up`'s byte for byte, with `shell=False` and a bounded `timeout=` —
+and proves that an absorbed start failure followed by health recovery prints no
+error text at all. The remaining allowlisted commands are verified by ordering
+(each command's own database-touching mock raises unless autostart already
+fired) plus seam identity (`probe_health` by `is`, and `compose_up` invoked in
+isolation and asserted to issue `db up`'s argv), so a dummy callable placed
+after the database work cannot satisfy them. The negatives — `db status`,
+`db down`, `db doctor`, `db up`, `version`, and `--help` on all nine — assert
+`ensure_running` is never called, and the parsing table is exercised value by
+value.
+
+`tests/conftest.py` forces `PARTGRAPH_AUTOSTART=0` for every test via an
+autouse fixture, so no test that has never heard of autostart can start a
+container during a plain `pytest` run;
+`tests/unit/test_autostart_hermeticity.py` parses `conftest.py` and fails if
+that fixture stops existing or stops being autouse.
+`tests/unit/test_scheduling_autostart_disabled.py` pins the amendment above:
+the unit sets `Environment=PARTGRAPH_AUTOSTART=0`, that line is the last word
+after every `EnvironmentFile=`, and both the unit header and
+`docs/scheduling.md`'s warning block name the variable.
+
+**Not verified, and deliberately so.** No container was started for this PR
+either. `AUTOSTART_READY_TIMEOUT_S` is therefore an unmeasured judgement call
+(§ 7a says so in the constant's own docstring), and the race described in § 7b
+was reasoned about and modelled in tests, never reproduced against two live
+`partgraph` processes.
 
 `tests/unit/test_lifecycle_volume.py` pins `volume_exists()`: True on exit 0,
 False on non-zero, None on timeout and on `OSError`, True even when a successful
