@@ -187,13 +187,26 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
 ):
     """Return (fake_run, calls) — a STATEFUL subprocess.run replacement.
 
-    ``live`` is the in-memory {container_id: row} set; a successful
-    stop/compose-down/systemctl-stop mutates it exactly as a real engine
-    would, so a SECOND `ps` call (the verification re-enumeration) genuinely
-    reflects what survived. ``calls`` records every (argv, kwargs) pair in
-    order for ordering/timeout/argv assertions. The engine `stop` TARGET
-    (``argv[-1]``) is always a container ID (Gate 3a finding 3a-H1) —
-    ``stop_fails_ids``/removal-from-``live`` are keyed by id, never by name.
+    ``live`` is the in-memory {container_id: row} set. Compose's own `down`
+    and a successful `systemctl --user stop` both genuinely REMOVE what they
+    created (the production module's own docstring: "Compose's own down
+    still removes what Compose created"), so ``compose_removes_ids`` /
+    ``systemctl_stop_removes_ids`` still pop the row entirely. A successful
+    ENGINE `stop` (target NOT in ``stop_fails_ids``) is DIFFERENT: `db
+    down`'s locked verb surface is `stop`-only (never `rm`), so it flips
+    that row's ``State`` to ``"exited"`` instead — it is NEVER popped. A
+    real engine still LISTS a stopped container under `ps --all`; modelling
+    a successful engine stop as full removal is `rm` semantics, a modelling
+    error (the same category of bug GATE-PR7 A18 fixed — asserting a
+    container must not EXIST rather than must not be RUNNING). So a SECOND
+    `ps` call (the verification re-enumeration) STILL lists an
+    engine-stopped container — now NOT_RUNNING — and STILL triggers a fresh
+    `container inspect` call on it, which is what makes "survived the stop"
+    and "was stopped" genuinely distinguishable (Gate 6 fixture-premise
+    fix). ``calls`` records every (argv, kwargs) pair in order for
+    ordering/timeout/argv assertions. The engine `stop` TARGET (``argv[-1]``)
+    is always a container ID (Gate 3a finding 3a-H1) — ``stop_fails_ids`` is
+    keyed by id, never by name.
 
     ``inspect_fails_ids_by_pass`` (Gate 5 finding A) maps a 1-indexed `ps`
     PASS NUMBER (1 = the pre-stop sweep's enumeration, 2 = the verification
@@ -242,7 +255,11 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
             target_id = argv[-1]
             if target_id in stop_fails_ids:
                 return _Proc(returncode=1, stderr="stop failed")
-            live.pop(target_id, None)
+            # `stop` is not `rm`: the row stays LISTED, now in a NOT_RUNNING
+            # state, exactly like a real engine. NEVER pop it — see the
+            # docstring above.
+            if target_id in live:
+                live[target_id] = {**live[target_id], "State": "exited"}
             return _Proc(returncode=stop_returncode)
         raise AssertionError(f"unscripted subprocess.run call in test fixture: {argv}")
 
@@ -753,11 +770,17 @@ def test_finding_a_inspect_fails_both_passes_exit_nonzero_undetermined_message()
 def test_finding_a_inspect_fails_only_verification_pass_exit_nonzero() -> None:
     """Gate 5 Finding A: Given the SAME S2-only-named container, but inspect
     SUCCEEDS during the pre-stop sweep (correctly classified S2, so a
-    `stop` IS attempted) and FAILS only during the verification pass.
+    `stop` IS attempted and SUCCEEDS) and FAILS only during the
+    verification pass. `db down`'s verb surface is `stop`-only, never
+    `rm`, so the successfully-stopped row is STILL listed by `ps --all`
+    (now `exited`) — the verification pass genuinely re-enumerates and
+    re-inspects it, and that second inspect call is the one that fails.
     When `partgraph db down` runs.
     Then the exit code is still 1 with the same "could not verify" message
     — a verification-pass-only failure is sufficient on its own to
-    withhold a clean result.
+    withhold a clean result — and the ordinary success line ("Dgraph
+    stopped...") is NOT what the command exits on: the "could not verify"
+    branch returns before it, even though a stop genuinely was issued.
     """
     row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4")
     fake_run, _calls = _make_scripted_run(
@@ -777,6 +800,10 @@ def test_finding_a_inspect_fails_only_verification_pass_exit_nonzero() -> None:
     assert result.exit_code == 1, result.output
     assert "systemd-partgraph-dgraph-maybe" in result.output
     assert "could not verify" in result.output.lower()
+    assert "Dgraph stopped" not in result.output, (
+        "the undetermined-ownership exit path must not ALSO print the "
+        f"ordinary clean-success line: {result.output!r}"
+    )
 
 
 def test_finding_a_inspect_fails_only_pre_stop_sweep_not_fatal_exit_zero() -> None:

@@ -64,18 +64,19 @@ re-exported from `partgraph/util/__init__.py`. Both rules are enforced
 mechanically by a source-text scan in
 `tests/unit/test_lifecycle_architecture.py`, not by prose alone.
 
-### 2. Selector policy S1 / S2 / S3 (locked)
+### 2. Selector policy S1 / S2 / UNKNOWN / S3 (locked)
 
 Ownership is decided **in Python, by exact string comparison, over a full
-enumeration**:
+enumeration**, and the four tags are tested in this **priority order**:
 
-| Tag    | Selector                                                                | Action                      |
-| ------ | ----------------------------------------------------------------------- | --------------------------- |
-| **S1** | container name is EXACTLY `partgraph-dgraph`                            | stop                        |
-| **S2** | container mounts the named volume EXACTLY `partgraph_dgraph_data`        | stop                        |
-| **S3** | holds host port `8081`/`9081`/`8001` but matches neither S1 nor S2       | **REPORT ONLY, never stop** |
+| # | Tag         | Selector                                                             | Action                      |
+| - | ----------- | -------------------------------------------------------------------- | --------------------------- |
+| 1 | **S1**      | container name is EXACTLY `partgraph-dgraph`                         | stop                        |
+| 2 | **S2**      | CONFIRMED to mount the named volume EXACTLY `partgraph_dgraph_data`  | stop                        |
+| 3 | **UNKNOWN** | mount status **undeterminable** — `container inspect` itself failed  | **never stop; see § 2a**    |
+| 4 | **S3**      | CONFIRMED not to mount it, but holds host port `8081`/`9081`/`8001`  | **REPORT ONLY, never stop** |
 
-Anything matching none of the three is not represented at all — it never appears
+Anything matching none of the four is not represented at all — it never appears
 in a result under some other tag.
 
 Exactness is load-bearing in both directions:
@@ -91,6 +92,47 @@ Exactness is load-bearing in both directions:
 - S3 exists because *something* answering on PartGraph's port is worth telling
   the operator about — but "it is on my port" is not "it is mine", so it is
   never a stop target.
+
+### 2a. UNKNOWN: an undetermined answer must not read as success
+
+S2 is the **only** thing that recognises a PartGraph instance running under a
+name Compose never chose — precisely the quadlet duplicate this ADR exists to
+stop — and S2 is decided **solely** by one `container inspect` call. The first
+implementation degraded any inspect failure (timeout, non-zero exit, unparseable
+payload) to "does not mount our volume". That is a **false success**: the same
+enumeration runs as both the pre-stop sweep and the post-stop verification, so a
+container whose inspect failed twice was invisible to both, and `db down` exited
+**0** — which this ADR contracts to mean "no PartGraph instance survives" —
+while it kept running.
+
+The mount probe is therefore **tri-state**: mounts / does not mount / **could
+not be determined**. `None` is never collapsed into `False`.
+
+- **UNKNOWN is tested BEFORE the port check.** A container we could not classify
+  must never be confidently downgraded to "just a port holder, safe to leave"
+  merely because it happens to hold a watched port. S3 now means *positively
+  confirmed not ours*, which is a stronger and more honest claim than before.
+- **UNKNOWN is never a stop target**, exactly like S3. We stop only what we
+  positively know is ours; an unverifiable container is reported, not acted on.
+  This keeps the cve-graph guarantee intact: an inspect failure can never
+  escalate into stopping a foreign container.
+- **`DownResult.undetermined`** carries the names still tagged UNKNOWN **after
+  the final verification pass, and only that pass**. An inspect failure confined
+  to the pre-stop sweep that resolves before verification is absorbed — the same
+  "do not over-fire" treatment phase-1 systemctl failures get (§ 5). Only
+  verification decides the verdict.
+- **The exit code follows.** `db down` exits **1** whenever `undetermined` is
+  non-empty, with a message containing "could not verify" and deliberately
+  *not* "still running", so the two conditions stay textually distinct: one says
+  the sweep positively failed, the other says the sweep cannot honestly claim to
+  have succeeded. Exit 0 keeps its full strength — it promises that nothing
+  PartGraph owns survived, and an unverifiable container cannot support that
+  promise.
+
+This mirrors the `_NOT_RUNNING_STATES` deny-list and `UnitState.wanted_by_default
+is None` decisions already recorded here: throughout this module, an
+undetermined answer degrades toward suspicion and a loud exit, never toward a
+silent all-clear.
 
 #### Forbidden selectors
 
@@ -113,13 +155,32 @@ is relied upon.
 
 The `--format json` **outer envelope** is undocumented and differs between
 engines (a single JSON array vs. newline-delimited JSON), so the parser accepts
-**both**. The **row shape** differs too — Podman reports `Id` and a `Names`
-list, Docker reports `ID` and a single comma-joined `Names` string — so both
-spellings are accepted, and the docker-shaped name string is split **before**
-the allow-list runs, never after, so a separator can never smuggle a second
-value past validation. Accepting both is what makes
-`PARTGRAPH_CONTAINER_ENGINE=docker` route through this module genuinely rather
-than nominally.
+**both**. The **row shape** differs too, in three places, and all three are
+accepted:
+
+| Field   | Podman                                | Docker                                        |
+| ------- | ------------------------------------- | --------------------------------------------- |
+| id      | `"Id"`                                | `"ID"`                                        |
+| name    | `"Names"` list                        | `"Names"` comma-joined string                 |
+| ports   | `"Ports"` list of dicts (`host_port`) | `"Ports"` string, `"0.0.0.0:8081->8080/tcp"`  |
+
+The docker-shaped name string is split **before** the allow-list runs, never
+after, so a separator can never smuggle a second value past validation. The
+docker-shaped ports string is split on commas, and each mapping's host port is
+read after the LAST `:` of the host side (so an IPv6 host such as
+`[::]:8081->8080/tcp` parses correctly); a segment without `->` publishes no
+host port and is skipped, as is a host side that is not a plain in-range
+integer — including a published RANGE such as `8081-8083`, which degrades to no
+port for that segment. Ports only ever ADD the report-only S3 tag and never
+override S1/S2/UNKNOWN, so a degraded port parse can never mis-stop anything;
+its only cost is a missed S3 advisory.
+
+Accepting all three shapes is what makes `PARTGRAPH_CONTAINER_ENGINE=docker`
+route through this module genuinely rather than nominally. Before it,
+`_row_ports` understood only Podman's shape, so on a Docker engine every
+container degraded to "publishes no ports" and **S3 silently never fired at
+all** — an undisclosed observability gap rather than a safety one, since ports
+are not a stop authority.
 
 Degradation is per-row: a non-dict array element, a row carrying no container ID
 under either spelling, a row missing `Names`, and a row whose `Names` is an
@@ -226,8 +287,12 @@ Three deliberate, enumerated breaking changes to the `db down` contract:
   longer the whole story and must not be parsed as such.
 - **(b) exit code is now meaningful.** Was Compose's return code, i.e. "did the
   Compose call succeed". It is now **0 iff no PartGraph instance survives the
-  sweep**, else **1** — a container that Compose was perfectly happy about but
-  that is still running now exits non-zero. `--dry-run` always exits 0.
+  sweep AND every enumerated container's ownership could be verified**, else
+  **1** — a container that Compose was perfectly happy about but that is still
+  running now exits non-zero, and so does one whose ownership `container
+  inspect` could not determine during verification (§ 2a). The two are reported
+  by textually distinct messages ("still running" vs. "could not verify") so a
+  script can tell "it failed" from "it cannot say". `--dry-run` always exits 0.
 - **(c) new processes may be invoked.** `db down` may now run
   `systemctl --user show`/`stop` and a direct engine `stop`, in addition to the
   Compose call. On a host with no `systemd --user` session, `systemctl` is
@@ -316,9 +381,12 @@ Recorded so a later reader does not mistake them for accidents:
 - **Scripts that parsed `db down`'s stdout** must stop doing so; it is now a
   PartGraph-composed summary. Call `<engine> compose -f docker/docker-compose.yml
   down` directly to get the old raw behaviour.
-- **Scripts that ignored `db down`'s exit code** should now check it: a non-zero
-  exit means a PartGraph instance is *still running*, which previously went
-  unreported.
+- **Scripts that ignored `db down`'s exit code** should now check it. A non-zero
+  exit means either that a PartGraph instance is *still running* or that a
+  container's ownership *could not be verified* — both previously went
+  unreported as a plain exit 0. The two are distinguishable by message, but a
+  script that only branches on the code should treat both as "the database may
+  still be up"; re-running `db down` is safe and idempotent.
 - **Hosts carrying a `partgraph-dgraph.service` quadlet unit**: `db down` now
   stops that unit as well. It does **not** disable it — a unit with
   `WantedBy=default.target` will still start again at the next login. Removing

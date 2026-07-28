@@ -167,8 +167,27 @@ _OWNER_NAME_MATCH = "S1"
 _OWNER_VOLUME_MATCH = "S2"
 _OWNER_PORT_HOLDER = "S3"
 
-#: Ownership tags whose containers this module may stop. S3 is never here.
+#: Fourth tag: the container's volume-mount status could NOT be determined
+#: because ``container inspect`` itself failed. Deliberately distinct from S3:
+#: "I could not tell" must never be recorded as "I checked, and it is not
+#: ours" (Gate 5 finding A).
+_OWNER_UNDETERMINED = "UNKNOWN"
+
+#: Ownership tags whose containers this module may stop. Neither S3 nor
+#: UNKNOWN is ever here: we only stop what we positively know is ours.
 _STOPPABLE_OWNERS = frozenset({_OWNER_NAME_MATCH, _OWNER_VOLUME_MATCH})
+
+#: Host-port grammar for a Docker-shaped ``Ports`` string. Strict ASCII digits
+#: only — ``str.isdigit()`` would also accept non-ASCII digit characters.
+_HOST_PORT_GRAMMAR = re.compile(r"^[0-9]+$")
+
+#: The separator Docker puts between the host side and the container side of a
+#: published port, e.g. ``0.0.0.0:8081->8080/tcp``.
+_DOCKER_PORT_ARROW = "->"
+
+#: Inclusive bounds for an accepted TCP/UDP port number.
+_MIN_PORT = 1
+_MAX_PORT = 65535
 
 #: Engine ``State`` values that positively mean "not currently running", so
 #: there is nothing to stop and nothing to report as a survivor. Deliberately a
@@ -212,11 +231,16 @@ class Instance:
         status: The engine-reported state (e.g. ``"running"``, ``"exited"``).
         ports: The host ports this container publishes, de-duplicated.
         owned_by: One of ``"S1"`` (exact name), ``"S2"`` (mounts the named data
-            volume) or ``"S3"`` (holds a watched host port but is not ours —
-            report-only). A container matching none of the three is never
+            volume), ``"UNKNOWN"`` (the mount status could not be determined
+            because ``container inspect`` failed) or ``"S3"`` (POSITIVELY
+            confirmed not to mount our volume, but holds a watched host port —
+            report-only). A container matching none of the four is never
             represented by an ``Instance`` at all.
-        mounts_data_volume: True iff the container mounts
-            :data:`PARTGRAPH_DATA_VOLUME` by exact name.
+        mounts_data_volume: True iff the container is CONFIRMED to mount
+            :data:`PARTGRAPH_DATA_VOLUME` by exact name. False covers both
+            "confirmed not to" and "could not be determined" — ``owned_by`` is
+            the authoritative field for that distinction, and it reads
+            ``"UNKNOWN"`` in the latter case.
     """
 
     id: str
@@ -274,6 +298,14 @@ class DownResult:
         survivors: Names of S1/S2 instances still running after verification.
         still_serving_health: True iff Dgraph's health endpoint still answered
             after the sweep.
+        undetermined: Names of instances whose ownership could NOT be
+            determined during the FINAL verification pass, because
+            ``container inspect`` failed on them there. Populated from that
+            pass ONLY: an inspect failure confined to the pre-stop sweep, which
+            resolves by the time verification runs, never lands here (the same
+            "do not over-fire" absorption phase-1 systemctl failures get). A
+            non-empty tuple means the sweep cannot honestly claim success —
+            distinct from :attr:`survivors`, which means it positively failed.
     """
 
     stopped: tuple[str, ...]
@@ -281,6 +313,7 @@ class DownResult:
     unit_stopped: bool
     survivors: tuple[str, ...]
     still_serving_health: bool
+    undetermined: tuple[str, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -410,17 +443,63 @@ def _row_name(row: Mapping[str, Any]) -> str | None:
 
 
 def _row_ports(row: Mapping[str, Any]) -> tuple[int, ...]:
-    """Return the de-duplicated host ports the row publishes."""
+    """Return the de-duplicated host ports the row publishes.
+
+    Both observed engine shapes parse identically: Podman's ``list[dict]``
+    (each entry carrying a ``host_port`` int) and Docker's comma-joined string
+    (``"0.0.0.0:8081->8080/tcp, 0.0.0.0:9081->9080/tcp"``). Anything else — a
+    malformed string, an empty string, a missing key — degrades to no ports
+    rather than raising. Ports only ever ADD the report-only S3 tag; they never
+    override S1/S2/UNKNOWN, so a degraded parse can never mis-stop anything.
+    """
     raw_ports = row.get("Ports")
-    if not isinstance(raw_ports, list):
-        return ()
+    if isinstance(raw_ports, list):
+        return _sorted_ports(_podman_host_ports(raw_ports))
+    if isinstance(raw_ports, str):
+        return _sorted_ports(_docker_host_ports(raw_ports))
+    return ()
+
+
+def _podman_host_ports(entries: list[Any]) -> set[int]:
+    """Extract host ports from podman's ``list[dict]`` ``Ports`` shape."""
     host_ports: set[int] = set()
-    for entry in raw_ports:
+    for entry in entries:
         if not isinstance(entry, dict):
             continue
         value = entry.get("host_port")
         if isinstance(value, int) and not isinstance(value, bool):
             host_ports.add(value)
+    return host_ports
+
+
+def _docker_host_ports(value: str) -> set[int]:
+    """Extract host ports from Docker's comma-joined ``Ports`` string.
+
+    Each comma-separated mapping looks like ``<host_ip>:<host_port>-><container
+    _port>/<proto>``; the host IP may be IPv6 (``[::]:8081->8080/tcp``), which
+    is why the host port is taken after the LAST ``:``. A segment without the
+    ``->`` separator publishes no host port (Docker prints bare ``8080/tcp``
+    for a merely-exposed port) and is skipped, as is a host side that is not a
+    plain in-range integer — including a published RANGE such as
+    ``8081-8083``, which degrades to no port for that segment.
+    """
+    host_ports: set[int] = set()
+    for segment in value.split(","):
+        mapping = segment.strip()
+        if _DOCKER_PORT_ARROW not in mapping:
+            continue
+        host_side = mapping.split(_DOCKER_PORT_ARROW, 1)[0]
+        candidate = host_side.rsplit(":", 1)[-1].strip()
+        if _HOST_PORT_GRAMMAR.match(candidate) is None:
+            continue
+        port = int(candidate)
+        if _MIN_PORT <= port <= _MAX_PORT:
+            host_ports.add(port)
+    return host_ports
+
+
+def _sorted_ports(host_ports: set[int]) -> tuple[int, ...]:
+    """Return *host_ports* as a deterministic, de-duplicated tuple."""
     return tuple(sorted(host_ports))
 
 
@@ -430,30 +509,48 @@ def _row_text(row: Mapping[str, Any], key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _mounts_data_volume(engine_prefix: list[str], container_id: str) -> bool:
-    """Return True iff *container_id* mounts :data:`PARTGRAPH_DATA_VOLUME`.
+def _mounts_data_volume(engine_prefix: list[str], container_id: str) -> bool | None:
+    """Report whether *container_id* mounts :data:`PARTGRAPH_DATA_VOLUME`.
 
-    Targets the opaque container ID, never a name, so a foreign container's name
-    never reaches an ``inspect`` argv. Any failure (non-zero exit, unparseable
-    payload, unexpected shape) degrades to False.
+    TRI-STATE (Gate 5 finding A): True (confirmed to mount it), False
+    (confirmed NOT to), or **None — could not be determined**, because the
+    ``inspect`` call itself failed: a timeout, a failure to execute, a non-zero
+    exit, an unparseable payload, or a shape carrying no ``Mounts`` at all.
+
+    None is never collapsed into False. Doing so is exactly the false success
+    this module exists to prevent: an S2 container is recognised ONLY by this
+    call, so a failed inspect silently reclassified as "does not mount our
+    volume" makes a still-running PartGraph instance invisible to both the
+    sweep and the verification, and `db down` then exits 0 while it runs on.
+
+    Targets the opaque container ID, never a name, so a foreign container's
+    name never reaches an ``inspect`` argv.
     """
     argv = [*engine_prefix, "container", "inspect", "--format", "json", container_id]
     try:
         result = _run_capture(argv, timeout=INSPECT_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
-        _LOGGER.warning("Inspecting a container timed out or could not be executed.")
-        return False
+        _LOGGER.warning(
+            "Inspecting a container timed out or could not be executed; its "
+            "ownership is undetermined."
+        )
+        return None
     if result.returncode != 0:
-        return False
+        _LOGGER.warning(
+            "Inspecting a container failed (engine exit code %d); its ownership "
+            "is undetermined.",
+            result.returncode,
+        )
+        return None
     try:
         parsed = json.loads(result.stdout)
     except ValueError:
-        return False
+        return None
     if not (isinstance(parsed, list) and parsed and isinstance(parsed[0], dict)):
-        return False
+        return None
     mounts = parsed[0].get("Mounts")
     if not isinstance(mounts, list):
-        return False
+        return None
     return any(
         isinstance(mount, dict)
         and mount.get("Type") == _MOUNT_TYPE_VOLUME
@@ -462,16 +559,30 @@ def _mounts_data_volume(engine_prefix: list[str], container_id: str) -> bool:
     )
 
 
-def _classify(name: str, *, mounts_volume: bool, ports: tuple[int, ...]) -> str | None:
-    """Return the S1/S2/S3 ownership tag for a container, or None if unrelated.
+def _classify(
+    name: str, *, mounts_volume: bool | None, ports: tuple[int, ...]
+) -> str | None:
+    """Return the ownership tag for a container, or None if it is not ours.
 
     Exact string equality only — never a prefix, suffix or substring match, and
-    never the image name or a Compose project label.
+    never the image name or a Compose project label. The priority order is
+    load-bearing:
+
+    1. name equals :data:`PARTGRAPH_CONTAINER_NAME` -> S1;
+    2. confirmed to mount :data:`PARTGRAPH_DATA_VOLUME` -> S2;
+    3. mount status UNDETERMINED -> ``UNKNOWN`` — checked BEFORE the port test,
+       so a container we could not classify is never confidently downgraded to
+       "just a port holder, safe to leave" merely because it happens to hold a
+       watched port;
+    4. confirmed NOT to mount it, but holds a watched host port -> S3;
+    5. otherwise not ours, and never returned at all.
     """
     if name == PARTGRAPH_CONTAINER_NAME:
         return _OWNER_NAME_MATCH
     if mounts_volume:
         return _OWNER_VOLUME_MATCH
+    if mounts_volume is None:
+        return _OWNER_UNDETERMINED
     if any(port in PARTGRAPH_WATCHED_PORTS for port in ports):
         return _OWNER_PORT_HOLDER
     return None
@@ -499,7 +610,9 @@ def _instance_from_row(engine_prefix: list[str], row: Mapping[str, Any]) -> Inst
         status=_row_text(row, "State"),
         ports=ports,
         owned_by=owned_by,
-        mounts_data_volume=mounts_volume,
+        # An undetermined mount status (None) surfaces as False here and as
+        # owned_by == "UNKNOWN" above; owned_by is the authoritative field.
+        mounts_data_volume=mounts_volume is True,
     )
 
 
@@ -822,6 +935,14 @@ def stop_all(  # noqa: PLR0913 — one keyword-only seam per injected dependency
     survivors = tuple(
         instance.name for instance in remaining if instance.id in survivor_ids
     )
+    # Populated from THIS pass only. An inspect failure during the pre-stop
+    # sweep that resolves before verification is absorbed, exactly like a
+    # phase-1 systemctl failure: only the verification pass decides the verdict.
+    undetermined = tuple(
+        instance.name
+        for instance in remaining
+        if instance.owned_by == _OWNER_UNDETERMINED
+    )
     stopped = tuple(
         instance.name
         for instance in targets
@@ -834,4 +955,5 @@ def stop_all(  # noqa: PLR0913 — one keyword-only seam per injected dependency
         unit_stopped=unit_stopped,
         survivors=survivors,
         still_serving_health=_still_serving_health(probe_health),
+        undetermined=undetermined,
     )

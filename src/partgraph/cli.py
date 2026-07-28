@@ -391,6 +391,21 @@ def down(
         )
         raise typer.Exit(code=1)
 
+    if result.undetermined:
+        # Deliberately worded so it can never be confused with the survivor
+        # line above: this is "we could not check", not "it is still running".
+        # Exit 1 all the same — exit 0 promises that no PartGraph instance
+        # survived, and an unverifiable container cannot support that promise.
+        _err_console.print(
+            f"Error: could not verify whether {len(result.undetermined)} "
+            f"container(s) belong to PartGraph: {', '.join(result.undetermined)}. "
+            "Re-run db down, or check them by hand.",
+            markup=False,
+            soft_wrap=True,
+            style="red",
+        )
+        raise typer.Exit(code=1)
+
     _console.print(_down_success_line(result), markup=False, soft_wrap=True)
     if result.still_serving_health:
         _err_console.print(

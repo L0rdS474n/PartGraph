@@ -338,15 +338,24 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
     """Return (fake_run, calls) — a STATEFUL subprocess.run stand-in.
 
     ``fake_run`` dispatches on argv shape (never trusts call ORDER). ``live``
-    is the in-memory {container_id: row} set; a successful engine `stop`
-    (target NOT in ``stop_fails_ids``) mutates it exactly as a real engine
-    would, so a SECOND `ps` call (a verification re-enumeration) genuinely
-    reflects what survived — "survived the stop" and "was stopped" are
-    therefore distinguishable, mirroring
+    is the in-memory {container_id: row} set. A successful engine `stop`
+    (target NOT in ``stop_fails_ids``) flips that row's ``State`` to
+    ``"exited"`` — it is NEVER popped/removed from ``live``. `db down`'s
+    locked verb surface is `stop`-only (never `rm`): a real engine still
+    LISTS a stopped container under `ps --all` in state ``exited``; modelling
+    a successful stop as full removal is `rm` semantics, a modelling error
+    (this is the same category of bug GATE-PR7 A18 fixed — asserting a
+    container must not EXIST rather than must not be RUNNING). So a SECOND
+    `ps` call (a verification re-enumeration) STILL lists a stopped
+    container — it just carries a NOT_RUNNING status now, exactly like a
+    real engine — and STILL triggers a fresh `container inspect` call on it
+    (the row is not gone), which is what makes "survived the stop" and "was
+    stopped" genuinely distinguishable, mirroring
     tests/unit/test_cli_db_down.py's `_make_scripted_run` (Gate 3a finding
-    3a-M6). ``ps_stdout_override`` lets a test replace the ps response body
-    verbatim (empty string / malformed text / an oversized payload) for
-    every ps call. ``calls`` records every (argv, kwargs) pair in order.
+    3a-M6 / Gate 6 fixture-premise fix). ``ps_stdout_override`` lets a test
+    replace the ps response body verbatim (empty string / malformed text /
+    an oversized payload) for every ps call. ``calls`` records every (argv,
+    kwargs) pair in order.
 
     ``inspect_fails_ids_by_pass`` (Gate 5 finding A) maps a 1-indexed `ps`
     PASS NUMBER (1 = the first `find_partgraph_instances()` call a test
@@ -387,7 +396,11 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
             target_id = argv[-1]
             if target_id in stop_fails_ids:
                 return _Proc(returncode=1, stderr="stop failed")
-            live.pop(target_id, None)
+            # `stop` is not `rm`: the row stays LISTED, now in a NOT_RUNNING
+            # state, exactly like a real engine (`db down`'s verb surface is
+            # stop-only). NEVER pop it — see the docstring above.
+            if target_id in live:
+                live[target_id] = {**live[target_id], "State": "exited"}
             return _Proc(returncode=stop_returncode)
         raise AssertionError(f"unscripted subprocess.run call in test fixture: {argv}")
 
@@ -1548,24 +1561,37 @@ def test_stop_all_inspect_fails_both_passes_s2_only_container_marks_undetermined
             probe_health=lambda: SimpleNamespace(healthy=False),
         )
 
-    assert "systemd-partgraph-dgraph-maybe" in result.undetermined, (
+    assert result.undetermined == ("systemd-partgraph-dgraph-maybe",), (
         f"an inspect failure on both passes must mark the container "
         f"undetermined, never silently clean: {result!r}"
     )
-    assert "systemd-partgraph-dgraph-maybe" not in result.stopped
-    assert "systemd-partgraph-dgraph-maybe" not in result.survivors
+    assert result.stopped == (), (
+        "an UNKNOWN instance (owned_by not in S1/S2) is never a stop "
+        f"target — nothing was ever attempted: {result!r}"
+    )
+    assert result.survivors == ()
 
 
 def test_stop_all_inspect_fails_only_during_verification_marks_undetermined() -> None:
     """Gate 5 Finding A: Given the SAME S2-only-named container, but inspect
-    SUCCEEDS during the pre-stop sweep (correctly classified S2, and a
-    `stop` IS attempted) yet FAILS again during the verification pass (a
-    transient re-failure — `ps --all` may still list it and its ownership
-    can no longer be confirmed).
+    SUCCEEDS during the pre-stop sweep (correctly classified S2, so a
+    `stop` IS attempted and SUCCEEDS) yet FAILS again during the
+    verification pass (a transient re-failure). `db down`'s verb surface
+    is `stop`-only, never `rm` (ADR-0021): a real engine still LISTS a
+    stopped container under `ps --all` — it does not vanish — so the
+    verification pass genuinely re-enumerates and re-inspects this exact
+    row, and THAT inspect call is the one that fails.
     When stop_all() runs.
-    Then DownResult.undetermined contains its name — a verification-pass
-    inspect failure alone is enough to withhold a clean result, regardless
-    of what the pre-stop sweep saw.
+    Then the container's name is in BOTH `DownResult.stopped` (a `stop`
+    call WAS issued and the engine reported success — that fact is real
+    and does not become false just because we later could not re-confirm
+    it) AND `DownResult.undetermined` (verification could not re-confirm
+    its ownership, so `db down` still refuses to claim a clean result).
+    This dual membership is deliberately accepted here, not weakened away:
+    it is the honest report of "we acted, then lost the ability to
+    verify" — pinned explicitly per the Gate 5/6 review exchange, and
+    independently verified by the implementer against the (unchanged)
+    production contract.
     """
     row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4")
     fake_run, _calls = _make_scripted_run(
@@ -1579,10 +1605,15 @@ def test_stop_all_inspect_fails_only_during_verification_marks_undetermined() ->
             probe_health=lambda: SimpleNamespace(healthy=False),
         )
 
-    assert "systemd-partgraph-dgraph-maybe" in result.undetermined, (
+    assert result.undetermined == ("systemd-partgraph-dgraph-maybe",), (
         f"a verification-pass-only inspect failure must still withhold a "
         f"clean result: {result!r}"
     )
+    assert result.stopped == ("systemd-partgraph-dgraph-maybe",), (
+        "the earlier, successfully-issued stop is still an honest fact — "
+        f"it must not be retracted just because re-verification failed: {result!r}"
+    )
+    assert result.survivors == ()
 
 
 def test_stop_all_inspect_fails_only_during_pre_stop_sweep_is_not_fatal() -> None:
@@ -1592,9 +1623,12 @@ def test_stop_all_inspect_fails_only_during_pre_stop_sweep_is_not_fatal() -> Non
     it resolves cleanly on retry), but SUCCEEDS during the verification
     pass and reveals it mounts nothing of ours.
     When stop_all() runs.
-    Then DownResult.undetermined is EMPTY — a pre-stop-sweep-only inspect
-    failure, on its own, is NOT fatal: only the verification pass decides
-    the exit code (mirrors A12's phase-1 absorption).
+    Then DownResult.undetermined is EMPTY, nothing was ever attempted
+    (`stopped` is also EMPTY: the row was never classified S1/S2 while
+    inspect was failing, so it was never a stop target), and survivors is
+    EMPTY — a pre-stop-sweep-only inspect failure, on its own, is NOT
+    fatal: only the verification pass decides the exit code (mirrors
+    A12's phase-1 absorption).
     """
     row = _ps_row("cid-unrelated", "totally-unrelated-service", "nginx:1.27.3")
     fake_run, _calls = _make_scripted_run(
@@ -1612,15 +1646,19 @@ def test_stop_all_inspect_fails_only_during_pre_stop_sweep_is_not_fatal() -> Non
         "a pre-stop-sweep-only inspect failure must not, by itself, mark "
         f"anything undetermined once verification succeeds: {result!r}"
     )
+    assert result.stopped == ()
     assert result.survivors == ()
 
 
 def test_stop_all_inspect_succeeds_everywhere_undetermined_stays_empty() -> None:
     """Gate 5 Finding A (the happy path must stay clean): Given a normal S1
-    survivor and inspect succeeding on every call.
+    survivor and inspect succeeding on every call (including the SECOND
+    inspect the verification pass issues on this same, now-`exited`,
+    row — `stop` is not `rm`; the row stays listed).
     When stop_all() runs its full sweep + verification.
-    Then DownResult.undetermined is EMPTY — adding this new field must never
-    make an already-clean run noisier.
+    Then DownResult.undetermined is EMPTY and `stopped` contains EXACTLY
+    the one instance that was stopped and verified gone — adding this new
+    field must never make an already-clean run noisier.
     """
     row = _ps_row("cid-1", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
     fake_run, _calls = _make_scripted_run(
@@ -1634,7 +1672,7 @@ def test_stop_all_inspect_succeeds_everywhere_undetermined_stays_empty() -> None
 
     assert result.undetermined == ()
     assert result.survivors == ()
-    assert PARTGRAPH_CONTAINER_NAME in result.stopped
+    assert result.stopped == (PARTGRAPH_CONTAINER_NAME,)
 
 
 # ---------------------------------------------------------------------------
