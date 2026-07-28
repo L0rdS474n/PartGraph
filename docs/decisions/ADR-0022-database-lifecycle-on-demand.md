@@ -412,16 +412,31 @@ The two are separated by what happens next, never by what the start command
 said.
 
 The cost of absorbing is that the diagnosis could be thrown away, and it is
-not: the absorbed exception's **type name** is logged at `WARNING` through the
-module's own `_LOGGER`, alongside `_stop_unit_if_active`'s and
-`_mounts_data_volume`'s existing absorbed-failure records. Only the type, never
-the message — a class name cannot contain a path separator, whereas engine
-stderr routinely quotes a compose file location, and this module's logging rule
-is that no record may leak one. The type is still enough to separate the two
-failures that matter: `ContainerEngineError` ("there is no container engine on
-this host") from `AutostartComposeError` ("the engine ran and refused"). It is
-**not** enough to tell a lost race from a genuine non-zero exit — those share a
-type, and the honest answer is that only the poll's outcome distinguishes them.
+not. It is kept in **two** places, for two different readers:
+
+- The absorbed exception's **type name** is logged at `WARNING` through the
+  module's own `_LOGGER`, alongside `_stop_unit_if_active`'s and
+  `_mounts_data_volume`'s existing absorbed-failure records.
+- The absorbed exception becomes the eventual `AutostartTimeoutError`'s
+  `__cause__` (`raise … from absorbed`), and `partgraph.cli` renders its type
+  on a second stderr line when the poll does fail. This is the operator-facing
+  copy, and it exists because the log record reaches a terminal only through
+  `logging.lastResort`: nothing in `src/partgraph/` configures logging, so any
+  future logging setup could redirect or drop it. A user-facing diagnostic
+  must not depend on that.
+
+Nothing is rendered on the **recovered** path — a lost race whose winner
+brought the database up did not go wrong, and printing an error for it is
+exactly the false alarm § 7c exists to prevent.
+
+Only the type, never the message, in both places: a class name cannot contain a
+path separator, whereas engine stderr routinely quotes a compose file location,
+and every error line this project prints is path-free. The type is enough to
+separate the two failures that matter — `ContainerEngineError` ("there is no
+container engine on this host") from `AutostartComposeError` ("the engine ran
+and refused"). It is **not** enough to tell a lost race from a genuine non-zero
+exit: those share a type, and the honest answer is that only the poll's outcome
+distinguishes them.
 
 #### 7c. The `compose_up` seam does not print
 
@@ -435,8 +450,8 @@ that worked.
 So `_autostart_compose_up()` is a separate, print-free function producing the
 **identical argv** (`<engine> compose -f <abs COMPOSE_FILE> up -d`), the same
 `shell=False` list-argv discipline, the same engine detection through
-`compose_command()`, and the same `COMPOSE_TIMEOUT_S` watchdog `db up` uses —
-because it can pay the same first-run image pull. It signals failure by
+`compose_command()`, but its **own** watchdog — `AUTOSTART_COMPOSE_TIMEOUT_S`,
+not `db up`'s `COMPOSE_TIMEOUT_S` (see Breaking changes § 2). It signals failure by
 raising; whether that failure matters is the poll's decision, and only if it
 does does anything reach the operator.
 
@@ -545,21 +560,59 @@ stated plainly:
 2. **Behaviour and timing change for a down database.** Previously any of the
    nine commands failed fast with the path-free "Is the database running? Start
    it with `partgraph db up`." hint. Now, unless `PARTGRAPH_AUTOSTART` is set
-   to a disable token, they attempt a start and then wait — up to
-   `AUTOSTART_READY_TIMEOUT_S` (120 s) plus the start command's own duration,
-   which on a first run includes pulling the image. A script that measured its
-   own runtime, or that treated a fast non-zero exit as "the database is down",
-   sees different timing and a different message
+   to a disable token, they attempt a start and then wait. **The worst case is
+   240 s — four minutes — before any error text appears**, and it is bounded by
+   two constants that are added, not multiplied:
+
+   | | | |
+   | --- | --- | --- |
+   | the `compose up -d` call | `AUTOSTART_COMPOSE_TIMEOUT_S` | 120 s |
+   | the readiness poll after it | `AUTOSTART_READY_TIMEOUT_S` | 120 s |
+   | **worst-case total** | | **240 s** |
+
+   The ordinary case is nothing like that: a container create and start on an
+   existing image and volume is seconds, and a database that is already up
+   costs one HTTP probe. 240 s is reached only when the engine is wedged, or
+   the database comes up and never answers.
+
+   `AUTOSTART_COMPOSE_TIMEOUT_S` is deliberately **not** the 1800 s
+   `COMPOSE_TIMEOUT_S` that `db up` uses. Inheriting it made the worst case
+   1800 + 120 s — about **32 minutes** of silence on a command someone typed to
+   look up a part. `db up` keeps 1800 s because the operator asked for a
+   database explicitly and expects a first-run image pull; autostart is
+   implicit and gets a budget sized for someone waiting at a prompt. The cost
+   of the smaller bound is that a first-run image pull over a slow link may be
+   cut short — in which case the operator is told to run `partgraph db up`,
+   which is the command that keeps the generous budget, precisely because it
+   was asked for.
+
+   A script that measured its own runtime, or that treated a fast non-zero exit
+   as "the database is down", sees different timing and a different message
    (`AutostartTimeoutError`'s, naming `partgraph db status`).
 3. **A host with no container engine now fails slowly instead of fast.** With
    neither podman nor docker on `PATH`, `compose_command()` raises
    `ContainerEngineError` — which `ensure_running()` absorbs like any other
-   start failure. The invocation therefore spends the **full readiness budget**
-   before reporting a timeout, where it previously failed immediately. This is
-   the direct, accepted cost of § 7b's rule that the start command's outcome is
-   never authoritative: the same absorption that lets a lost race succeed makes
-   an unstartable host wait. Setting `PARTGRAPH_AUTOSTART=0` restores the fast
-   failure, and that is the documented answer for CI and for scripted use.
+   start failure. The invocation therefore spends the **full 120 s readiness
+   budget** before reporting a timeout, where it previously failed immediately.
+   (The `compose up` half costs nothing here: detection fails before any
+   subprocess is spawned.) This is the direct, accepted cost of § 7b's rule
+   that the start command's outcome is never authoritative: the same absorption
+   that lets a lost race succeed makes an unstartable host wait. The error
+   names the absorbed failure's type on a second line, so this case is
+   distinguishable from "the database came up and never answered". Setting
+   `PARTGRAPH_AUTOSTART=0` restores the fast failure, and that is the
+   documented answer for CI and for scripted use.
+
+4. **`db check-index` is no longer unconditionally engine-independent.**
+   ADR-0019's AC-IDX-25 pinned that `db check-index` never calls a container
+   engine, mirroring `db status`. The *check* still does not — it reaches
+   Dgraph over HTTP — but the *command* now runs the autostart gate first, so
+   with autostart enabled and the database down it will invoke the engine. The
+   command's own docstring says so explicitly rather than continuing to claim
+   otherwise, and `PARTGRAPH_AUTOSTART=0` restores the unconditional
+   guarantee. **`db status` is unaffected**: it is absent from the allowlist
+   entirely and remains engine-free under all settings, because a probe that
+   starts what it measures cannot report on it (ADR-0018).
 
 The migration for every one of these is one variable, and it is the same
 variable in all three cases.
@@ -580,27 +633,63 @@ this ADR exists to eliminate, reintroduced through the scheduling door after
 § 5 closed the login door.
 
 **The amended guarantee.** D1's promise holds for the scheduling layer, and it
-now holds *because the shipped unit says so explicitly* rather than because the
-CLI is incapable of starting anything. `systemd/partgraph-refresh-all.service`
-sets:
+now holds *because the shipped scheduling layer opts out explicitly* rather
+than because the CLI is incapable of starting anything. The opt-out lives in
+the **wrapper**, `scripts/partgraph-refresh-all.sh`, which does
 
-```
-Environment=PARTGRAPH_AUTOSTART=0
+```sh
+export PARTGRAPH_AUTOSTART=0
 ```
 
-placed **after** the optional `EnvironmentFile=-%h/.config/partgraph/refresh-all.env`,
-because systemd applies same-key `Environment=`/`EnvironmentFile=` directives
-in file order and the last one wins. An operator's own env file therefore
-cannot silently reintroduce an implicit container start on a scheduled run.
+before it invokes `partgraph`, unconditionally and for both phases.
+
+**Why the wrapper and not the unit — a correction.** An earlier draft of this
+section put the guarantee in
+`systemd/partgraph-refresh-all.service` as
+`Environment=PARTGRAPH_AUTOSTART=0`, placed *after* the optional
+`EnvironmentFile=-%h/.config/partgraph/refresh-all.env`, and justified that
+placement by claiming systemd resolves same-key `Environment=`/
+`EnvironmentFile=` directives in file order, last one wins.
+
+**That claim is false, and the guarantee built on it did not hold.**
+`systemd.exec(5)` states, of `EnvironmentFile=`, verbatim:
+
+> Settings from these files override settings made with Environment=.
+
+Unconditionally — the sentence makes no reference to the order the directives
+appear in, and a live check confirmed it in both orders: `EnvironmentFile=`
+won each time. So *any* `PARTGRAPH_AUTOSTART=` line in an operator's own
+`refresh-all.env` — a file this repository documents and deliberately supports
+— silently beat the unit's setting, and the weekly unattended run would have
+started a container. Reordering the directives cannot fix it; only moving the
+mechanism can.
+
+A shell `export` inside the wrapper is applied **after** systemd has finished
+assembling the environment and before `partgraph` is exec'd, so it is the last
+word by construction and is immune to the precedence rule entirely. It also
+covers the cron installation, which never involves systemd at all. The value
+is hard-coded rather than read from the environment, because the environment
+is precisely the channel that cannot be trusted to carry it; an operator who
+genuinely wants a scheduled run to start the database edits that visible line
+in a file they installed.
+
+The unit **keeps** `Environment=PARTGRAPH_AUTOSTART=0` as defence in depth,
+with its comment rewritten to say what it is: a second layer covering the case
+where the wrapper is bypassed (an `ExecStart=` pointed straight at `partgraph`,
+or a drop-in that replaces it) while the env file sets nothing for this key.
+It is explicitly **not** the guarantee, and no longer claims to be.
+
+An `EnvironmentFile`-only resolution was rejected for a separate reason: the
+only env file this repo references is optional (leading `-`,
+missing-file-is-non-fatal) and operator-created, and most installs will never
+have one. A guarantee that depends on a file most operators do not have is not
+a guarantee.
+
 The unit's header comment and `docs/scheduling.md`'s `[!WARNING]` block both
-name `PARTGRAPH_AUTOSTART`, so a reader is told *why* the "never manages the
-database lifecycle" claim still holds instead of finding it contradicted by
-`--help`.
-
-An `EnvironmentFile`-only resolution was rejected: the only env file this repo
-references is optional (leading `-`, missing-file-is-non-fatal) and
-operator-created, and most installs will never have one. A guarantee that
-depends on a file most operators do not have is not a guarantee.
+name `PARTGRAPH_AUTOSTART` and both now name the wrapper as the mechanism, so
+a reader is told *why* the "never manages the database lifecycle" claim holds
+instead of finding it contradicted by `--help` — or, worse, believing a
+mechanism that does not work.
 
 **Scope of the amendment.** D1 is amended, not repealed. The scheduling layer
 still runs no daemon, still does not health-check the database, and still
@@ -693,16 +782,22 @@ autouse fixture, so no test that has never heard of autostart can start a
 container during a plain `pytest` run;
 `tests/unit/test_autostart_hermeticity.py` parses `conftest.py` and fails if
 that fixture stops existing or stops being autouse.
-`tests/unit/test_scheduling_autostart_disabled.py` pins the amendment above:
-the unit sets `Environment=PARTGRAPH_AUTOSTART=0`, that line is the last word
-after every `EnvironmentFile=`, and both the unit header and
-`docs/scheduling.md`'s warning block name the variable.
+`tests/unit/test_scheduling_autostart_disabled.py` pins the amendment above by
+EXECUTING the wrapper against a stub `partgraph` with a hostile
+`PARTGRAPH_AUTOSTART` already exported into its environment, and asserting the
+stub observed `PARTGRAPH_AUTOSTART=0` on both phases — a behavioural check of
+the mechanism that actually holds, not a text match on the unit file. The
+unit's `Environment=` line is pinned separately, as defence in depth.
 
 **Not verified, and deliberately so.** No container was started for this PR
-either. `AUTOSTART_READY_TIMEOUT_S` is therefore an unmeasured judgement call
-(§ 7a says so in the constant's own docstring), and the race described in § 7b
-was reasoned about and modelled in tests, never reproduced against two live
-`partgraph` processes.
+either. `AUTOSTART_READY_TIMEOUT_S` and `AUTOSTART_COMPOSE_TIMEOUT_S` are
+therefore unmeasured judgement calls (§ 7a and Breaking changes § 2 say so),
+and the race described in § 7b was reasoned about and modelled in tests, never
+reproduced against two live `partgraph` processes. The `EnvironmentFile=`
+precedence correction in the amendment above IS verified — against
+`systemd.exec(5)`'s own text and a live systemd reproduction in both directive
+orders — but the shipped unit itself has not been installed and run by this
+PR.
 
 `tests/unit/test_lifecycle_volume.py` pins `volume_exists()`: True on exit 0,
 False on non-zero, None on timeout and on `OSError`, True even when a successful

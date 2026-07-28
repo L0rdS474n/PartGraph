@@ -6,10 +6,16 @@
 # docs/scheduling.md for the install steps.
 #
 # It assumes the database is already up (`partgraph db up`); this unit does NOT
-# start or stop it. It sets PARTGRAPH_AUTOSTART=0 below so that guarantee holds
-# even now that `partgraph refresh`/`refresh-links` are, when invoked
-# interactively, autostart-capable commands (ADR-0022 Section 7) — the
-# scheduled path deliberately opts back out of that lazy start.
+# start or stop it. That guarantee needs stating explicitly now that
+# `partgraph refresh`/`refresh-links` are, when invoked interactively,
+# autostart-capable commands (ADR-0022 Section 7): the scheduled path
+# deliberately opts back out of that lazy start with PARTGRAPH_AUTOSTART=0.
+#
+# WHERE that opt-out actually takes effect: in the wrapper this unit runs
+# (scripts/partgraph-refresh-all.sh, installed to %h/.local/bin), which does
+# `export PARTGRAPH_AUTOSTART=0` before invoking partgraph. The
+# Environment= line below is DEFENCE IN DEPTH ONLY and is not authoritative —
+# see the comment beside it.
 
 [Unit]
 Description=PartGraph refresh (stock/price + datasheet links), one-shot
@@ -28,12 +34,26 @@ EnvironmentFile=-%h/.config/partgraph/refresh-all.env
 
 # Keep the database lifecycle out of the scheduled path (ADR-0014 D1), even
 # though `refresh`/`refresh-links` are autostart-capable commands when run
-# interactively (ADR-0022 Section 7). Placed AFTER the optional
-# EnvironmentFile above so it always wins if that file is ever edited to also
-# set PARTGRAPH_AUTOSTART: systemd applies same-key Environment=/
-# EnvironmentFile= directives in file order, last one wins, and this line is
-# the last word on this variable in this unit — an operator override cannot
-# silently reintroduce an implicit container start on a scheduled run.
+# interactively (ADR-0022 Section 7).
+#
+# DEFENCE IN DEPTH — NOT AUTHORITATIVE. This line does NOT win against the
+# optional EnvironmentFile above, and moving it does not change that.
+# systemd.exec(5) says of EnvironmentFile=, verbatim: "Settings from these
+# files override settings made with Environment=." That statement is
+# unconditional, with no reference to directive order, and it was confirmed
+# against live systemd in both orders — EnvironmentFile= won each time. So if
+# an operator's refresh-all.env ever contains a PARTGRAPH_AUTOSTART= line, it
+# beats this one no matter where this one sits.
+#
+# What this line DOES buy: it covers the case where the wrapper is bypassed —
+# somebody points ExecStart= straight at `partgraph refresh`, or a drop-in
+# replaces it — while the env file sets nothing for this key. That is worth
+# keeping, but it is a second layer, not the guarantee.
+#
+# The guarantee lives in the wrapper: scripts/partgraph-refresh-all.sh does
+# `export PARTGRAPH_AUTOSTART=0`, which is applied after systemd has finished
+# assembling the environment and therefore cannot be overridden by any
+# systemd-level directive.
 Environment=PARTGRAPH_AUTOSTART=0
 
 # Hardening. The default (no-fetch) run writes nothing to the filesystem — it

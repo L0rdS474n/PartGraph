@@ -278,7 +278,11 @@ STOP_GRACE_SECONDS = 60
 #:
 #: Image PULL time is deliberately NOT inside this budget: pulling happens
 #: inside the injected ``compose_up`` call, which returns before the deadline
-#: is even computed, and the CLI gives that call its own, far larger watchdog.
+#: is even computed, and the CLI gives that call its own SEPARATE watchdog
+#: (``AUTOSTART_COMPOSE_TIMEOUT_S``). The two are ADDED, not multiplied, and
+#: the sum is the ceiling on how long an implicit start can hold a foreground
+#: command — which is why the CLI sizes its half for someone waiting at a
+#: prompt rather than reusing ``db up``'s far more generous pull budget.
 #: This budget covers only "the container exists — is Dgraph answering yet?".
 AUTOSTART_READY_TIMEOUT_S = 120.0
 
@@ -1414,6 +1418,16 @@ def ensure_running(
     if _probe_reports_healthy(probe_health):
         return
 
+    #: The absorbed start failure, kept so the eventual timeout can CHAIN it.
+    #: Absorbing for control flow is right (a lost race must proceed); throwing
+    #: the diagnosis away is not. If the poll goes on to fail, ``__cause__``
+    #: carries WHY the start attempt failed, and ``partgraph.cli`` renders its
+    #: type — so the operator gets the reason on the one path where it matters,
+    #: not only in a log record that depends on how logging happens to be
+    #: configured. On the RECOVERED path nothing is rendered at all: the
+    #: failure turned out not to be one.
+    absorbed: BaseException | None = None
+
     try:
         compose_up()
     except Exception as exc:  # noqa: BLE001 — see the docstring: the start
@@ -1434,6 +1448,7 @@ def ensure_running(
             "up.",
             type(exc).__name__,
         )
+        absorbed = exc
 
     delay = _resolve_sleep(sleep)
     clock = _resolve_monotonic(monotonic)
@@ -1443,8 +1458,13 @@ def ensure_running(
         if _probe_reports_healthy(probe_health):
             return
         if clock() >= deadline:
+            # ``from absorbed``: the start failure, if there was one, becomes
+            # this exception's ``__cause__``. ``absorbed`` is None when the
+            # start command reported success and the database simply never
+            # answered — ``raise ... from None`` is correct there too, since
+            # there is no active exception context inside this loop to suppress.
             raise AutostartTimeoutError(
                 f"the database did not become healthy within "
                 f"{AUTOSTART_READY_TIMEOUT_S:.0f}s of the start command; run "
                 f"`partgraph db status` to check whether it came up after all."
-            )
+            ) from absorbed

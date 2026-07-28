@@ -98,6 +98,33 @@ _GRPC_MAX_MESSAGE_BYTES = 256 * 1024 * 1024
 COMPOSE_TIMEOUT_S = 1800.0
 COMPOSE_DOWN_TIMEOUT_S = 300.0
 
+#: Watchdog for the AUTOSTART ``compose up -d`` call — deliberately NOT
+#: :data:`COMPOSE_TIMEOUT_S`, because the two invocations differ in the only
+#: dimension that matters here: what the person at the keyboard asked for.
+#:
+#: ``db up`` is an EXPLICIT request to start a database. The operator typed it,
+#: expects provisioning, and on a first run expects an image pull; 1800 s is a
+#: reasonable ceiling for a job they are knowingly waiting on.
+#:
+#: Autostart is IMPLICIT. It fires inside ``partgraph search`` — a command
+#: whose user is looking for a part, not provisioning infrastructure. Inheriting
+#: the 1800 s bound made the worst case (a wedged engine, a hung daemon, a
+#: registry pull that neither completes nor errors) 1800 s of silence followed
+#: by :data:`~partgraph.util.lifecycle.AUTOSTART_READY_TIMEOUT_S` of polling —
+#: about 32 minutes before the first byte of error text. No interactive command
+#: may do that, so the implicit path gets its own, much smaller budget: worst
+#: case is now 120 + 120 = 240 s.
+#:
+#: What 120 s costs. The steady-state autostart — image already present, volume
+#: already there — is a container create and start, which is seconds. The case
+#: this bound can genuinely cut short is a FIRST-RUN image pull on a slow link,
+#: and the answer there is the right one: the operator is told to run
+#: ``partgraph db up``, the explicit command that keeps the generous budget
+#: precisely because it was asked for. Sizing the implicit path for the rare
+#: provisioning case would have taxed every ordinary invocation's failure mode
+#: to avoid one clear message in an uncommon one.
+AUTOSTART_COMPOSE_TIMEOUT_S = 120.0
+
 #: Absolute path to the Compose file. Resolved three levels up from this file
 #: (src/partgraph/cli.py -> src/partgraph -> src -> <repo root>) so the value
 #: passed to the engine's ``compose -f`` flag is always absolute and never
@@ -310,9 +337,10 @@ def _autostart_enabled() -> bool:
 def _autostart_compose_up() -> None:
     """Issue ``db up``'s own argv, printing NOTHING at all.
 
-    Byte-for-byte the same argv, engine detection, ``shell=False`` discipline
-    and bounded watchdog as :func:`up` — but silent, and that silence is the
-    whole reason this is not simply ``_run_compose(["up", "-d"], ...)``.
+    Byte-for-byte the same argv, engine detection and ``shell=False``
+    discipline as :func:`up` — but silent, and on a much shorter leash. The
+    silence is the whole reason this is not simply
+    ``_run_compose(["up", "-d"], ...)``.
 
     ``_run_compose`` prints a red ``Error:`` line before raising on a non-zero
     exit. ``ensure_running()`` ABSORBS a start failure and proceeds when health
@@ -324,10 +352,14 @@ def _autostart_compose_up() -> None:
     matters is the health poll's decision, and only if it does does anything
     reach the operator.
 
-    :data:`COMPOSE_TIMEOUT_S` is the same generous watchdog ``db up`` uses,
-    because this call can pay the same first-run image pull. It is NOT charged
-    against the readiness budget: ``ensure_running()`` starts its deadline only
-    after this returns.
+    The watchdog is :data:`AUTOSTART_COMPOSE_TIMEOUT_S`, NOT the
+    :data:`COMPOSE_TIMEOUT_S` ``db up`` uses: this call is implicit, made on
+    behalf of somebody who typed ``partgraph search``, and it bounds the total
+    implicit wait to ``AUTOSTART_COMPOSE_TIMEOUT_S`` +
+    :data:`~partgraph.util.lifecycle.AUTOSTART_READY_TIMEOUT_S` (240 s) instead
+    of the ~32 minutes the generous bound would have allowed against a wedged
+    engine. It is NOT charged against the readiness budget: ``ensure_running()``
+    starts its deadline only after this returns.
 
     Raises:
         partgraph.util.container.ContainerEngineError: No usable engine on
@@ -336,7 +368,7 @@ def _autostart_compose_up() -> None:
             an unrelated-looking detection error.
         AutostartComposeError: The engine ran and exited non-zero.
         subprocess.TimeoutExpired: The call exceeded
-            :data:`COMPOSE_TIMEOUT_S`.
+            :data:`AUTOSTART_COMPOSE_TIMEOUT_S`.
     """
     argv = [*compose_command(), "-f", str(COMPOSE_FILE), "up", "-d"]
     # shell=False with a list argv, exactly as _run_compose does: no string is
@@ -346,7 +378,7 @@ def _autostart_compose_up() -> None:
         capture_output=True,
         text=True,
         shell=False,
-        timeout=COMPOSE_TIMEOUT_S,
+        timeout=AUTOSTART_COMPOSE_TIMEOUT_S,
         check=False,
     )
     if result.returncode != 0:
@@ -368,6 +400,20 @@ def _autostart_database() -> None:
     ``probe_health`` is passed as this module's OWN module-level reference so
     the CLI's patch point stays the CLI's, and so the injected seam is the same
     object ``db status`` uses — one health contract, not two.
+
+    On timeout it renders the leaf's message AND, when the start command itself
+    failed, a second line naming that failure's TYPE. The leaf also logs the
+    absorbed failure, but that record reaches a terminal only through
+    ``logging.lastResort`` — nothing in ``src/partgraph/`` configures logging,
+    so any future logging setup could silently redirect or drop it. The reason
+    a start attempt failed is operator-facing, so it goes through the same
+    console the rest of this CLI's errors use rather than depending on that.
+
+    Only the type, never the exception's message: engine output routinely
+    quotes a compose file path, and every line this CLI prints on an error path
+    is path-free. And only on the TIMEOUT path — on the recovered path (a lost
+    start race whose winner brought the database up) nothing is printed at all,
+    because nothing went wrong.
     """
     if not _autostart_enabled():
         return
@@ -377,6 +423,11 @@ def _autostart_database() -> None:
         # The leaf's message is already a single, path-free, complete line;
         # printing it verbatim is the same treatment ContainerEngineError gets.
         _err_console.print(f"[red]Error:[/red] {exc}")
+        if exc.__cause__ is not None:
+            _err_console.print(
+                "The start command itself failed first "
+                f"({type(exc.__cause__).__name__}); see `partgraph db doctor`."
+            )
         raise typer.Exit(code=1) from exc
 
 
@@ -651,10 +702,22 @@ def check_index() -> None:
     ``embedding`` predicate match ``schema/partgraph.dql`` and whether a sample of
     embedded parts, replayed through ``similar_to`` at k=1000, self-matches at or
     above the rate threshold.
-    Like ``db status`` (ADR-0018) this is engine-independent — it never calls a
-    container engine. Exits 0 iff the database is reachable, the schema matches,
-    and the self-similarity probe passed (or there is nothing embedded yet to
-    check); otherwise 1.
+
+    The CHECK itself is engine-independent: it reaches Dgraph over HTTP and
+    never asks a container engine anything. The COMMAND is not, and no longer
+    claims to be — since ADR-0022 Section 7 it first runs the autostart gate,
+    so on a host where autostart is enabled (the default) and the database is
+    down it will invoke ``<engine> compose ... up -d`` before probing. Set
+    ``PARTGRAPH_AUTOSTART=0`` to get the older, strictly engine-free behaviour.
+
+    This is the distinction ``db status`` does NOT have: it is absent from the
+    autostart allowlist entirely and remains engine-free unconditionally
+    (ADR-0018), because a probe that starts what it measures cannot report on
+    it.
+
+    Exits 0 iff the database is reachable, the schema matches, and the
+    self-similarity probe passed (or there is nothing embedded yet to check);
+    otherwise 1.
     """
     # Like `db apply-schema`, this command reaches Dgraph without going through
     # _connect_dgraph() (it queries the HTTP endpoint directly), so the
@@ -1631,8 +1694,10 @@ def search(  # noqa: PLR0913, PLR0917 — Typer command surface: one option per 
       partgraph search "1.2V MAX232"
       partgraph search --semantic "rs232 transceiver"
 
-    All reads are read-only; this command never modifies the database. Use
-    --limit to bound the result count and --no-truncate to print full URLs.
+    All reads are read-only; this command never modifies the database. It can,
+    however, START it: if the database is down, the search first brings it up
+    and waits for it (ADR-0022). Set PARTGRAPH_AUTOSTART=0 to disable that.
+    Use --limit to bound the result count and --no-truncate to print full URLs.
     The command searches related parts by MPN similarity.
     """
     # Shared structured-filter validation (AC-SF-28): validate every new filter
@@ -1964,7 +2029,9 @@ def show(
     Looks the part up by its normalised MPN and prints manufacturer, package,
     category, stock, promoted key parameters, the long-tail attributes, all
     datasheet URLs and related parts found by MPN similarity. This is a
-    read-only operation; it never modifies the database.
+    read-only operation; it never modifies the database. It can, however,
+    START it: if the database is down, this command first brings it up and
+    waits for it (ADR-0022). Set PARTGRAPH_AUTOSTART=0 to disable that.
     """
     from partgraph.normalize.model import normalize_mpn  # noqa: PLC0415
     from partgraph.query.dql_builder import build_show_dql  # noqa: PLC0415
