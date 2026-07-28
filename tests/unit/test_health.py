@@ -51,13 +51,21 @@ compose_command`` directly rather than exercising a real network call or a
 real container engine.
 
 Regression pins living in tests/unit/test_cli.py (UNCHANGED by this file):
-  - test_cli.py:118/134 — `db status --help` continues to exit 0 and be
-    English, over the SAME ["up", "down", "status", "apply-schema"]
-    parametrization (AC-9). This file's own `db status --help` test (below)
-    is a redundant, self-contained anchor for the same guarantee.
-  - test_cli.py:162/245 — the `subprocess.run` argv / absolute-path
+  - test_cli.py — `db status --help` continues to exit 0 and be English, over
+    the SAME ["up", "down", "status", "apply-schema"] parametrization (AC-9).
+    This file's own `db status --help` test (below) is a redundant,
+    self-contained anchor for the same guarantee.
+  - test_cli.py — the `subprocess.run` argv / absolute-path
     parametrizations are narrowed from ["up", "down", "status"] to
     ["up", "down"]: `status` no longer delegates to Compose at all (ADR-0018).
+    fix/db-down-all-instances (PR-A) UPDATE: `db down` itself now issues
+    SEVERAL subprocess.run calls (a systemd unit-state sweep alongside the
+    existing Compose call, per PR-A), so those two `up`/`down` tests no
+    longer read `mock_run.call_args` (the LAST call); they select the ONE
+    call whose argv contains "compose" out of `mock_run.call_args_list`
+    instead, and separately assert list-argv/`shell=False` for EVERY
+    recorded call. No assertion in THIS file depends on `db down`'s call
+    count or argv shape.
 """
 
 from __future__ import annotations

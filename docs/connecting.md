@@ -33,6 +33,23 @@ partgraph embed             # compute semantic vectors (enables --semantic)
 `embed` additionally enables semantic/vector search. Stop the database with
 `partgraph db down` (data is preserved in a named volume).
 
+> [!NOTE]
+> **`db down` stops every lifecycle owner.** Besides Compose, a *second* owner
+> can exist for the same database: a `systemd --user` unit
+> (`partgraph-dgraph.service`, typically generated from the same compose file by
+> a quadlet converter) declaring the same container name, the same ports
+> `8081`/`9081`/`8001` and the same data volume. Compose cannot stop a container
+> it did not create, so a plain `compose down` would leave that instance
+> serving on those ports — while `db down` reported success. `partgraph db down`
+> now stops that unit too and then verifies: it exits **0** only when no
+> PartGraph instance survives, **1** naming any that did, and **1** as well when
+> a container's ownership *could not be verified* — a distinct message saying
+> "could not verify" rather than "still running". A container that
+> merely holds one of those ports without being PartGraph's is reported, never
+> stopped. Run `partgraph db down --dry-run` to see what would be stopped
+> without touching anything. Details in
+> [ADR-0021](decisions/ADR-0021-db-down-all-lifecycle-owners.md).
+
 ### Ports and the 8080 / 9080 collision
 
 > [!WARNING]

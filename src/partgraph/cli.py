@@ -40,9 +40,10 @@ from partgraph.refresh.stock import (
     build_stock_index,
     refresh_stock_write,
 )
-from partgraph.util.container import ContainerEngineError, compose_command
+from partgraph.util.container import ContainerEngineError, compose_command, engine_command
 from partgraph.util.health import DGRAPH_HTTP_HEALTH_URL, probe_health
 from partgraph.util.index_health import check_index_integrity
+from partgraph.util.lifecycle import DownResult, stop_all
 
 # ``get_encoder`` is imported at module level (not lazily) ON PURPOSE: the test
 # suite patches it as ``patch.object(cli, "get_encoder", ...)`` for both the
@@ -77,6 +78,14 @@ DGRAPH_GRPC_ADDR = "127.0.0.1:9081"
 #: ``-1`` "unlimited" sentinel — this extends ADR-0007's bounded-constant
 #: precedent to the transport layer (ADR-0010).
 _GRPC_MAX_MESSAGE_BYTES = 256 * 1024 * 1024
+
+#: Finite, named watchdog (seconds) for a single Compose invocation. `db up`
+#: gets the generous bound because a first run may pull the Dgraph image;
+#: `db down` gets the tighter one because it only stops what already exists.
+#: Both are bounded on purpose — never an unbounded wait (ADR-0007's
+#: bounded-constant precedent, extended here to the Compose subprocess).
+COMPOSE_TIMEOUT_S = 1800.0
+COMPOSE_DOWN_TIMEOUT_S = 300.0
 
 #: Absolute path to the Compose file. Resolved three levels up from this file
 #: (src/partgraph/cli.py -> src/partgraph -> src -> <repo root>) so the value
@@ -166,22 +175,27 @@ app.add_typer(ingest_app, name="ingest")
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _run_compose(compose_args: list[str], *, action: str) -> None:
+def _run_compose(
+    compose_args: list[str], *, action: str, timeout: float = COMPOSE_TIMEOUT_S
+) -> None:
     """Run ``<engine> compose -f <COMPOSE_FILE> <compose_args>`` safely.
 
-    The compose command prefix (``["docker", "compose"]`` or
-    ``["podman", "compose"]``) is resolved at call time by
+    The compose command prefix (the detected engine plus ``compose``) is
+    resolved at call time by
     :func:`partgraph.util.container.compose_command`, so PartGraph works on
     whichever container engine is installed (Docker or Podman, podman-first).
 
     Args:
         compose_args: Trailing Compose arguments (e.g. ``["up", "-d"]``).
         action: Human-readable description used in error messages.
+        timeout: Finite, bounded subprocess watchdog in seconds, so a wedged
+            engine can never hang the CLI indefinitely.
 
     Raises:
-        typer.Exit: code 1 if no usable container engine can be resolved, or the
-            subprocess return code if the container engine exits non-zero, after
-            printing a clear English error message to stderr.
+        typer.Exit: code 1 if no usable container engine can be resolved or the
+            call exceeded *timeout*, or the subprocess return code if the
+            container engine exits non-zero, after printing a clear English
+            error message to stderr.
     """
     try:
         prefix = compose_command()
@@ -193,13 +207,24 @@ def _run_compose(compose_args: list[str], *, action: str) -> None:
         raise typer.Exit(code=1) from exc
     argv = [*prefix, "-f", str(COMPOSE_FILE), *compose_args]
     # shell is never True: argv is a list and no string is interpolated by a
-    # shell, eliminating shell-injection risk.
-    result = subprocess.run(  # noqa: PLW1510 — return code handled explicitly below
-        argv,
-        capture_output=True,
-        text=True,
-        shell=False,
-    )
+    # shell, eliminating shell-injection risk. check=False: the return code is
+    # inspected explicitly below so the error message stays ours.
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Path-free, single-line: names neither the compose file nor the argv.
+        _err_console.print(
+            f"[red]Error:[/red] the container engine did not finish the {action} "
+            f"within {timeout:.0f}s."
+        )
+        raise typer.Exit(code=1) from exc
     if result.stdout:
         _console.print(result.stdout, end="")
     if result.returncode != 0:
@@ -225,15 +250,175 @@ def up() -> None:
     )
 
 
-@db_app.command("down")
-def down() -> None:
-    """Stop the local Dgraph database, preserving the named data volume.
+def _print_down_dry_run(result: DownResult) -> None:
+    """Print what a real ``db down`` would have stopped, and what it would not.
 
-    The '-v' flag is intentionally never passed, so the partgraph_dgraph_data
-    volume (and therefore all ingested data) survives a 'db down'.
+    Every field of *result* that a real run would act on is reported here,
+    including the health probe: a preview that silently discarded an answer it
+    had already paid for would be both wasted work and a worse preview. Whether
+    the database is answering right now is exactly what an operator about to
+    stop it wants to know — and it is the one signal that survives even when no
+    container matches any selector at all.
+
+    ``markup=False``: every name here is engine-derived, so a '[...]'-bearing
+    string must never be misread as a Rich style tag. ``soft_wrap=True`` keeps
+    each message on the single line it is contracted to be.
     """
-    _run_compose(["down"], action="stop")
-    _console.print("[green]Dgraph stopped.[/green] The data volume is preserved.")
+    if result.survivors:
+        _console.print(
+            f"Dry run: would stop {len(result.survivors)} PartGraph instance(s): "
+            f"{', '.join(result.survivors)}.",
+            markup=False,
+            soft_wrap=True,
+        )
+    else:
+        _console.print(
+            "Dry run: no PartGraph instance is running; nothing would be stopped.",
+            markup=False,
+            soft_wrap=True,
+        )
+    if result.skipped_foreign_port_holders:
+        _console.print(
+            "Dry run: reported only, never stopped (holds a PartGraph port but is "
+            f"not PartGraph's): {', '.join(result.skipped_foreign_port_holders)}.",
+            markup=False,
+            soft_wrap=True,
+        )
+    _console.print(
+        "Dry run: the Dgraph health endpoint is answering right now."
+        if result.still_serving_health
+        else "Dry run: the Dgraph health endpoint is not answering.",
+        markup=False,
+        soft_wrap=True,
+    )
+
+
+def _down_success_line(result: DownResult) -> str:
+    """Compose the single-line success message for a completed ``db down``."""
+    if result.stopped:
+        return (
+            "Dgraph stopped. Also stopped outside Compose: "
+            f"{', '.join(result.stopped)}. The data volume is preserved."
+        )
+    return (
+        "Dgraph stopped. No PartGraph instance is running. "
+        "The data volume is preserved."
+    )
+
+
+@db_app.command("down")
+def down(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Report what would be stopped without stopping anything. "
+            "Always exits 0."
+        ),
+    ),
+) -> None:
+    """Stop every PartGraph database instance, preserving the named data volume.
+
+    Compose alone only stops what Compose itself created. A second lifecycle
+    owner can exist on the same host: a quadlet-generated systemd --user unit
+    (partgraph-dgraph.service) owning an identical container. This command stops
+    both, then verifies that nothing PartGraph owns is still running.
+
+    The data volume is never removed: '-v' is never passed and the sweep's only
+    verb is 'stop'. A container that merely holds one of PartGraph's host ports
+    without being PartGraph's is reported, never stopped.
+
+    Exits 0 iff no PartGraph instance survives, else 1. --dry-run always exits 0.
+    """
+    # The sweep itself lives in partgraph.util.lifecycle.stop_all (ADR-0021),
+    # which runs, in order: the systemd unit stop, the Compose `down` injected
+    # below, a direct engine `stop` of every surviving PartGraph-owned
+    # container (targeted by container ID, never by name), and a verification
+    # re-enumeration.
+    #
+    # A SECOND, bare engine prefix (independent of compose_command()'s
+    # compose-plugin prefix) is needed for the enumeration/stop sweep. Both
+    # resolutions route through ADR-0009 detection; either can fail, and both
+    # failures are surfaced the same clean way as `db up`'s.
+    try:
+        engine_prefix = engine_command()
+    except ContainerEngineError as exc:
+        _err_console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        result = stop_all(
+            engine_prefix=engine_prefix,
+            # Injected on purpose: the leaf never decides for itself whether
+            # Compose runs. An exception raised in here (a missing engine, a
+            # non-zero compose exit, a timeout) propagates unmodified.
+            compose_down=lambda: _run_compose(
+                ["down"], action="stop", timeout=COMPOSE_DOWN_TIMEOUT_S
+            ),
+            # cli.py's OWN module-level probe_health reference, so `db status`
+            # and `db down` share one seam and the leaf imports nothing here.
+            probe_health=probe_health,
+            dry_run=dry_run,
+        )
+    except typer.Exit:
+        # Already reported by _run_compose with its own message and exit code.
+        raise
+    except Exception as exc:
+        # Defense-in-depth (mirrors status()/check_index()): the leaf degrades
+        # every EXPECTED parsing outcome itself, so only an UNEXPECTED failure
+        # (a wedged engine timing out, an OS-level error) reaches here. Turn it
+        # into a fixed, path-free message and a clean exit so no raw traceback
+        # can leak an internal path. Re-raised via ``from exc``, so this is not
+        # a blind, swallowing except (ruff BLE001 is satisfied).
+        _err_console.print(
+            "[red]Error:[/red] could not complete the Dgraph shutdown sweep."
+        )
+        raise typer.Exit(code=1) from exc
+
+    if dry_run:
+        _print_down_dry_run(result)
+        return
+
+    # Both conditions are reported before exiting, because they can co-occur and
+    # they are not the same news: one says a stop positively failed, the other
+    # says a stop cannot be confirmed. Reporting only the first would silently
+    # drop the second from an operator who needs both. They are printed as
+    # separate lines, never merged into one sentence, so "still running" and
+    # "could not verify" stay textually distinct signals.
+    # markup=False, so an engine-derived name carrying '[...]' is printed
+    # literally rather than being read as a Rich style tag.
+    if result.survivors:
+        _err_console.print(
+            f"Error: {len(result.survivors)} PartGraph instance(s) still running "
+            f"after db down: {', '.join(result.survivors)}.",
+            markup=False,
+            soft_wrap=True,
+            style="red",
+        )
+    if result.undetermined:
+        _err_console.print(
+            f"Error: could not verify whether {len(result.undetermined)} "
+            f"container(s) belong to PartGraph: {', '.join(result.undetermined)}. "
+            "Re-run db down, or check them by hand.",
+            markup=False,
+            soft_wrap=True,
+            style="red",
+        )
+    if result.survivors or result.undetermined:
+        # Exit 1 for either: exit 0 promises that no PartGraph instance
+        # survived, and neither a known survivor nor an unverifiable container
+        # can support that promise.
+        raise typer.Exit(code=1)
+
+    _console.print(_down_success_line(result), markup=False, soft_wrap=True)
+    if result.still_serving_health:
+        _err_console.print(
+            "Warning: the Dgraph health port still answers; it is served by "
+            "something PartGraph does not own.",
+            markup=False,
+            soft_wrap=True,
+            style="yellow",
+        )
 
 
 @db_app.command("status")
@@ -930,7 +1115,7 @@ def _emit_search_json(result, parsed) -> None:
 
 
 @app.command()
-def search(  # noqa: PLR0913 — Typer command surface: one option per filter flag
+def search(  # noqa: PLR0913, PLR0917 — Typer command surface: one option per filter flag
     query: str = typer.Argument(
         "",
         help="Free-text component query, e.g. 'MAX232' or '10k 0402 1%'.",
