@@ -417,6 +417,18 @@ _UNIT_LOADED_WANTEDBY_LINE_MISSING_LINES = [
     "UnitFileState=generated",
 ]
 
+#: A unit an operator has explicitly MASKED (`systemctl --user mask
+#: partgraph-dgraph.service`) — systemd's real shape: masking symlinks the
+#: unit to /dev/null, so LoadState is "masked" (never "loaded") and there is
+#: no [Install] section to read, hence the SAME empty WantedBy= the
+#: confirmed-False fixture above also carries. The state most likely to be
+#: confused with the one this fix pins: a masked unit also never starts at
+#: login, but for a completely different, unrelated reason.
+_UNIT_MASKED_EMPTY_WANTEDBY_LINES = [
+    "LoadState=masked", "ActiveState=inactive", "SubState=dead",
+    "UnitFileState=masked", "WantedBy=",
+]
+
 
 def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptable outcome.
     *,
@@ -2120,6 +2132,41 @@ def test_unit_state_wanted_by_default_stays_none_when_load_state_is_not_found_ev
     assert result.wanted_by_default is None, (
         f"a not-found unit's empty WantedBy= must stay None, never be read "
         f"as a confirmed False; got {result.wanted_by_default!r}"
+    )
+
+
+def test_unit_state_wanted_by_default_stays_none_when_load_state_is_masked_even_with_empty_wantedby() -> None:
+    """Given `systemctl --user show ...` reports LoadState=masked — an
+    operator ran `systemctl --user mask partgraph-dgraph.service`, which
+    genuinely blocks autostart-at-login but for a completely different
+    reason than an empty WantedBy= does — while ALSO answering with an
+    empty WantedBy= (systemd's real shape for a masked unit: masking
+    symlinks the unit to /dev/null, so there is no [Install] section for
+    systemd to read).
+    When unit_state() is called.
+    Then wanted_by_default stays None, NOT False: the empty-WantedBy-is-a-
+    confirmed-no reading is licensed ONLY on a unit systemd actually
+    LOADED. A masked unit is present and known to systemd (distinct from
+    not-found) but never reaches `loaded` — it is the state most likely to
+    be confused with the one this fix pins, since both a masked unit and a
+    confirmed-empty-WantedBy unit never start at login, for unrelated
+    reasons. Conflating them would render a masked unit's autostart status
+    as a confident "no" for the wrong reason.
+    """
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[], unit_lines=_UNIT_MASKED_EMPTY_WANTEDBY_LINES,
+    )
+    with (
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", return_value="/usr/bin/systemctl"),
+    ):
+        result = unit_state()
+
+    assert result.present is True
+    assert result.load_state == "masked"
+    assert result.wanted_by_default is None, (
+        f"a masked unit's empty WantedBy= must stay None, never be read as "
+        f"a confirmed False; got {result.wanted_by_default!r}"
     )
 
 

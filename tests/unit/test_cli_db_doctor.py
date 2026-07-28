@@ -222,6 +222,17 @@ _UNIT_LOADED_WANTEDBY_LINE_MISSING_LINES = [
     "LoadState=loaded", "ActiveState=inactive", "SubState=dead",
     "UnitFileState=generated",
 ]
+#: A unit an operator has explicitly MASKED (`systemctl --user mask
+#: partgraph-dgraph.service`) — systemd's real shape: masking symlinks the
+#: unit to /dev/null, so LoadState is "masked" (never "loaded") and there is
+#: no [Install] section to read, hence the SAME empty WantedBy= this file's
+#: confirmed-False fixture above also carries. The state most likely to be
+#: confused with the one this PR fixed: a masked unit also never starts at
+#: login, but for a completely different, unrelated reason.
+_UNIT_MASKED_EMPTY_WANTEDBY_LINES = [
+    "LoadState=masked", "ActiveState=inactive", "SubState=dead",
+    "UnitFileState=masked", "WantedBy=",
+]
 
 
 def _make_doctor_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptable outcome.
@@ -525,6 +536,47 @@ def test_doctor_reports_wanted_by_default_none_as_unknown_when_systemctl_not_fou
     low = wanted_by_line.lower()
     assert "unknown" in low, (
         f"a not-found unit's empty WantedBy= must still render as 'unknown', "
+        f"never as a confirmed no: {wanted_by_line!r}"
+    )
+    import re as _re
+    assert not _re.search(r"\b(yes|enabled|true|no|disabled|false)\b", low), (
+        f"an undetermined WantedBy must never be rendered as a guessed yes/no: {wanted_by_line!r}"
+    )
+
+
+def test_doctor_reports_wanted_by_default_none_as_unknown_when_unit_is_masked_even_with_empty_wantedby() -> None:
+    """[Contract: UnitState.wanted_by_default is None when undeterminable —
+    NEVER guessed] Given the unit is MASKED (`systemctl --user mask
+    partgraph-dgraph.service` — a realistic operator action, and the state
+    most likely to be confused with the one this PR fixed: a masked unit
+    ALSO never starts at login, but for a completely different, unrelated
+    reason) — `LoadState=masked`, never `loaded` — while ALSO answering
+    with an empty WantedBy= (systemd's real shape for a masked unit: masking
+    symlinks the unit to /dev/null, so there is no [Install] section to
+    read; the SAME empty value the confirmed-False fixture above carries).
+    When `partgraph db doctor` runs.
+    Then the WantedBy-related line still says "unknown", NOT the new
+    confirmed "no": the empty-WantedBy-is-a-confirmed-no reading is licensed
+    only on a unit systemd actually loaded, and a masked unit is not that —
+    conflating the two would render a masked unit's autostart status as a
+    confident "no" for the wrong reason.
+    """
+    fake = _make_doctor_scripted_run(
+        ps_rows=[], unit_lines=_UNIT_MASKED_EMPTY_WANTEDBY_LINES, volume_returncode=1,
+    )
+    with (
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "doctor"])
+
+    _assert_clean(result, 0)
+    wanted_by_line = _line_with(result.output, "WantedBy")
+    low = wanted_by_line.lower()
+    assert "unknown" in low, (
+        f"a masked unit's empty WantedBy= must still render as 'unknown', "
         f"never as a confirmed no: {wanted_by_line!r}"
     )
     import re as _re
