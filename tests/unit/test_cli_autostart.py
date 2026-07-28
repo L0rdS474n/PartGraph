@@ -396,8 +396,13 @@ def test_b3_never_becomes_healthy_exits_one_names_budget_and_db_status_no_traceb
     When `partgraph search MAX232` runs with autostart ON.
     Then the exit code is 1, a single output line names `partgraph db
     status` (the AutostartTimeoutError's own message, printed by the CLI),
-    no `Traceback` reaches the user, and the search's own DB work (the mock
-    client's txn) NEVER runs.
+    no `Traceback` reaches the user, the search's own DB work (the mock
+    client's txn) NEVER runs, and [Gate 5 gap fix] NO second line naming a
+    start-command failure appears — compose_up() reported success here, so
+    `_autostart_database()`'s `exc.__cause__ is not None` branch must stay
+    UN-taken, distinguishing this from the new
+    `test_b4_start_command_fails_and_never_recovers_exits_one_with_primary_
+    and_cause_lines` case below.
     """
     _autostart_on(monkeypatch)
     mock_client = _make_empty_search_client()
@@ -429,6 +434,91 @@ def test_b3_never_becomes_healthy_exits_one_names_budget_and_db_status_no_traceb
     )
     for line in result.output.splitlines():
         assert "/" not in line, f"autostart-timeout line leaks a path: {line!r}"
+    assert "start command itself failed first" not in result.output, (
+        "compose_up() reported success in this scenario — no second, "
+        f"cause-naming line may appear: {result.output!r}"
+    )
+
+
+def test_b4_start_command_fails_and_never_recovers_exits_one_with_primary_and_cause_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-4 [Gate 5 gap fix — the new diagnostic had zero coverage]: Given the
+    compose `up -d` call itself exits non-zero (`_autostart_compose_up`
+    raises `AutostartComposeError`, `src/partgraph/cli.py`) AND
+    `probe_health()` NEVER reports healthy afterward — a genuine,
+    unrecoverable start failure, the one case where an operator most needs
+    to know a fatal misconfiguration rather than a benign lost race
+    (contrast `test_absorbed_start_failure_followed_by_health_recovery_
+    prints_no_error`, which pins the RECOVERED path staying silent and is
+    deliberately left unmodified).
+    When `partgraph search MAX232` runs with autostart ON.
+    Then the exit code is 1; the PRIMARY line names the readiness budget and
+    suggests `partgraph db status` (identical to B-3's own line); a SECOND,
+    DISTINCT line reads "The start command itself failed first
+    (AutostartComposeError); see `partgraph db doctor`." — naming the
+    absorbed failure's TYPE, chained via `AutostartTimeoutError.__cause__`
+    in the leaf (asserted directly, by identity, in
+    `tests/unit/test_lifecycle_ensure_running.py`; this file can only
+    observe the RENDERED text, since `CliRunner` does not hand back the raw
+    exception chain) — and both lines are individually single-line and
+    path-free. The search's own DB work never runs.
+    """
+    _autostart_on(monkeypatch)
+    mock_client = _make_empty_search_client()
+
+    def _fake_run(argv, **kwargs):
+        if "compose" in argv and "up" in argv:
+            return MagicMock(returncode=125, stdout="", stderr="engine refused")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    from partgraph.util.lifecycle import AUTOSTART_READY_TIMEOUT_S
+
+    with (
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch.object(cli_mod, "_build_dgraph_client", return_value=(mock_client, MagicMock())),
+        patch("subprocess.run", side_effect=_fake_run),
+        patch("time.sleep"),
+        patch(
+            "time.monotonic",
+            side_effect=[0.0, AUTOSTART_READY_TIMEOUT_S + 1.0],
+        ),
+    ):
+        result = _invoke(["search", "MAX232"])
+
+    assert result.exit_code == 1, result.output
+    assert "Traceback" not in result.output
+    assert not mock_client.txn.called, (
+        "the search's own DB query must never run when the database never "
+        "became healthy"
+    )
+
+    lines = result.output.splitlines()
+    primary_lines = [ln for ln in lines if "partgraph db status" in ln]
+    cause_lines = [ln for ln in lines if "start command itself failed first" in ln]
+    assert primary_lines, (
+        f"expected the primary readiness-budget line (same as B-3's): "
+        f"{result.output!r}"
+    )
+    assert len(cause_lines) == 1, (
+        f"expected EXACTLY one second line naming the absorbed start "
+        f"failure's type: {result.output!r}"
+    )
+    cause_line = cause_lines[0]
+    assert "AutostartComposeError" in cause_line, (
+        f"the second line must name the cause's TYPE "
+        f"(AutostartComposeError): {cause_line!r}"
+    )
+    assert "partgraph db doctor" in cause_line, (
+        f"the second line must point at `partgraph db doctor`: {cause_line!r}"
+    )
+    assert cause_line != primary_lines[0], (
+        "the cause line must be DISTINCT from the primary line, not merged "
+        f"into one sentence: {result.output!r}"
+    )
+    for ln in lines:
+        assert "/" not in ln, f"autostart error line leaks a path: {ln!r}"
 
 
 # ---------------------------------------------------------------------------

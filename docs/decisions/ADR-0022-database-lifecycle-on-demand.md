@@ -561,24 +561,50 @@ stated plainly:
    nine commands failed fast with the path-free "Is the database running? Start
    it with `partgraph db up`." hint. Now, unless `PARTGRAPH_AUTOSTART` is set
    to a disable token, they attempt a start and then wait. **The worst case is
-   240 s — four minutes — before any error text appears**, and it is bounded by
-   two constants that are added, not multiplied:
+   249 s before any error text appears.** The full derivation, so the next
+   reader can check it without redoing it — every term is additive:
 
-   | | | |
-   | --- | --- | --- |
-   | the `compose up -d` call | `AUTOSTART_COMPOSE_TIMEOUT_S` | 120 s |
-   | the readiness poll after it | `AUTOSTART_READY_TIMEOUT_S` | 120 s |
-   | **worst-case total** | | **240 s** |
+   | # | what | bound | worst case |
+   | --- | --- | --- | --- |
+   | 1 | the short-circuit health probe, before anything else | `HEALTH_PROBE_TIMEOUT_S` x 2 | 4 s |
+   | 2 | the `compose up -d` call | `AUTOSTART_COMPOSE_TIMEOUT_S` | 120 s |
+   | 3 | the readiness budget | `AUTOSTART_READY_TIMEOUT_S` | 120 s |
+   | 4 | one poll interval begun just under the deadline | `AUTOSTART_POLL_INTERVAL_S` | 1 s |
+   | 5 | the probe that interval starts, which runs to completion | `HEALTH_PROBE_TIMEOUT_S` x 2 | 4 s |
+   | | **worst-case total** | | **249 s** |
 
-   The ordinary case is nothing like that: a container create and start on an
+   Three things in that table are easy to get wrong, and this ADR has now been
+   corrected twice for exactly this kind of arithmetic, so they are spelled
+   out:
+
+   - **Terms 4 and 5 exist because the deadline is checked *after* the sleep
+     and the probe, not before.** An iteration admitted at `deadline - ε` runs
+     to completion; the deadline preempts nothing already in flight. The
+     readiness *phase* therefore spans up to
+     `AUTOSTART_READY_TIMEOUT_S + AUTOSTART_POLL_INTERVAL_S + one probe`, not
+     `AUTOSTART_READY_TIMEOUT_S`.
+   - **One probe costs up to 2 x `HEALTH_PROBE_TIMEOUT_S`, not 1 x.**
+     `probe_health()` calls `requests.get(url, timeout=HEALTH_PROBE_TIMEOUT_S)`,
+     and `requests` maps a single float to `Timeout(connect=t, read=t)`
+     (`HTTPAdapter.send`) — the connect and read phases are bounded
+     *separately*. There are no retries (the default adapter is
+     `Retry(total=0)`) and no DNS phase (the URL is a literal loopback
+     address), so 2 x is the ceiling, not a floor of a longer series.
+   - **Term 1 is outside the readiness budget**, because it runs before the
+     deadline is computed. It reaches its own ceiling only when something is
+     *listening* on the port but not answering — a wedged Dgraph, or a foreign
+     process holding 8081. When the port is simply closed the connection is
+     refused immediately and term 1 is ~0.
+
+   The ordinary case is nothing like 249 s: a container create and start on an
    existing image and volume is seconds, and a database that is already up
-   costs one HTTP probe. 240 s is reached only when the engine is wedged, or
-   the database comes up and never answers.
+   costs one HTTP probe and nothing else. The ceiling is reached only when the
+   engine is wedged, or the database comes up and never answers.
 
    `AUTOSTART_COMPOSE_TIMEOUT_S` is deliberately **not** the 1800 s
-   `COMPOSE_TIMEOUT_S` that `db up` uses. Inheriting it made the worst case
-   1800 + 120 s — about **32 minutes** of silence on a command someone typed to
-   look up a part. `db up` keeps 1800 s because the operator asked for a
+   `COMPOSE_TIMEOUT_S` that `db up` uses. Inheriting it put term 2 at 1800 s
+   instead of 120 s — about **32 minutes** of silence on a command someone
+   typed to look up a part. `db up` keeps 1800 s because the operator asked for a
    database explicitly and expects a first-run image pull; autostart is
    implicit and gets a budget sized for someone waiting at a prompt. The cost
    of the smaller bound is that a first-run image pull over a slow link may be

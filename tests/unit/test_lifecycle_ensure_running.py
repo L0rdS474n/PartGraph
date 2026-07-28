@@ -395,8 +395,12 @@ def test_b3_never_becomes_healthy_raises_after_a_bounded_poll_count_never_real_t
     times (the poll count is bounded by, and directly attributable to, the
     injected clock — never real elapsed wall time, since `sleep` here is a
     MagicMock that never actually sleeps), each call passing
-    AUTOSTART_POLL_INTERVAL_S; and the exception's own message is a single,
-    path-free line naming the budget and suggesting `partgraph db status`.
+    AUTOSTART_POLL_INTERVAL_S; the exception's own message is a single,
+    path-free line naming the budget and suggesting `partgraph db status`;
+    and [Gate 5 gap fix] `excinfo.value.__cause__` is None — compose_up()
+    reported success here, so `raise ... from None` must be the path taken,
+    distinguishable from B-4's chained one below (there is no active
+    exception context inside the poll loop to accidentally suppress either).
     """
     probe_health = MagicMock(return_value=_UNHEALTHY)
     compose_up = MagicMock()
@@ -431,6 +435,12 @@ def test_b3_never_becomes_healthy_raises_after_a_bounded_poll_count_never_real_t
     )
     assert "\n" not in message, f"the timeout message must be a single line: {message!r}"
     assert "/" not in message, f"the timeout message must be path-free: {message!r}"
+    assert excinfo.value.__cause__ is None, (
+        "compose_up() reported SUCCESS here (the DB simply never answered), "
+        "so the raised AutostartTimeoutError must carry no __cause__ — "
+        f"'raise ... from None', not a chained exception: got "
+        f"{excinfo.value.__cause__!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -449,19 +459,24 @@ def test_b4_start_failure_that_never_recovers_still_times_out_cleanly() -> None:
     Then AutostartTimeoutError is raised (the leaf's own clean, catchable
     failure signal — `partgraph.cli` is expected to turn this into "exit
     non-zero with a clear message, no traceback"), compose_up() was called
-    EXACTLY once despite raising (never retried), and the DB work never got
-    a chance to run (ensure_running() never returned normally).
+    EXACTLY once despite raising (never retried), the DB work never got a
+    chance to run (ensure_running() never returned normally), and [Gate 5
+    gap fix] the raised exception's `__cause__` IS the exact absorbed
+    exception object `compose_up()` raised — asserted by IDENTITY (`is`),
+    not by matching some text, so a future refactor that drops the `from
+    absorbed` chain while keeping a similar-looking message is still caught.
     """
+    raised = RuntimeError("the container engine exited with code 125")
 
     def _compose_up_raises() -> None:
-        raise RuntimeError("the container engine exited with code 125")
+        raise raised
 
     probe_health = MagicMock(return_value=_UNHEALTHY)
     compose_up = MagicMock(side_effect=_compose_up_raises)
     sleep = MagicMock()
     monotonic = MagicMock(side_effect=[0.0, AUTOSTART_READY_TIMEOUT_S + 1.0])
 
-    with pytest.raises(AutostartTimeoutError):
+    with pytest.raises(AutostartTimeoutError) as excinfo:
         ensure_running(
             probe_health=probe_health, compose_up=compose_up, sleep=sleep, monotonic=monotonic,
         )
@@ -470,6 +485,12 @@ def test_b4_start_failure_that_never_recovers_still_times_out_cleanly() -> None:
     assert sleep.call_count == 1, (
         "the DB is still polled at least once even after a start failure — "
         "only the deadline decides when to give up"
+    )
+    assert excinfo.value.__cause__ is raised, (
+        "the timeout must be CHAINED onto the exact absorbed exception "
+        f"compose_up() raised ('raise AutostartTimeoutError(...) from "
+        f"absorbed'), not merely carry similar text: got "
+        f"{excinfo.value.__cause__!r}, expected {raised!r}"
     )
 
 

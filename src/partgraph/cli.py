@@ -112,8 +112,17 @@ COMPOSE_DOWN_TIMEOUT_S = 300.0
 #: registry pull that neither completes nor errors) 1800 s of silence followed
 #: by :data:`~partgraph.util.lifecycle.AUTOSTART_READY_TIMEOUT_S` of polling —
 #: about 32 minutes before the first byte of error text. No interactive command
-#: may do that, so the implicit path gets its own, much smaller budget: worst
-#: case is now 120 + 120 = 240 s.
+#: may do that, so the implicit path gets its own, much smaller budget.
+#:
+#: This constant is the SECOND of five additive terms in the autostart gate's
+#: worst case, which totals 249 s: one health probe (4 s) + this (120 s) +
+#: ``AUTOSTART_READY_TIMEOUT_S`` (120 s) + one ``AUTOSTART_POLL_INTERVAL_S``
+#: (1 s) + one more health probe (4 s). The two trailing terms exist because
+#: the readiness deadline is checked AFTER each sleep-and-probe, so an
+#: iteration admitted just under it still runs to completion; a probe costs up
+#: to 2 x ``HEALTH_PROBE_TIMEOUT_S`` because ``requests`` bounds the connect
+#: and read phases separately. The full derivation is in ADR-0022's
+#: "Breaking changes" section — do not restate a rounded figure here.
 #:
 #: What 120 s costs. The steady-state autostart — image already present, volume
 #: already there — is a container create and start, which is seconds. The case
@@ -354,12 +363,12 @@ def _autostart_compose_up() -> None:
 
     The watchdog is :data:`AUTOSTART_COMPOSE_TIMEOUT_S`, NOT the
     :data:`COMPOSE_TIMEOUT_S` ``db up`` uses: this call is implicit, made on
-    behalf of somebody who typed ``partgraph search``, and it bounds the total
-    implicit wait to ``AUTOSTART_COMPOSE_TIMEOUT_S`` +
-    :data:`~partgraph.util.lifecycle.AUTOSTART_READY_TIMEOUT_S` (240 s) instead
-    of the ~32 minutes the generous bound would have allowed against a wedged
-    engine. It is NOT charged against the readiness budget: ``ensure_running()``
-    starts its deadline only after this returns.
+    behalf of somebody who typed ``partgraph search``. It holds the whole
+    autostart gate's worst case to 249 s (the five-term derivation is on
+    :data:`AUTOSTART_COMPOSE_TIMEOUT_S` and in ADR-0022) instead of the ~32
+    minutes the generous bound would have allowed against a wedged engine.
+    This call is NOT charged against the readiness budget:
+    ``ensure_running()`` starts its deadline only after it returns.
 
     Raises:
         partgraph.util.container.ContainerEngineError: No usable engine on
