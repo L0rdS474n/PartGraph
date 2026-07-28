@@ -41,6 +41,13 @@ from partgraph.refresh.stock import (
     build_stock_index,
     refresh_stock_write,
 )
+from partgraph.util.activity import (
+    DEFAULT_IDLE_TIMEOUT_MINUTES,
+    default_state_dir,
+    evaluate_idle,
+    held_lease,
+    touch_activity,
+)
 from partgraph.util.container import ContainerEngineError, compose_command, engine_command
 from partgraph.util.health import DGRAPH_HTTP_HEALTH_URL, probe_health
 from partgraph.util.index_health import check_index_integrity
@@ -159,6 +166,14 @@ NORMALIZE_CHECKPOINT_PATH = _REPO_ROOT / "data" / "state" / "normalize.json"
 #: run to the staged file via a cheap fingerprint so a crash can resume the
 #: remaining batches instead of re-sending the whole staged set.
 LOAD_CHECKPOINT_PATH = _REPO_ROOT / "data" / "state" / "load_checkpoint.json"
+
+#: Where the idle auto-stop state (the activity stamp and the per-process
+#: leases) lives — the SAME ``data/state`` directory the normalize and load
+#: checkpoints already use, resolved by the leaf rather than re-derived here so
+#: the two can never drift apart (ADR-0023). A module-level constant, mirroring
+#: the checkpoint paths above, so a test can redirect it without patching the
+#: leaf.
+ACTIVITY_STATE_DIR = default_state_dir()
 
 #: HTTPS URL of the CDFER single-file JLCPCB/LCSC component database (~1 GB).
 #: Verified upstream GitHub Pages asset published by the cdfer
@@ -624,6 +639,212 @@ def down(
         )
 
 
+# ---------------------------------------------------------------------------
+# db idle-stop — the unattended half of the lifecycle (ADR-0023)
+# ---------------------------------------------------------------------------
+
+#: The environment variable an operator sets to retune, or switch off, the
+#: idle auto-stop budget.
+_IDLE_TIMEOUT_ENV_VAR = "PARTGRAPH_IDLE_TIMEOUT_MINUTES"
+
+
+def _idle_timeout_minutes() -> float:
+    """Return the configured idle budget in minutes.
+
+    Read from :data:`os.environ` at CALL time, never captured at import time,
+    exactly as :func:`_autostart_enabled` is — and parsed HERE rather than in
+    the leaf for the same reason: this is the CLI's policy, so the CLI owns it,
+    and :func:`partgraph.util.activity.evaluate_idle` stays a pure function of
+    its arguments.
+
+    The rule, and why each row of it goes the way it does:
+
+    ===========================  =========================================
+    value (after ``.strip()``)   result
+    ===========================  =========================================
+    unset / empty / whitespace   :data:`DEFAULT_IDLE_TIMEOUT_MINUTES`
+    unparseable (``"banana"``)   :data:`DEFAULT_IDLE_TIMEOUT_MINUTES`
+    non-finite (``inf``/``nan``) :data:`DEFAULT_IDLE_TIMEOUT_MINUTES`
+    finite and ``<= 0``          ``0.0`` — the canonical DISABLED sentinel
+    finite and ``> 0``           that value, verbatim, with no ceiling
+    ===========================  =========================================
+
+    Every unusable value falls back to the DOCUMENTED DEFAULT rather than to
+    either extreme. Not to "stop immediately" — which a naive ``float(x) or 0``
+    idiom, or letting ``nan`` through into an ``age >= timeout`` comparison
+    that is always False, would each risk in a different wrong direction — and
+    not to "silently disabled", which would surprise an operator who was
+    plainly trying to CONFIGURE the timeout, not switch the feature off.
+
+    Only a value that parses AND is non-positive disables it. That folds the
+    documented ``0`` escape hatch and any negative number into one rule: a
+    negative timeout has no sane positive reading, and left unguarded inside
+    ``age_minutes >= timeout`` it would be ALWAYS true — the single most
+    dangerous parsing bug available to a control whose job is stopping a
+    database.
+
+    No sanity CEILING is imposed, unlike :data:`AUTOSTART_READY_TIMEOUT_S`'s:
+    the risk directions are not symmetric. An oversized autostart budget costs
+    a human a real foreground wait; an oversized idle budget only means
+    idle-stop practically never fires, which is already the safe direction.
+    """
+    raw = os.environ.get(_IDLE_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return DEFAULT_IDLE_TIMEOUT_MINUTES
+    text = raw.strip()
+    if not text:
+        return DEFAULT_IDLE_TIMEOUT_MINUTES
+    try:
+        value = float(text)
+    except ValueError:
+        return DEFAULT_IDLE_TIMEOUT_MINUTES
+    if not math.isfinite(value):
+        return DEFAULT_IDLE_TIMEOUT_MINUTES
+    return value if value > 0 else 0.0
+
+
+def _report_idle_stop_outcome(result: DownResult) -> None:
+    """Report what the sweep did, in `db down`'s own vocabulary.
+
+    ``db idle-stop`` always exits 0 (see :func:`idle_stop`), and "always exits
+    0" must never collapse into "always silent": a genuinely failed stop has to
+    stay visible in the journal even though the unit itself is never reported
+    as failed. Survivors and undetermined containers are reported on separate
+    lines and with the SAME words ``db down`` uses for the identical
+    ``DownResult`` fields, so an operator grepping for either finds both.
+
+    Every line is path-free and carries display names only, never the opaque
+    container ID. ``markup=False`` keeps an engine-derived name containing
+    ``[...]`` from being read as a Rich style tag.
+    """
+    if result.survivors:
+        _err_console.print(
+            f"Idle auto-stop: {len(result.survivors)} survivor(s) still running "
+            f"after the stop sweep: {', '.join(result.survivors)}.",
+            markup=False,
+            soft_wrap=True,
+            style="red",
+        )
+    if result.undetermined:
+        _err_console.print(
+            f"Idle auto-stop: could not verify whether {len(result.undetermined)} "
+            f"container(s) belong to PartGraph: {', '.join(result.undetermined)}.",
+            markup=False,
+            soft_wrap=True,
+            style="red",
+        )
+    if not (result.survivors or result.undetermined):
+        # Distinguished, not merged: "the sweep found nothing running" and "the
+        # sweep stopped something" are different news, and a line claiming a
+        # stop that never happened would be wrong in the journal forever.
+        _console.print(
+            (
+                "Idle auto-stop: the database was idle; stopped "
+                f"{', '.join(result.stopped)}. The data volume is preserved."
+                if result.stopped
+                else "Idle auto-stop: the database was idle; no PartGraph "
+                "instance was running, so nothing was stopped."
+            ),
+            markup=False,
+            soft_wrap=True,
+        )
+
+
+@db_app.command("idle-stop")
+def idle_stop() -> None:
+    """Stop the database if it has been idle long enough (ADR-0023).
+
+    The unattended counterpart to lazy autostart: `partgraph` is a one-shot
+    CLI, so nothing inside a command can notice idleness after that command has
+    exited. This is the separate one-shot invocation an opt-in
+    ``systemd --user`` timer runs periodically instead
+    (systemd/partgraph-db-idle-stop.timer; the repository ships it and never
+    enables it).
+
+    It never starts anything: the autostart gate is deliberately absent here,
+    regardless of PARTGRAPH_AUTOSTART. A live lease — any PartGraph command
+    genuinely mid-run, interactive or scheduled — blocks the stop
+    unconditionally, even against an activity stamp old enough to demand one.
+    The stop itself is delegated to the same `db down` sweep, so the S1/S2/S3
+    selector policy, the "never rm, never -v" verb surface and the promise to
+    leave unrelated containers alone are inherited, not re-derived.
+
+    Set PARTGRAPH_IDLE_TIMEOUT_MINUTES to retune the budget (default 30), or to
+    0 to switch this off entirely.
+
+    Always exits 0: this runs unattended, and a survivor costs continued idle
+    memory, never correctness — it must not make a timer's run accounting look
+    like a failure the way a human-typed `db down` correctly does. It is never
+    SILENT about one, though: anything short of a clean stop is still reported.
+    """
+    timeout_minutes = _idle_timeout_minutes()
+    if timeout_minutes <= 0:
+        # A genuine zero-I/O no-op: no health probe, no engine detection, no
+        # state read at all. The escape hatch must not cost the very work it
+        # exists to avoid.
+        _console.print(
+            "Idle auto-stop is disabled "
+            f"({_IDLE_TIMEOUT_ENV_VAR} is not a positive number); nothing was checked."
+        )
+        return
+
+    try:
+        # cli.py's OWN module-level probe_health reference — the same seam
+        # `db status`, `db down` and the autostart gate share.
+        db_reachable = bool(getattr(probe_health(), "healthy", False))
+    except Exception:  # noqa: BLE001 — unattended: a probe failure is not fatal.
+        # probe_health already maps every EXPECTED network outcome to a
+        # HealthResult, so only an unexpected error lands here. Treat it as
+        # "not reachable": that is the reading that fabricates nothing.
+        db_reachable = False
+
+    decision = evaluate_idle(
+        state_dir=ACTIVITY_STATE_DIR,
+        idle_timeout_minutes=timeout_minutes,
+        db_reachable=db_reachable,
+    )
+    if not decision.should_stop:
+        _console.print(
+            f"Idle auto-stop: leaving the database alone (reason: {decision.reason})."
+        )
+        return
+
+    try:
+        engine_prefix = engine_command()
+    except ContainerEngineError:
+        # Path-free and non-fatal: with no engine on this host there is nothing
+        # this command could have stopped anyway.
+        _err_console.print(
+            "Idle auto-stop: no usable container engine was found; nothing was stopped.",
+            style="red",
+        )
+        return
+
+    try:
+        result = stop_all(
+            engine_prefix=engine_prefix,
+            # Byte-for-byte `db down`'s own seam: never `-v`, never `rm`.
+            compose_down=lambda: _run_compose(
+                ["down"], action="stop", timeout=COMPOSE_DOWN_TIMEOUT_S
+            ),
+            probe_health=probe_health,
+            dry_run=False,
+        )
+    except Exception:  # noqa: BLE001 — see the docstring: always exit 0.
+        # Includes the typer.Exit `_run_compose` raises on a non-zero Compose
+        # exit (typer.Exit derives from RuntimeError). Reported path-free and
+        # absorbed, because an unattended sweep that failed must be visible in
+        # the journal without marking the timer's own run as failed.
+        _err_console.print(
+            "Idle auto-stop: the shutdown sweep did not complete; nothing is "
+            "guaranteed stopped.",
+            style="red",
+        )
+        return
+
+    _report_idle_stop_outcome(result)
+
+
 @db_app.command("status")
 def status() -> None:
     """Report whether the local Dgraph database is running and healthy.
@@ -673,28 +894,35 @@ def apply_schema() -> None:
         _err_console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    # This command talks to Dgraph over its OWN gRPC path, not through
-    # _connect_dgraph(), so the autostart gate is wired explicitly here. Placed
-    # AFTER the schema file is read: a missing or malformed local schema is a
-    # local error and must be reported without starting a container for it.
-    _autostart_database()
+    # The lease covers the autostart gate as well as the schema write: a
+    # database this invocation is bringing up is a database no concurrent
+    # `db idle-stop` may stop out from under it (ADR-0023). The stamp is
+    # written inside the held window, on success only.
+    with held_lease(state_dir=ACTIVITY_STATE_DIR):
+        # This command talks to Dgraph over its OWN gRPC path, not through
+        # _connect_dgraph(), so the autostart gate is wired explicitly here.
+        # Placed AFTER the schema file is read: a missing or malformed local
+        # schema is a local error and must be reported without starting a
+        # container for it.
+        _autostart_database()
 
-    try:
-        schema_module.apply_schema(schema_text, DGRAPH_GRPC_ADDR)
-    except ImportError as exc:
-        _err_console.print(
-            "[red]Error:[/red] pydgraph is not installed. "
-            'Install it with `pip install -e ".[dev]"` or `pip install pydgraph`.'
-        )
-        raise typer.Exit(code=1) from exc
-    except Exception as exc:
-        # Surface any pydgraph/gRPC failure with a clear message, then re-raise
-        # as a CLI exit so the error is never silently swallowed.
-        _err_console.print(
-            f"[red]Error:[/red] failed to apply schema to Dgraph at "
-            f"{DGRAPH_GRPC_ADDR}: {exc}"
-        )
-        raise typer.Exit(code=1) from exc
+        try:
+            schema_module.apply_schema(schema_text, DGRAPH_GRPC_ADDR)
+        except ImportError as exc:
+            _err_console.print(
+                "[red]Error:[/red] pydgraph is not installed. "
+                'Install it with `pip install -e ".[dev]"` or `pip install pydgraph`.'
+            )
+            raise typer.Exit(code=1) from exc
+        except Exception as exc:
+            # Surface any pydgraph/gRPC failure with a clear message, then
+            # re-raise as a CLI exit so the error is never silently swallowed.
+            _err_console.print(
+                f"[red]Error:[/red] failed to apply schema to Dgraph at "
+                f"{DGRAPH_GRPC_ADDR}: {exc}"
+            )
+            raise typer.Exit(code=1) from exc
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
 
     _console.print(
         f"[green]Schema applied[/green] to Dgraph at {DGRAPH_GRPC_ADDR} "
@@ -728,26 +956,33 @@ def check_index() -> None:
     self-similarity probe passed (or there is nothing embedded yet to check);
     otherwise 1.
     """
-    # Like `db apply-schema`, this command reaches Dgraph without going through
-    # _connect_dgraph() (it queries the HTTP endpoint directly), so the
-    # autostart gate is wired explicitly here rather than inherited.
-    _autostart_database()
+    # The lease covers the autostart gate as well as the probe, for the same
+    # reason `db apply-schema`'s does; the stamp is written inside the held
+    # window, on success only (ADR-0023). A NOT-healthy result still counts as
+    # real database work: the check reached the database to learn that.
+    with held_lease(state_dir=ACTIVITY_STATE_DIR):
+        # Like `db apply-schema`, this command reaches Dgraph without going
+        # through _connect_dgraph() (it queries the HTTP endpoint directly), so
+        # the autostart gate is wired explicitly here rather than inherited.
+        _autostart_database()
 
-    try:
-        result = check_index_integrity(schema_text=schema_module.load_schema(SCHEMA_FILE))
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        # Defense-in-depth (security Finding 2, mirroring status()): the leaf maps
-        # every EXPECTED network outcome to an IndexIntegrityResult and lets only
-        # UNEXPECTED errors propagate. Turn any such error into a fixed, path-free
-        # message and a clean exit so no raw traceback (which could leak an
-        # internal path) reaches the user's terminal. Re-raised via ``from exc``,
-        # so this is not a blind, swallowing except (ruff BLE001 is satisfied).
-        _err_console.print(
-            "[red]Error:[/red] could not run the index integrity check."
-        )
-        raise typer.Exit(code=1) from exc
+        try:
+            result = check_index_integrity(schema_text=schema_module.load_schema(SCHEMA_FILE))
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            # Defense-in-depth (security Finding 2, mirroring status()): the leaf
+            # maps every EXPECTED network outcome to an IndexIntegrityResult and
+            # lets only UNEXPECTED errors propagate. Turn any such error into a
+            # fixed, path-free message and a clean exit so no raw traceback (which
+            # could leak an internal path) reaches the user's terminal. Re-raised
+            # via ``from exc``, so this is not a blind, swallowing except (ruff
+            # BLE001 is satisfied).
+            _err_console.print(
+                "[red]Error:[/red] could not run the index integrity check."
+            )
+            raise typer.Exit(code=1) from exc
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
 
     # Exit formula (ADR-0019): healthy iff reachable AND the schema matches AND the
     # self-similarity probe passed or was skipped for want of embedded parts
@@ -1246,37 +1481,48 @@ def _stage_load() -> int:
     parts = _read_staged_parts(STAGED_PATH)
     fingerprint = _file_fingerprint(STAGED_PATH)
     LOAD_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    stub = None
-    try:
-        client, stub = _connect_dgraph()
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=_console,
-            transient=True,
-        ) as progress_bar:
-            task = progress_bar.add_task("Loading into Dgraph", total=len(parts) or None)
+    # Hold the activity lease across the real database work and release it in
+    # a `finally` even if that work raises; stamp INSIDE the held window, on
+    # success only, so a command that did not finish never records activity
+    # for work it never did (ADR-0023).
+    with held_lease(state_dir=ACTIVITY_STATE_DIR):
+        stub = None
+        try:
+            client, stub = _connect_dgraph()
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=_console,
+                transient=True,
+            ) as progress_bar:
+                task = progress_bar.add_task("Loading into Dgraph", total=len(parts) or None)
 
-            def _on_load(current: int, total_count: int) -> None:
-                progress_bar.update(task, completed=current, total=total_count or None)
+                def _on_load(current: int, total_count: int) -> None:
+                    progress_bar.update(task, completed=current, total=total_count or None)
+                    # The heartbeat reuses the Loader's OWN pre-existing
+                    # per-batch callback rather than adding a second, parallel
+                    # hook that could silently drift out of sync with it
+                    # (ADR-0023): a full catalogue load runs for hours.
+                    touch_activity(state_dir=ACTIVITY_STATE_DIR)
 
-            Loader(client, progress=_on_load).load(
-                parts,
-                checkpoint_path=LOAD_CHECKPOINT_PATH,
-                fingerprint=fingerprint,
+                Loader(client, progress=_on_load).load(
+                    parts,
+                    checkpoint_path=LOAD_CHECKPOINT_PATH,
+                    fingerprint=fingerprint,
+                )
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            _err_console.print(
+                f"[red]Error:[/red] failed to load parts into Dgraph: {exc}. "
+                "Is the database running? Start it with `partgraph db up`."
             )
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        _err_console.print(
-            f"[red]Error:[/red] failed to load parts into Dgraph: {exc}. "
-            "Is the database running? Start it with `partgraph db up`."
-        )
-        raise typer.Exit(code=1) from exc
-    finally:
-        if stub is not None:
-            stub.close()
+            raise typer.Exit(code=1) from exc
+        finally:
+            if stub is not None:
+                stub.close()
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
     return len(parts)
 
 
@@ -1311,30 +1557,37 @@ def stats() -> None:
     from rich.table import Table  # noqa: PLC0415
 
     stub = None
-    try:
-        client, stub = _connect_dgraph()
-        counts: dict[str, int] = {}
-        for node_type in _STATS_NODE_TYPES:
-            query = f"{{ q(func: type({node_type})) {{ count(uid) }} }}"
-            txn = client.txn(read_only=True)
-            try:
-                resp = txn.query(query)
-                data = _json.loads(resp.json)
-                block = data.get("q", [])
-                counts[node_type] = block[0]["count"] if block else 0
-            finally:
-                txn.discard()
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        _err_console.print(
-            f"[red]Error:[/red] failed to query Dgraph: {exc}. "
-            "Is the database running? Start it with `partgraph db up`."
-        )
-        raise typer.Exit(code=1) from exc
-    finally:
-        if stub is not None:
-            stub.close()
+    # The lease is held across the real database work and released in a
+    # `finally` even if that work raises (ADR-0023); the stamp is written
+    # INSIDE that window, on success only, so no gap exists in which a
+    # concurrent `db idle-stop` could stop a database whose activity was about
+    # to be recorded but was not yet.
+    with held_lease(state_dir=ACTIVITY_STATE_DIR):
+        try:
+            client, stub = _connect_dgraph()
+            counts: dict[str, int] = {}
+            for node_type in _STATS_NODE_TYPES:
+                query = f"{{ q(func: type({node_type})) {{ count(uid) }} }}"
+                txn = client.txn(read_only=True)
+                try:
+                    resp = txn.query(query)
+                    data = _json.loads(resp.json)
+                    block = data.get("q", [])
+                    counts[node_type] = block[0]["count"] if block else 0
+                finally:
+                    txn.discard()
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            _err_console.print(
+                f"[red]Error:[/red] failed to query Dgraph: {exc}. "
+                "Is the database running? Start it with `partgraph db up`."
+            )
+            raise typer.Exit(code=1) from exc
+        finally:
+            if stub is not None:
+                stub.close()
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
 
     table = Table(title="PartGraph node counts")
     table.add_column("Type", justify="left")
@@ -1575,6 +1828,61 @@ def _emit_search_json(result, parsed) -> None:
     print(_json.dumps(envelope, ensure_ascii=False))
 
 
+def _relaxed_search_pass(  # noqa: PLR0913 — one seam per already-validated input.
+    client,
+    parsed,
+    hard_data: dict,
+    *,
+    limit: int,
+    sort_key: str,
+    filter_kwargs: dict,
+):
+    """Run the nearest-match (relaxed) second pass and return its ranked result.
+
+    Extracted from :func:`search` verbatim — same queries, same merge, same
+    ranking — purely so that command's own body stays inside the statement
+    budget once the activity lease wraps it. Behaviour is unchanged: the
+    parametric quantities are dropped while the text, package and structured
+    filters are kept, rows already returned by the hard pass are excluded by
+    uid, and the remainder is merged under the ``"nearest"`` key the ranker
+    reads. ``sort_key`` is threaded for consistency; ``rank_results`` ignores it
+    in nearest-match mode, where parameter distance always wins.
+    """
+    from partgraph.query.dql_builder import build_search_dql  # noqa: PLC0415
+    from partgraph.query.parser import ParsedQuery  # noqa: PLC0415
+    from partgraph.query.ranker import rank_results  # noqa: PLC0415
+
+    relaxed = ParsedQuery(
+        quantities=[],
+        package=parsed.package,
+        text_tokens=parsed.text_tokens,
+        raw_query=parsed.raw_query,
+    )
+    relaxed_text, relaxed_vars = build_search_dql(relaxed, limit=limit, **filter_kwargs)
+    relaxed_data = _run_block_query(client, relaxed_text, relaxed_vars)
+
+    hard_uids = {
+        r.get("uid")
+        for key in ("exact", "trig", "fts")
+        for r in hard_data.get(key, []) or []
+        if isinstance(r, dict)
+    }
+    nearest_rows = [
+        r
+        for block in relaxed_data.values()
+        if isinstance(block, list)
+        for r in block
+        if isinstance(r, dict) and r.get("uid") not in hard_uids
+    ]
+    merged = {
+        "exact": hard_data.get("exact", []) or [],
+        "trig": hard_data.get("trig", []) or [],
+        "fts": hard_data.get("fts", []) or [],
+        "nearest": nearest_rows,
+    }
+    return rank_results(merged, parsed, sort=sort_key)
+
+
 @app.command()
 def search(  # noqa: PLR0913, PLR0917 — Typer command surface: one option per filter flag
     query: str = typer.Argument(
@@ -1739,7 +2047,7 @@ def search(  # noqa: PLR0913, PLR0917 — Typer command surface: one option per 
         return
 
     from partgraph.query.dql_builder import build_search_dql  # noqa: PLC0415
-    from partgraph.query.parser import ParsedQuery, parse_query  # noqa: PLC0415
+    from partgraph.query.parser import parse_query  # noqa: PLC0415
     from partgraph.query.ranker import rank_results  # noqa: PLC0415
     from partgraph.query.renderer import render_search_results  # noqa: PLC0415
 
@@ -1769,60 +2077,38 @@ def search(  # noqa: PLR0913, PLR0917 — Typer command surface: one option per 
         "max_price": max_price_val,
     }
 
-    stub = None
-    try:
-        client, stub = _connect_dgraph()
+    # Hold the activity lease across the real database work and release it in
+    # a `finally` even if that work raises; stamp INSIDE the held window, on
+    # success only, so a command that did not finish never records activity
+    # for work it never did (ADR-0023).
+    with held_lease(state_dir=ACTIVITY_STATE_DIR):
+        stub = None
+        try:
+            client, stub = _connect_dgraph()
 
-        # Pass 1 (hard): full parametric + text filter + all structured filters.
-        query_text, variables = build_search_dql(parsed, limit=limit, **filter_kwargs)
-        data = _run_block_query(client, query_text, variables)
-        result = rank_results(data, parsed, sort=sort_key)
+            # Pass 1 (hard): full parametric + text filter + all structured filters.
+            query_text, variables = build_search_dql(parsed, limit=limit, **filter_kwargs)
+            data = _run_block_query(client, query_text, variables)
+            result = rank_results(data, parsed, sort=sort_key)
 
-        if not result.rows and parsed.quantities:
-            # Pass 2 (relaxed): drop parametric filters, keep text + package + the
-            # hard structured filters, and merge the relaxed rows under the
-            # "nearest" key for the ranker.
-            relaxed = ParsedQuery(
-                quantities=[],
-                package=parsed.package,
-                text_tokens=parsed.text_tokens,
-                raw_query=parsed.raw_query,
-            )
-            relaxed_text, relaxed_vars = build_search_dql(
-                relaxed, limit=limit, **filter_kwargs
-            )
-            relaxed_data = _run_block_query(client, relaxed_text, relaxed_vars)
-
-            hard_uids = {
-                r.get("uid")
-                for key in ("exact", "trig", "fts")
-                for r in data.get(key, []) or []
-                if isinstance(r, dict)
-            }
-            nearest_rows = [
-                r
-                for block in relaxed_data.values()
-                if isinstance(block, list)
-                for r in block
-                if isinstance(r, dict) and r.get("uid") not in hard_uids
-            ]
-            merged = {
-                "exact": data.get("exact", []) or [],
-                "trig": data.get("trig", []) or [],
-                "fts": data.get("fts", []) or [],
-                "nearest": nearest_rows,
-            }
-            # ``sort`` is threaded for consistency; rank_results ignores it in
-            # nearest-match mode (parameter-distance order always wins).
-            result = rank_results(merged, parsed, sort=sort_key)
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        _err_console.print(_DB_QUERY_ERROR)
-        raise typer.Exit(code=1) from exc
-    finally:
-        if stub is not None:
-            stub.close()
+            if not result.rows and parsed.quantities:
+                result = _relaxed_search_pass(
+                    client,
+                    parsed,
+                    data,
+                    limit=limit,
+                    sort_key=sort_key,
+                    filter_kwargs=filter_kwargs,
+                )
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            _err_console.print(_DB_QUERY_ERROR)
+            raise typer.Exit(code=1) from exc
+        finally:
+            if stub is not None:
+                stub.close()
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
 
     # Success path only: under --json emit exactly one JSON envelope (Arch
     # MUST-3) — including the empty-result envelope, never the human "No matches
@@ -1957,45 +2243,51 @@ def _run_semantic_search(  # noqa: PLR0913 — keyword-only filter passthrough
         SEMANTIC_CANDIDATE_CAP,
     )
 
-    stub = None
-    probe_hint: str | None = None
-    try:
-        client, stub = _connect_dgraph()
-        query_text, variables = build_semantic_dql(
-            query_vector,
-            candidate_k,
-            parsed=parsed,
-            manufacturer=manufacturer,
-            category=category,
-            min_stock=min_stock,
-            is_basic=is_basic,
-            max_price=max_price,
-        )
-        data = _run_block_query(client, query_text, variables)
-        result = rank_results(
-            data,
-            parsed if parsed is not None else parse_query(""),
-            sort=sort,
-            query_vector=query_vector,
-            result_limit=min(limit, MAX_RESULT_LIMIT),
-        )
+    # Hold the activity lease across the real database work and release it in
+    # a `finally` even if that work raises; stamp INSIDE the held window, on
+    # success only, so a command that did not finish never records activity
+    # for work it never did (ADR-0023).
+    with held_lease(state_dir=ACTIVITY_STATE_DIR):
+        stub = None
+        probe_hint: str | None = None
+        try:
+            client, stub = _connect_dgraph()
+            query_text, variables = build_semantic_dql(
+                query_vector,
+                candidate_k,
+                parsed=parsed,
+                manufacturer=manufacturer,
+                category=category,
+                min_stock=min_stock,
+                is_basic=is_basic,
+                max_price=max_price,
+            )
+            data = _run_block_query(client, query_text, variables)
+            result = rank_results(
+                data,
+                parsed if parsed is not None else parse_query(""),
+                sort=sort,
+                query_vector=query_vector,
+                result_limit=min(limit, MAX_RESULT_LIMIT),
+            )
 
-        # Empty human-path result: probe the embedding index ONCE on the SAME
-        # client to choose the right hint (starvation vs run-embed). The probe is
-        # NOT issued under --json (which never prints a hint and never pays the
-        # extra round-trip; AC-SF-27/AC-HY-15) nor when there is already a row to
-        # show (AC-HY-15). _probe_embedding_hint owns its own exceptions, so a
-        # probe failure never trips this primary query's exit-1 handler (F2).
-        if not result.rows and not json_output:
-            probe_hint = _probe_embedding_hint(client)
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        _err_console.print(_DB_QUERY_ERROR)
-        raise typer.Exit(code=1) from exc
-    finally:
-        if stub is not None:
-            stub.close()
+            # Empty human-path result: probe the embedding index ONCE on the SAME
+            # client to choose the right hint (starvation vs run-embed). The probe is
+            # NOT issued under --json (which never prints a hint and never pays the
+            # extra round-trip; AC-SF-27/AC-HY-15) nor when there is already a row to
+            # show (AC-HY-15). _probe_embedding_hint owns its own exceptions, so a
+            # probe failure never trips this primary query's exit-1 handler (F2).
+            if not result.rows and not json_output:
+                probe_hint = _probe_embedding_hint(client)
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            _err_console.print(_DB_QUERY_ERROR)
+            raise typer.Exit(code=1) from exc
+        finally:
+            if stub is not None:
+                stub.close()
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
 
     envelope_parsed = parsed if parsed is not None else parse_query("")
 
@@ -2048,19 +2340,25 @@ def show(
 
     mpn_norm = normalize_mpn(mpn)
 
-    stub = None
-    try:
-        client, stub = _connect_dgraph()
-        query_text, variables = build_show_dql(mpn_norm)
-        data = _run_block_query(client, query_text, variables)
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        _err_console.print(_DB_QUERY_ERROR)
-        raise typer.Exit(code=1) from exc
-    finally:
-        if stub is not None:
-            stub.close()
+    # Hold the activity lease across the real database work and release it in
+    # a `finally` even if that work raises; stamp INSIDE the held window, on
+    # success only, so a command that did not finish never records activity
+    # for work it never did (ADR-0023).
+    with held_lease(state_dir=ACTIVITY_STATE_DIR):
+        stub = None
+        try:
+            client, stub = _connect_dgraph()
+            query_text, variables = build_show_dql(mpn_norm)
+            data = _run_block_query(client, query_text, variables)
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            _err_console.print(_DB_QUERY_ERROR)
+            raise typer.Exit(code=1) from exc
+        finally:
+            if stub is not None:
+                stub.close()
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
 
     part_block = data.get("part", []) or []
     if not part_block:
@@ -2260,6 +2558,10 @@ def _embed_all_pages(
         embedded_total += int(summary.get("embedded", 0) or 0)
         selected_total += page_size
         progress_bar.update(task, completed=selected_total)
+        # Heartbeat, at the SAME per-page checkpoint the progress bar already
+        # uses: a multi-hour run must never look idle to `db idle-stop` merely
+        # because its single completion stamp has not been written yet.
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
 
         if remaining is not None:
             remaining -= page_size  # (d) bounded run: count each row exactly once.
@@ -2463,6 +2765,9 @@ def _reembed_all_pages(
         )
         selected_total += page_size
         progress_bar.update(task, completed=selected_total)
+        # Per-page heartbeat, as in the missing-only pass above: `embed
+        # --changed` runs this pass FIRST and it can be just as long.
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
 
         if remaining is not None:
             remaining -= page_size  # (d) bounded run: count each row exactly once.
@@ -2552,48 +2857,54 @@ def embed(
     controller.reader = get_system_reader()  # type: ignore[attr-defined]
 
     start = _time.monotonic()
-    stub = None
-    reembedded_total = 0
-    embedded_total = 0
-    try:
-        client, stub = _connect_dgraph()
-        # None (no --limit) drives the pages unbounded — to exhaustion over the
-        # whole eligible catalogue; a finite --limit N bounds each pass to N rows
-        # exactly, never re-capped at any default (ADR-0011). --changed runs the
-        # reconcile pass FIRST, then the (unchanged) missing pass (ADR-0015).
-        remaining = parsed_limit
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=_console,
-            transient=True,
-        ) as progress_bar:
-            if changed:
-                reembedded_total = _reembed_all_pages(
+    # Hold the activity lease across the real database work and release it in
+    # a `finally` even if that work raises; stamp INSIDE the held window, on
+    # success only, so a command that did not finish never records activity
+    # for work it never did (ADR-0023).
+    with held_lease(state_dir=ACTIVITY_STATE_DIR):
+        stub = None
+        reembedded_total = 0
+        embedded_total = 0
+        try:
+            client, stub = _connect_dgraph()
+            # None (no --limit) drives the pages unbounded — to exhaustion over the
+            # whole eligible catalogue; a finite --limit N bounds each pass to N rows
+            # exactly, never re-capped at any default (ADR-0011). --changed runs the
+            # reconcile pass FIRST, then the (unchanged) missing pass (ADR-0015).
+            remaining = parsed_limit
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=_console,
+                transient=True,
+            ) as progress_bar:
+                if changed:
+                    reembedded_total = _reembed_all_pages(
+                        client,
+                        encoder=encoder,
+                        controller=controller,
+                        remaining=remaining,
+                        progress_bar=progress_bar,
+                    )
+                embedded_total = _embed_all_pages(
                     client,
                     encoder=encoder,
                     controller=controller,
                     remaining=remaining,
                     progress_bar=progress_bar,
                 )
-            embedded_total = _embed_all_pages(
-                client,
-                encoder=encoder,
-                controller=controller,
-                remaining=remaining,
-                progress_bar=progress_bar,
-            )
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        # Any DB/runtime failure: never interpolate the exception, so no internal
-        # path can leak. Re-raised as a clean CLI exit.
-        _err_console.print(_EMBED_DB_ERROR)
-        raise typer.Exit(code=1) from exc
-    finally:
-        if stub is not None:
-            stub.close()
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            # Any DB/runtime failure: never interpolate the exception, so no internal
+            # path can leak. Re-raised as a clean CLI exit.
+            _err_console.print(_EMBED_DB_ERROR)
+            raise typer.Exit(code=1) from exc
+        finally:
+            if stub is not None:
+                stub.close()
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
 
     elapsed = _time.monotonic() - start
     if changed:
@@ -2850,6 +3161,9 @@ def _refresh_all_pages(  # noqa: PLR0913 — one keyword-only seam per orchestra
 
         selected_total += page_size
         progress_bar.update(task, completed=selected_total)
+        # Per-page heartbeat at the existing checkpoint (ADR-0023): a link
+        # sweep over a large catalogue runs for hours between completions.
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
         remaining -= page_size  # (d) count each returned row exactly once.
         if page_size < page_limit:
             break  # (b) short page: fewer rows than asked means no more.
@@ -2928,39 +3242,45 @@ def refresh_links(
         raise typer.Exit(code=1)
 
     http_client = _build_http_client()
-    stub = None
-    totals = dict.fromkeys(_REFRESH_SUMMARY_KEYS, 0)
-    try:
-        client, stub = _connect_dgraph()
-        remaining = parsed_limit if parsed_limit is not None else _REFRESH_SELECT_DEFAULT
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=_console,
-            transient=True,
-        ) as progress_bar:
-            totals = _refresh_all_pages(
-                client,
-                http_client=http_client,
-                max_failures=max_failures,
-                timeout=timeout,
-                stale_days=stale_days,
-                remaining=remaining,
-                progress_bar=progress_bar,
-            )
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        # Any DB/runtime failure (selection read, write-back or purge mutation):
-        # never interpolate the exception, so no internal path can leak. Re-raised
-        # as a clean CLI exit.
-        _err_console.print(_REFRESH_DB_ERROR)
-        raise typer.Exit(code=1) from exc
-    finally:
-        if stub is not None:
-            stub.close()
-        _close_http_client(http_client)
+    # Hold the activity lease across the real database work and release it in
+    # a `finally` even if that work raises; stamp INSIDE the held window, on
+    # success only, so a command that did not finish never records activity
+    # for work it never did (ADR-0023).
+    with held_lease(state_dir=ACTIVITY_STATE_DIR):
+        stub = None
+        totals = dict.fromkeys(_REFRESH_SUMMARY_KEYS, 0)
+        try:
+            client, stub = _connect_dgraph()
+            remaining = parsed_limit if parsed_limit is not None else _REFRESH_SELECT_DEFAULT
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=_console,
+                transient=True,
+            ) as progress_bar:
+                totals = _refresh_all_pages(
+                    client,
+                    http_client=http_client,
+                    max_failures=max_failures,
+                    timeout=timeout,
+                    stale_days=stale_days,
+                    remaining=remaining,
+                    progress_bar=progress_bar,
+                )
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            # Any DB/runtime failure (selection read, write-back or purge mutation):
+            # never interpolate the exception, so no internal path can leak. Re-raised
+            # as a clean CLI exit.
+            _err_console.print(_REFRESH_DB_ERROR)
+            raise typer.Exit(code=1) from exc
+        finally:
+            if stub is not None:
+                stub.close()
+            _close_http_client(http_client)
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
 
     _console.print(
         f"[green]Checked {totals['checked']} datasheet links:[/green] "
@@ -3204,6 +3524,8 @@ def _refresh_stock_all_pages(
 
         selected_total += page_size
         progress_bar.update(task, completed=selected_total)
+        # Per-page heartbeat at the existing checkpoint (ADR-0023).
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
         remaining -= page_size  # (d) count each returned row exactly once.
         if page_size < page_limit:
             break  # (b) short page: fewer rows than asked means no more.
@@ -3300,37 +3622,43 @@ def refresh(
         _err_console.print(_REFRESH_STOCK_SOURCE_ERROR)
         raise typer.Exit(code=1) from exc
 
-    stub = None
-    totals = dict.fromkeys(_REFRESH_STOCK_SUMMARY_KEYS, 0)
-    try:
-        client, stub = _connect_dgraph()
-        remaining = (
-            parsed_limit if parsed_limit is not None else _REFRESH_STOCK_SELECT_DEFAULT
-        )
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=_console,
-            transient=True,
-        ) as progress_bar:
-            totals = _refresh_stock_all_pages(
-                client,
-                stock_index=stock_index,
-                stale_days=stale_days,
-                remaining=remaining,
-                progress_bar=progress_bar,
+    # Hold the activity lease across the real database work and release it in
+    # a `finally` even if that work raises; stamp INSIDE the held window, on
+    # success only, so a command that did not finish never records activity
+    # for work it never did (ADR-0023).
+    with held_lease(state_dir=ACTIVITY_STATE_DIR):
+        stub = None
+        totals = dict.fromkeys(_REFRESH_STOCK_SUMMARY_KEYS, 0)
+        try:
+            client, stub = _connect_dgraph()
+            remaining = (
+                parsed_limit if parsed_limit is not None else _REFRESH_STOCK_SELECT_DEFAULT
             )
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        # Any DB/runtime failure (selection read or write-back mutation): never
-        # interpolate the exception, so no internal path can leak.
-        _err_console.print(_REFRESH_STOCK_DB_ERROR)
-        raise typer.Exit(code=1) from exc
-    finally:
-        if stub is not None:
-            stub.close()
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=_console,
+                transient=True,
+            ) as progress_bar:
+                totals = _refresh_stock_all_pages(
+                    client,
+                    stock_index=stock_index,
+                    stale_days=stale_days,
+                    remaining=remaining,
+                    progress_bar=progress_bar,
+                )
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            # Any DB/runtime failure (selection read or write-back mutation): never
+            # interpolate the exception, so no internal path can leak.
+            _err_console.print(_REFRESH_STOCK_DB_ERROR)
+            raise typer.Exit(code=1) from exc
+        finally:
+            if stub is not None:
+                stub.close()
+        touch_activity(state_dir=ACTIVITY_STATE_DIR)
 
     _console.print(
         f"[green]Refreshed stock/price for {totals['checked']} parts:[/green] "

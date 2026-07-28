@@ -20,6 +20,7 @@ host's scheduler (a **systemd timer** or **cron**), wrapping the shipped
 4. [Option B — cron](#4-option-b--cron)
 5. [Enabling the weekly `--fetch`](#5-enabling-the-weekly---fetch)
 6. [Container engine is irrelevant here](#6-container-engine-is-irrelevant-here)
+7. [The idle auto-stop timer, and how it interacts with this one](#7-the-idle-auto-stop-timer-and-how-it-interacts-with-this-one)
 
 > [!WARNING]
 > **These schedules assume the database is already running** — i.e. you have run
@@ -44,6 +45,14 @@ host's scheduler (a **systemd timer** or **cron**), wrapping the shipped
 > non-zero with a path-free "is the database running?" hint and the wrapper
 > propagates that failure to your scheduler — nothing is corrupted, the run is
 > simply logged as failed.
+>
+> **If you also install the idle auto-stop timer** (`partgraph-db-idle-stop.timer`,
+> ADR-0023), that "database is down when a job fires" case stops being
+> hypothetical: idle auto-stop can legitimately stop an idle database *between*
+> your scheduled runs, and because of the `PARTGRAPH_AUTOSTART=0` above the next
+> scheduled refresh will **not** start it again — it fails, loudly and visibly.
+> That is a disclosed trade-off of running both timers, not a bug; see
+> [section 7](#7-the-idle-auto-stop-timer-and-how-it-interacts-with-this-one).
 
 ---
 
@@ -211,6 +220,131 @@ no engine, compose, or database-lifecycle commands.
 
 ---
 
+## 7. The idle auto-stop timer, and how it interacts with this one
+
+PartGraph ships a **second, unrelated** pair of units under `systemd/`:
+`partgraph-db-idle-stop.{service,timer}`. They run `partgraph db idle-stop`,
+which stops the database once it has gone unused for
+`PARTGRAPH_IDLE_TIMEOUT_MINUTES` (default **30**). It exists because the
+database otherwise stays up indefinitely after the first command that starts it
+— see [ADR-0023](decisions/ADR-0023-database-idle-autostop.md).
+
+The two timers are **independently opt-in**. Installing one neither requires nor
+implies the other, and neither knows the other's schedule.
+
+> [!IMPORTANT]
+> **Do step 2 before step 4.** The unit's `ExecStart=` is prefixed with `-`, so
+> systemd treats *any* failure of the command — including "the file is not
+> there" — as a successful run. Enable the timer before the CLI is reachable at
+> `$HOME/.local/bin/partgraph` and you get a timer that fires every ten minutes,
+> reports `success` every time, and **stops nothing, forever**. See
+> [When the timer says success but the database never stops](#when-the-timer-says-success-but-the-database-never-stops)
+> for how that looks and how to confirm it.
+
+From the repository root:
+
+```bash
+# 1. Install the unit files for your user.
+mkdir -p "$HOME/.config/systemd/user"
+install -m 0644 systemd/partgraph-db-idle-stop.service "$HOME/.config/systemd/user/"
+install -m 0644 systemd/partgraph-db-idle-stop.timer   "$HOME/.config/systemd/user/"
+
+# 2. Make the CLI reachable at the path the unit runs. REQUIRED, and required
+#    BEFORE step 4 — the unit runs $HOME/.local/bin/partgraph and nothing else.
+#    If your CLI lives in a conda or virtualenv bin, symlink it there (or
+#    override ExecStart with
+#    `systemctl --user edit partgraph-db-idle-stop.service`):
+mkdir -p "$HOME/.local/bin"
+ln -sf "$(command -v partgraph)" "$HOME/.local/bin/partgraph"
+
+# 3. Confirm step 2 actually worked, before enabling anything. This must print
+#    a usage banner, not "No such file or directory":
+"$HOME/.local/bin/partgraph" db idle-stop --help
+
+# 4. Enable and start the timer.
+systemctl --user daemon-reload
+systemctl --user enable --now partgraph-db-idle-stop.timer
+
+# 5. Confirm the schedule, then the first real run.
+systemctl --user list-timers partgraph-db-idle-stop.timer
+journalctl --user -u partgraph-db-idle-stop.service   # after the first firing
+```
+
+### When the timer says success but the database never stops
+
+`systemctl --user status` and `list-timers` **cannot** tell you about this
+failure, and that is worth knowing before you go looking. Because of the `-`
+prefix the unit reports `Result=success`, `ExecMainStatus=0`,
+`ActiveState=inactive` whether the command ran and decided not to stop anything
+or was never found at all. The journal is the only place the difference shows:
+
+```bash
+journalctl --user -u partgraph-db-idle-stop.service -n 20
+```
+
+| What the journal shows | What it means |
+| --- | --- |
+| `Unable to locate executable '…/partgraph': No such file or directory` | Step 2 was skipped or the symlink is broken. **The check has never run.** Redo steps 2–3; no re-enable is needed. |
+| `Idle auto-stop: leaving the database alone (reason: fresh-stamp)` | Working. The database was used recently. |
+| `Idle auto-stop: leaving the database alone (reason: live-lease)` | Working. A PartGraph command is running right now. |
+| `Idle auto-stop: leaving the database alone (reason: undetermined-lease)` | A lease file cannot be resolved — see ADR-0023's accepted limitation 1. Inspect `data/state/activity_lease.*.json`. |
+| `Idle auto-stop: the database was idle; stopped …` | Working, and it stopped the database. |
+| nothing at all for the service | The timer is not enabled, or has not fired yet. |
+
+The quickest end-to-end confirmation is to run one check by hand and watch what
+it prints — it is the same one-shot command the timer runs, and it never starts
+anything:
+
+```bash
+systemctl --user start partgraph-db-idle-stop.service   # via the unit
+"$HOME/.local/bin/partgraph" db idle-stop               # or directly
+```
+
+Optional configuration, read from `%h/.config/partgraph/idle-stop.env`:
+
+```bash
+mkdir -p "$HOME/.config/partgraph"
+printf 'PARTGRAPH_IDLE_TIMEOUT_MINUTES=45\n' >> "$HOME/.config/partgraph/idle-stop.env"
+```
+
+`0` (or any non-positive value) disables the check while leaving the timer
+installed; an unparseable value falls back to the documented 30-minute default
+rather than to either extreme.
+
+### What it will not do to a scheduled run
+
+**A refresh that is actually running is safe.** Every database-touching PartGraph
+command — `refresh` and `refresh-links` included — holds a *lease* for as long as
+it runs, and a live lease blocks idle auto-stop unconditionally, even against an
+activity stamp old enough to demand a stop on its own. Idle auto-stop cannot tell
+a scheduled run from an interactive one, and does not need to.
+
+### What it can do, and why that is left as-is
+
+**Between** scheduled runs, idle auto-stop may stop an idle database — that is
+its entire job. Your next scheduled refresh then finds the database down and
+fails, because the wrapper forces `PARTGRAPH_AUTOSTART=0` and a scheduled run
+never starts a container implicitly. The failure is loud (a non-zero phase exit,
+propagated by the wrapper to systemd/cron) and harmless: nothing is corrupted,
+and the next run after you bring the database back up covers the same work,
+because both commands select by staleness rather than by "what the last run
+missed".
+
+This is **not** special-cased away. Making idle auto-stop skip a stop because a
+refresh is *scheduled soon* would require it to read another, independently
+opt-in unit's calendar — coupling two things an operator deliberately chose
+separately. If you run both timers, choose one of:
+
+- **Keep the database up** for the scheduled window (`partgraph db up` before
+  the refresh, e.g. from a drop-in `ExecStartPre=`), or
+- **Widen the budget** — set `PARTGRAPH_IDLE_TIMEOUT_MINUTES` comfortably above
+  your refresh interval, or
+- **Accept the failed run** — with a weekly refresh and a 30-minute idle budget,
+  that is the common case, and it is visible in
+  `journalctl --user -u partgraph-refresh-all.service` rather than silent.
+
+---
+
 ## How this was verified
 
 - **Environment:** the units were validated with `systemd-analyze verify`
@@ -221,6 +355,14 @@ no engine, compose, or database-lifecycle commands.
   above was taken from live `partgraph refresh --help` and
   `partgraph refresh-links --help`.
 - **Date:** 2026-07-04.
+- **Idle auto-stop units (section 7), added 2026-07-28:** verified the same
+  way — `systemd-analyze verify systemd/partgraph-db-idle-stop.service
+  systemd/partgraph-db-idle-stop.timer` exits 0 with empty stdout and stderr.
+  The install and `systemctl --user enable --now` steps in section 7 were
+  **not** applied on the authoring host, and no database was stopped: the
+  lease-blocks-a-concurrent-refresh property is proven in
+  `tests/unit/test_scheduling_idle_stop_interaction.py` against the real
+  decision function, not against a live timer.
 - **Not executed:** no real `partgraph refresh` / `refresh-links` was run
   against a live database, no ~1 GB `--fetch` download was performed, and the
   `systemctl --user enable --now` / `crontab` install steps were **not** applied

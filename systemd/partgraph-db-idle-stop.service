@@ -1,0 +1,70 @@
+# partgraph-db-idle-stop.service — one-shot idle check for the PartGraph
+# database. Triggered by partgraph-db-idle-stop.timer.
+#
+# Install this as a PER-USER unit (systemctl --user); it then runs as your own
+# login user — never root — so no `User=` directive is set, and every path it
+# refers to is written with %h (your own home) rather than a fixed operator
+# path. See docs/scheduling.md for the install steps.
+#
+# WHY A HOST-SIDE TIMER AT ALL. `partgraph` is a one-shot CLI: each invocation
+# runs its command and exits, so nothing inside it survives to notice, half an
+# hour later, that the database has gone unused. This unit is that outside
+# observer — it simply runs `partgraph db idle-stop`, which stops the database
+# only if PartGraph's own activity state says it is genuinely idle (ADR-0023).
+#
+# WHAT IT WILL NOT DO. It never starts anything, never removes a container, a
+# volume or an image, and never touches a container that is not PartGraph's: the
+# stop is delegated to the same sweep `partgraph db down` uses. A PartGraph
+# command that is genuinely mid-run holds a lease that blocks the stop
+# outright, so a long ingest or embed run is never cut short.
+#
+# INTERACTION WITH THE SCHEDULED REFRESH (docs/scheduling.md). This timer and
+# partgraph-refresh-all.timer are independently opt-in; neither requires the
+# other. While a scheduled `partgraph refresh` / `refresh-links` is running its
+# lease blocks this check, so a refresh in progress is safe. BETWEEN scheduled
+# runs, though, this timer may legitimately stop an idle database — and
+# scripts/partgraph-refresh-all.sh sets PARTGRAPH_AUTOSTART=0, so the next
+# scheduled refresh will NOT start it again: that run fails loudly, visibly to
+# the scheduler, with the usual path-free "is the database running?" hint. That
+# is a disclosed trade-off of installing both timers, not a bug. If you want
+# both, keep the database up yourself, or raise
+# PARTGRAPH_IDLE_TIMEOUT_MINUTES above your refresh interval.
+
+[Unit]
+Description=PartGraph idle database check (stop the database when unused), one-shot
+
+[Service]
+Type=oneshot
+
+# The PartGraph CLI, from the per-user bin. %h is the invoking user's home, so
+# no operator-specific path is baked into this unit. If your `partgraph` lives
+# elsewhere (a conda or virtualenv bin), either symlink it here or point this
+# line at it with a drop-in:
+#   systemctl --user edit partgraph-db-idle-stop.service
+#
+# The leading '-' tells systemd to IGNORE a non-zero exit from this command,
+# including "not installed". That is deliberate and matches what the command
+# itself already promises: `db idle-stop` is unattended and best-effort, and
+# exits 0 whatever it finds (ADR-0023), so this unit must never mark a timer
+# run as failed. Nothing is hidden by it — every reason a run did nothing, an
+# uninstalled CLI included, is in the journal:
+#   journalctl --user -u partgraph-db-idle-stop.service
+ExecStart=-%h/.local/bin/partgraph db idle-stop
+
+# Optional operator config, e.g. PARTGRAPH_IDLE_TIMEOUT_MINUTES=45 to widen the
+# idle budget (default 30), or =0 to disable the check while leaving the timer
+# installed. The leading '-' makes a missing file non-fatal.
+EnvironmentFile=-%h/.config/partgraph/idle-stop.env
+
+# Hardening. This check reads two small marker files under the checkout's
+# data/state directory, talks to the local database over the network, and asks
+# the container engine to stop a container. It needs no new privileges and no
+# private temporary state.
+NoNewPrivileges=true
+PrivateTmp=true
+
+# NOTE: ProtectSystem=strict is deliberately NOT set here, unlike
+# partgraph-refresh-all.service. This command WRITES: it bootstraps or self-heals
+# the activity stamp in your checkout's data/state directory, and the container
+# engine it drives needs its own runtime directories. A read-only filesystem
+# would make the ordinary case fail rather than the dangerous one.

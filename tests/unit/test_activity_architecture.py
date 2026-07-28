@@ -1,0 +1,310 @@
+"""
+Tests: PR-C (feat/db-idle-autostop) — `partgraph.util.activity` ARCHITECTURE
+(mechanical leaf-discipline guards), mirroring
+`tests/unit/test_lifecycle_architecture.py`'s own established convention for
+`partgraph.util.lifecycle` — extended in the OTHER direction too, since this
+PR's whole premise is that the two leaves stay mutually ignorant of each
+other ("`lifecycle.py` knows nothing about activity. `activity.py` knows
+nothing about containers.").
+
+Split out from `tests/unit/test_activity.py` for the SAME reason
+`test_lifecycle_architecture.py` was split from `test_lifecycle.py`: that
+file's own top-level `from partgraph.util.activity import (...)` already
+hard-fails COLLECTION with `ModuleNotFoundError` until the module exists —
+which would make any test-level "skip if absent" branch placed in THAT file
+unreachable dead code. THIS file imports nothing from
+`partgraph.util.activity` at module level (only stdlib + pytest, plus a
+READ of `partgraph.util.lifecycle`'s own already-existing source for the
+reverse-direction check), so it always collects and every test skips
+cleanly, individually, while `activity.py` is absent, and goes green the
+moment it lands with the right shape.
+"""
+
+from __future__ import annotations
+
+import ast
+import inspect
+import pathlib
+
+import pytest
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
+_ACTIVITY_PATH = _REPO_ROOT / "src" / "partgraph" / "util" / "activity.py"
+_LIFECYCLE_PATH = _REPO_ROOT / "src" / "partgraph" / "util" / "lifecycle.py"
+
+
+def _read_activity_source_or_skip() -> str:
+    if not _ACTIVITY_PATH.exists():
+        pytest.skip("src/partgraph/util/activity.py does not exist yet (expected pre-PR-C).")
+    return _ACTIVITY_PATH.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# [Gate 5 finding — mutation-tested and confirmed] The import scanner, AST
+# based rather than a hand-enumerated regex list, catching THREE distinct
+# Python import shapes for each forbidden dotted module path:
+#   1. `import a.b.c`               (ast.Import)
+#   2. `from a.b.c import name`     (ast.ImportFrom, the "from" clause IS
+#                                     itself the forbidden module)
+#   3. `from a.b import c`          (ast.ImportFrom, the "from" clause is
+#                                     the PARENT package and the forbidden
+#                                     module is one of the imported NAMES)
+# The regex list this scanner replaces enumerated only shapes 1 and 2 for
+# five of its six forbidden targets. Gate 5's mutation run proved shape 3
+# passes it silently: injecting `from partgraph.util import lifecycle` (and
+# `... import container`) into the REAL `src/partgraph/util/activity.py`
+# left the suite at 1507 passed, uncaught, while `import
+# partgraph.util.lifecycle` and `from partgraph.util.lifecycle import
+# stop_all` were both correctly caught — reproduced independently here (see
+# the self-tests below) before trusting the fix, exactly as
+# `test_repo_never_executes_lifecycle_mutations.py`'s own "Gate 3a BLOCKING
+# 1" discipline demands: a scanner is proven to have real teeth on embedded
+# canary source BEFORE it is trusted against the real tree.
+#
+# A single AST-based function replaces the 18-entry regex list (6 forbidden
+# modules x 3 shapes) that the fix would otherwise require, both because
+# hand-enumerating that many near-identical patterns is exactly the kind of
+# mistake that created this gap in the first place, and because the THREE
+# shapes above are the complete, closed set of ways CPython lets a name be
+# imported (no fourth shape exists to omit next time).
+# ---------------------------------------------------------------------------
+
+
+def _find_forbidden_imports(
+    source: str, label: str, forbidden_modules: frozenset[str]
+) -> list[str]:
+    """Return one message per forbidden import found in *source*, covering
+    all three shapes described above uniformly. `node.module is None` (a
+    relative `from . import x`) is skipped: this repo's own style is
+    absolute imports throughout, exactly as
+    `test_repo_never_executes_lifecycle_mutations.py`'s own scanner
+    discloses as its own scope boundary — not a silent gap, a stated one.
+    """
+    tree = ast.parse(source, filename=label)
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in forbidden_modules:
+                    violations.append(f"{label}:{node.lineno}: import {alias.name}")
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            for alias in node.names:
+                if node.module in forbidden_modules:
+                    violations.append(
+                        f"{label}:{node.lineno}: from {node.module} import {alias.name}"
+                    )
+                    continue
+                dotted = f"{node.module}.{alias.name}"
+                if dotted in forbidden_modules:
+                    violations.append(
+                        f"{label}:{node.lineno}: from {node.module} import {alias.name}"
+                    )
+    return list(dict.fromkeys(violations))
+
+
+# ---------------------------------------------------------------------------
+# Self-test: prove the scanner has real teeth for EACH shape, and does not
+# false-positive on a benign import, BEFORE trusting it against the real
+# tree (mirrors test_repo_never_executes_lifecycle_mutations.py's own
+# positive/negative-control discipline).
+# ---------------------------------------------------------------------------
+
+
+def test_scanner_catches_shape_1_plain_dotted_import() -> None:
+    """[Positive control, shape 1] `import a.b.c`."""
+    violations = _find_forbidden_imports(
+        "import partgraph.util.lifecycle\n", "canary.py",
+        frozenset({"partgraph.util.lifecycle"}),
+    )
+    assert violations, "shape 1 (`import a.b.c`) must be caught"
+
+
+def test_scanner_catches_shape_2_from_the_forbidden_module_import_a_name() -> None:
+    """[Positive control, shape 2] `from a.b.c import name`."""
+    violations = _find_forbidden_imports(
+        "from partgraph.util.lifecycle import stop_all\n", "canary.py",
+        frozenset({"partgraph.util.lifecycle"}),
+    )
+    assert violations, "shape 2 (`from a.b.c import name`) must be caught"
+
+
+def test_scanner_catches_shape_3_from_the_parent_package_import_the_forbidden_module() -> None:
+    """[Gate 5 finding — positive control, shape 3] `from a.b import c` —
+    the shape the old regex list silently missed for five of its six
+    forbidden targets."""
+    violations = _find_forbidden_imports(
+        "from partgraph.util import lifecycle\n", "canary.py",
+        frozenset({"partgraph.util.lifecycle"}),
+    )
+    assert violations, "shape 3 (`from a.b import c`) must be caught"
+
+
+def test_scanner_catches_shape_3_for_a_top_level_module_target_too() -> None:
+    """[Positive control, shape 3, top-level target] `from partgraph import
+    cli` — the SAME shape 3 hazard, one level shallower (parent is
+    `partgraph` itself rather than `partgraph.util`)."""
+    violations = _find_forbidden_imports(
+        "from partgraph import cli\n", "canary.py", frozenset({"partgraph.cli"}),
+    )
+    assert violations, "shape 3 at the top-level package boundary must be caught"
+
+
+def test_scanner_does_not_flag_an_unrelated_benign_import() -> None:
+    """[Negative control] Given imports of things that are NOT forbidden
+    (including a sibling leaf, `partgraph.util.health`, and a stdlib
+    module).
+    When the scanner runs.
+    Then nothing is flagged — proves the scanner discriminates by the exact
+    forbidden set, not merely "any import at all"."""
+    src = "from partgraph.util import health\nimport os\nimport json\n"
+    violations = _find_forbidden_imports(
+        src, "canary.py", frozenset({"partgraph.util.lifecycle", "partgraph.util.container"}),
+    )
+    assert not violations, violations
+
+
+# ---------------------------------------------------------------------------
+# activity.py must never import partgraph.cli, or any container/embed/query/
+# load module — it "knows nothing about containers".
+# ---------------------------------------------------------------------------
+
+_ACTIVITY_FORBIDDEN_MODULES = frozenset({
+    "partgraph.cli",
+    "partgraph.embed",
+    "partgraph.query",
+    "partgraph.load",
+    "partgraph.util.lifecycle",
+    "partgraph.util.container",
+})
+
+
+def test_activity_source_never_imports_partgraph_cli_embed_query_load_or_container_or_lifecycle() -> None:
+    """Given `partgraph.util.activity` is documented as a LEAF module that
+    knows nothing about containers, Compose, or the container engine, and
+    must never import `partgraph.cli` or any embed/query/load module —
+    mirrors `partgraph.util.lifecycle`'s own leaf discipline, EXTENDED here
+    to also forbid `partgraph.util.lifecycle`/`partgraph.util.container`
+    themselves (the "activity.py knows nothing about containers" half of the
+    mutual-ignorance contract).
+    When `src/partgraph/util/activity.py`'s source is AST-parsed and scanned
+    for all three import shapes above, against every forbidden module.
+    Then none is found. Skips cleanly (not error) if the source file does
+    not exist yet.
+    """
+    text = _read_activity_source_or_skip()
+    violations = _find_forbidden_imports(
+        text, str(_ACTIVITY_PATH), _ACTIVITY_FORBIDDEN_MODULES
+    )
+    assert not violations, (
+        "partgraph.util.activity must never import partgraph.cli, any "
+        "embed/query/load module, or partgraph.util.lifecycle/container "
+        f"(leaf discipline — 'knows nothing about containers'). Found: {violations!r}"
+    )
+
+
+def test_lifecycle_source_never_mentions_activity_the_reverse_direction_regression_lock() -> None:
+    """Given the OTHER half of the mutual-ignorance contract: "lifecycle.py
+    knows nothing about activity" — and `partgraph.util.lifecycle` already
+    exists today (PR-A), so this half can be checked NOW, as a genuine
+    regression lock, not merely a post-landing aspiration.
+    When `src/partgraph/util/lifecycle.py`'s real, current source is
+    AST-scanned for all three import shapes against `partgraph.util.activity`.
+    Then none is found — proving this file catches a FUTURE violation (a
+    later PR wiring activity into lifecycle would fail this test), not
+    merely documenting an absence that happens to be true today because the
+    module does not exist yet.
+    """
+    assert _LIFECYCLE_PATH.exists(), (
+        "src/partgraph/util/lifecycle.py is expected to already exist (PR-A landed)."
+    )
+    text = _LIFECYCLE_PATH.read_text(encoding="utf-8")
+    violations = _find_forbidden_imports(
+        text, str(_LIFECYCLE_PATH), frozenset({"partgraph.util.activity"})
+    )
+    assert not violations, (
+        "partgraph.util.lifecycle must never import partgraph.util.activity "
+        f"(the two leaves must stay mutually ignorant). Found: {violations!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# psutil must be imported LAZILY, never at module level (mirrors
+# src/partgraph/util/resources.py's own documented ARCH-1 precedent: "import
+# psutil MUST stay lazy... a module-level import here would make merely
+# importing the CLI (or partgraph.util) require psutil and hard-fail when it
+# is absent").
+# ---------------------------------------------------------------------------
+
+
+def test_psutil_is_never_imported_at_activity_module_top_level() -> None:
+    """Given `partgraph/util/__init__.py` imports `partgraph.util.activity`'s
+    sibling modules eagerly, and `cli.py` sits on that same import path
+    (mirrors ARCH-1 in `src/partgraph/util/resources.py`).
+    When `src/partgraph/util/activity.py`'s AST is inspected.
+    Then no `import psutil` / `from psutil import ...` statement appears
+    directly in the MODULE body (`tree.body`) — only inside a function
+    (lazy, call-time import) is acceptable. Distinguishes real module-level
+    placement from a merely-indented lazy import via the AST, not a regex
+    that could be fooled by indentation alone.
+    Skips cleanly (not error) if the source file does not exist yet.
+    """
+    text = _read_activity_source_or_skip()
+    tree = ast.parse(text, filename=str(_ACTIVITY_PATH))
+
+    def _mentions_psutil(node: ast.stmt) -> bool:
+        if isinstance(node, ast.Import):
+            return any(alias.name.split(".")[0] == "psutil" for alias in node.names)
+        if isinstance(node, ast.ImportFrom):
+            return node.module is not None and node.module.split(".")[0] == "psutil"
+        return False
+
+    top_level_violations = [
+        ast.dump(node) for node in tree.body
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and _mentions_psutil(node)
+    ]
+    assert not top_level_violations, (
+        "psutil must be imported LAZILY inside a function body, never at "
+        f"module level (mirrors resources.py's ARCH-1): {top_level_violations!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# partgraph.util must NOT re-export activity's functions (mirrors the
+# health/index_health/lifecycle precedent, ADR-0018 Sec 4).
+# ---------------------------------------------------------------------------
+
+
+def test_partgraph_util_package_does_not_reexport_activity_functions() -> None:
+    """Given ADR-0018 Section 4's precedent, already extended to `lifecycle`
+    ([3b-L2] in `test_lifecycle_architecture.py`): neither `health`,
+    `index_health`, nor `lifecycle` is re-exported from
+    `partgraph/util/__init__.py`.
+    When `partgraph.util` (the package's own `__init__.py`) is inspected.
+    Then it does NOT expose any non-DTO name from
+    `partgraph.util.activity.__all__` as a top-level attribute. The
+    forbidden-name set is DERIVED from `activity.__all__` at RUN TIME
+    (filtering DTOs via `inspect.isclass`), mirroring the lifecycle test's
+    own fix for the same "hardcoded tuple silently stops covering new
+    names" failure mode.
+    Uses `pytest.importorskip` so this test skips individually and cleanly
+    while `partgraph.util.activity` does not yet exist.
+    """
+    activity = pytest.importorskip(
+        "partgraph.util.activity",
+        reason="partgraph.util.activity does not exist yet (expected pre-PR-C).",
+    )
+    import partgraph.util as util_package  # noqa: PLC0415
+
+    forbidden_names = [
+        name for name in activity.__all__
+        if not inspect.isclass(getattr(activity, name))
+    ]
+    assert forbidden_names, (
+        "sanity check: expected at least one non-DTO name in "
+        "partgraph.util.activity.__all__ to check."
+    )
+    for forbidden_name in forbidden_names:
+        assert not hasattr(util_package, forbidden_name), (
+            f"partgraph.util must NOT re-export {forbidden_name!r} — it must "
+            "only be reachable via partgraph.util.activity directly."
+        )
