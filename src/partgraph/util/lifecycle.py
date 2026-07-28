@@ -61,6 +61,7 @@ import logging
 import re
 import shutil
 import subprocess
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -69,7 +70,9 @@ from partgraph.util.container import engine_command
 
 __all__ = [
     "ENUMERATE_TIMEOUT_S",
+    "INSPECT_SWEEP_BUDGET_S",
     "INSPECT_TIMEOUT_S",
+    "MAX_INSPECTED_ROWS",
     "MAX_PS_OUTPUT_BYTES",
     "PARTGRAPH_CONTAINER_NAME",
     "PARTGRAPH_DATA_VOLUME",
@@ -78,12 +81,14 @@ __all__ = [
     "STOP_GRACE_SECONDS",
     "STOP_TIMEOUT_S",
     "SYSTEMCTL_TIMEOUT_S",
+    "VOLUME_INSPECT_TIMEOUT_S",
     "DownResult",
     "Instance",
     "UnitState",
     "find_partgraph_instances",
     "stop_all",
     "unit_state",
+    "volume_exists",
 ]
 
 #: Module logger. Absorbed failures (a systemd unit that refuses to stop, an
@@ -124,6 +129,43 @@ ENUMERATE_TIMEOUT_S = 15.0
 
 #: Watchdog for one ``<engine> container inspect`` call.
 INSPECT_TIMEOUT_S = 10.0
+
+#: Watchdog for one ``<engine> volume inspect`` call (:func:`volume_exists`).
+#: Sized like :data:`INSPECT_TIMEOUT_S` because it is the same kind of call —
+#: one local "inspect a named thing" round-trip against the same engine.
+VOLUME_INSPECT_TIMEOUT_S = 10.0
+
+#: Finite ceiling on how many ``container inspect`` calls ONE enumeration may
+#: issue, and the total wall-clock budget it may spend issuing them.
+#:
+#: Why a bound exists at all: :func:`find_partgraph_instances` resolves the S2
+#: volume test with one ``container inspect`` per row, each bounded only by
+#: :data:`INSPECT_TIMEOUT_S`. That is per-CALL bounded but per-SWEEP unbounded —
+#: on a host reporting thousands of containers with a degraded engine the sweep
+#: cost is rows x 10s, and ``db doctor`` advertises itself as always safe to run.
+#: Rows that can be classified WITHOUT the call are skipped outright first (see
+#: :func:`_mount_status`), which removes cost rather than truncating coverage;
+#: these two ceilings then bound whatever genuinely still needs inspecting.
+#:
+#: Neither bound is normally approached: the affected host runs six containers
+#: in total, an order of magnitude below :data:`MAX_INSPECTED_ROWS`, and a
+#: healthy inspect answers in milliseconds. Exceeding either is degraded
+#: HONESTLY — the remaining rows' mount status becomes UNDETERMINED (None), the
+#: same tri-state a failed inspect produces, never a guessed "not ours". The
+#: cost of the bound is therefore paid in *precision* (an S2 duplicate past the
+#: ceiling that holds none of PartGraph's ports is excluded rather than stopped)
+#: and never in *false success*: a row past the ceiling that DOES hold a watched
+#: port still surfaces as ``UNKNOWN``, which ``db down`` reports and exits 1 on.
+#:
+#: :data:`INSPECT_SWEEP_BUDGET_S` is the binding constraint against a WEDGED
+#: engine (where each call burns the full :data:`INSPECT_TIMEOUT_S`), and
+#: :data:`MAX_INSPECTED_ROWS` against a merely LARGE host (where each call is
+#: fast but there are thousands of them). Worst-case sweep wall clock is
+#: ``INSPECT_SWEEP_BUDGET_S + INSPECT_TIMEOUT_S``: the deadline is checked
+#: BEFORE each call, so the last one admitted can overshoot it by at most one
+#: watchdog.
+MAX_INSPECTED_ROWS = 64
+INSPECT_SWEEP_BUDGET_S = 30.0
 
 #: Watchdog for one ``<engine> stop`` call. Must exceed
 #: :data:`STOP_GRACE_SECONDS` by a MEANINGFUL margin, not merely be greater
@@ -285,10 +327,14 @@ class Instance:
             report-only). A container matching none of the four is never
             represented by an ``Instance`` at all.
         mounts_data_volume: True iff the container is CONFIRMED to mount
-            :data:`PARTGRAPH_DATA_VOLUME` by exact name. False covers both
-            "confirmed not to" and "could not be determined" — ``owned_by`` is
-            the authoritative field for that distinction, and it reads
-            ``"UNKNOWN"`` in the latter case.
+            :data:`PARTGRAPH_DATA_VOLUME` by exact name. False covers three
+            cases — "confirmed not to", "could not be determined", and "never
+            asked" (an S1 name match, or a row past the sweep ceiling; see
+            :func:`_mount_status`). ``owned_by`` is the authoritative field:
+            it reads ``"S1"`` for a name match, whose ownership needs no mount
+            evidence, and ``"UNKNOWN"`` when the evidence was wanted and could
+            not be obtained. This field is DISPLAY/diagnostic only — no
+            ownership or stop decision is ever made from it.
     """
 
     id: str
@@ -653,7 +699,82 @@ def _classify(
     return None
 
 
-def _instance_from_row(engine_prefix: list[str], row: Mapping[str, Any]) -> Instance | None:
+@dataclass
+class _InspectSweepBudget:
+    """Finite ceiling on ONE enumeration's ``container inspect`` fan-out.
+
+    Two independent bounds, both spent by the same sweep and both documented on
+    :data:`MAX_INSPECTED_ROWS`: a remaining-call count (against a LARGE host)
+    and a monotonic deadline (against a WEDGED engine). ``skipped`` counts the
+    rows refused, so the caller can report the degradation ONCE for the whole
+    sweep instead of once per row — a thousand identical warning lines would
+    bury every other message a command emits.
+
+    Deliberately created per enumeration, never module-global: ``stop_all``
+    enumerates twice (the pre-stop sweep and the verification pass) and the
+    second pass must get its own full budget, not the remainder of the first.
+    """
+
+    remaining_calls: int
+    deadline: float
+    skipped: int = 0
+
+    def allow_one(self) -> bool:
+        """Consume one inspect slot; return False once either bound is spent.
+
+        The deadline is checked BEFORE the call it admits, never after, so an
+        admitted call may overshoot it by at most one :data:`INSPECT_TIMEOUT_S`.
+        """
+        if self.remaining_calls <= 0 or time.monotonic() >= self.deadline:
+            self.skipped += 1
+            return False
+        self.remaining_calls -= 1
+        return True
+
+
+def _new_inspect_sweep_budget() -> _InspectSweepBudget:
+    """Return a fresh budget for one enumeration's inspect sweep."""
+    return _InspectSweepBudget(
+        remaining_calls=MAX_INSPECTED_ROWS,
+        deadline=time.monotonic() + INSPECT_SWEEP_BUDGET_S,
+    )
+
+
+def _mount_status(
+    engine_prefix: list[str],
+    name: str,
+    container_id: str,
+    *,
+    budget: _InspectSweepBudget,
+) -> bool | None:
+    """Resolve one row's S2 volume test, or return None without asking.
+
+    Two rows are never inspected, for two DIFFERENT reasons:
+
+    1. **An exact S1 name match.** :func:`_classify`'s first step returns S1
+       with or without the mount evidence ("an exact name match needs no
+       corroboration"), so the call cannot change the verdict for this row.
+       Skipping it removes cost outright and truncates no coverage at all.
+    2. **A row past the sweep's own ceiling** (:class:`_InspectSweepBudget`).
+       This one DOES cost precision, so it degrades the way every other
+       unanswerable question in this module degrades: to None — UNDETERMINED,
+       identical to a failed inspect, never a guessed False. :func:`_classify`
+       then escalates a watched-port holder to ``UNKNOWN`` rather than quietly
+       calling it "just a port holder, safe to leave".
+    """
+    if name == PARTGRAPH_CONTAINER_NAME:
+        return None
+    if not budget.allow_one():
+        return None
+    return _mounts_data_volume(engine_prefix, container_id)
+
+
+def _instance_from_row(
+    engine_prefix: list[str],
+    row: Mapping[str, Any],
+    *,
+    budget: _InspectSweepBudget,
+) -> Instance | None:
     """Turn one ``ps`` row into a classified :class:`Instance`, or None.
 
     None means "skip this row": it is malformed (no usable name, no usable
@@ -663,7 +784,7 @@ def _instance_from_row(engine_prefix: list[str], row: Mapping[str, Any]) -> Inst
     container_id = _row_id(row)
     if name is None or container_id is None:
         return None
-    mounts_volume = _mounts_data_volume(engine_prefix, container_id)
+    mounts_volume = _mount_status(engine_prefix, name, container_id, budget=budget)
     ports = _row_ports(row)
     owned_by = _classify(name, mounts_volume=mounts_volume, ports=ports)
     if owned_by is None:
@@ -726,7 +847,15 @@ def find_partgraph_instances(
     READ-ONLY. Runs ``<engine> ps --all --format json`` (never ``--filter``:
     that flag is a *regex* on both engines and must never be ownership
     authority) and decides ownership in Python, then runs ``<engine> container
-    inspect --format json <id>`` per usable row to resolve the S2 volume test.
+    inspect --format json <id>`` to resolve the S2 volume test for each row that
+    still needs it.
+
+    The inspect fan-out is BOUNDED (:data:`MAX_INSPECTED_ROWS`,
+    :data:`INSPECT_SWEEP_BUDGET_S`) and rows an exact name match already
+    classifies are never inspected at all (:func:`_mount_status`). Whatever the
+    bound refuses is degraded to an UNDETERMINED mount status, never to a
+    guessed "not ours", so the ceiling can cost precision but never a false
+    success.
 
     Args:
         engine_prefix: Engine argv prefix; detected via
@@ -773,11 +902,23 @@ def find_partgraph_instances(
         )
         return ()
 
+    budget = _new_inspect_sweep_budget()
     instances = [
         instance
-        for instance in (_instance_from_row(prefix, row) for row in _parse_ps_rows(result.stdout))
+        for instance in (
+            _instance_from_row(prefix, row, budget=budget)
+            for row in _parse_ps_rows(result.stdout)
+        )
         if instance is not None
     ]
+    if budget.skipped:
+        # Reported once for the whole sweep, not once per row. Single-line and
+        # path-free, and it carries a COUNT rather than any engine-derived name.
+        _LOGGER.warning(
+            "The bounded container-inspection sweep was exhausted; the "
+            "volume-mount status of %d further container(s) was not determined.",
+            budget.skipped,
+        )
     return tuple(instances)
 
 
@@ -830,6 +971,70 @@ def unit_state(*, which: Callable[[str], str | None] | None = None) -> UnitState
         active_state=_property_or_none(properties, "ActiveState"),
         wanted_by_default=(_DEFAULT_TARGET in wanted_by.split()) if wanted_by else None,
     )
+
+
+def volume_exists(
+    *,
+    engine_prefix: list[str] | None = None,
+    which: Callable[[str], str | None] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> bool | None:
+    """Report whether the named data volume :data:`PARTGRAPH_DATA_VOLUME` exists.
+
+    READ-ONLY, and exactly ONE subprocess call: ``<engine> volume inspect
+    --format json <volume>``. The verb surface is ``inspect`` only — this
+    function never runs ``volume rm``, ``volume create`` or ``prune``, and
+    ``-f``/``--force`` never appears in its argv.
+
+    TRI-STATE, mirroring :attr:`UnitState.wanted_by_default` and
+    :func:`_mounts_data_volume`:
+
+    - **True** — the engine confirmed the volume exists (``inspect`` exit 0).
+    - **False** — the engine confirmed it does not (a non-zero ``inspect`` exit,
+      a real engine's own "no such volume" outcome).
+    - **None** — could NOT be determined, because the call itself failed to run
+      (a timeout, or an ``OSError`` such as a binary that vanished in the narrow
+      window after the PATH check).
+
+    Existence is decided by the ENGINE's own exit code, never by parsing the
+    body: a corrupt or truncated payload on a SUCCESSFUL inspect must not
+    downgrade a confirmed positive into an unknown or a false negative, exactly
+    as ``_mounts_data_volume`` treats its own return code as authoritative for
+    the yes/no question it already answered.
+
+    There is deliberately NO ``volume_name=`` parameter.
+    :data:`PARTGRAPH_DATA_VOLUME` is a FROZEN constant, like
+    :data:`PARTGRAPH_CONTAINER_NAME` and :data:`PARTGRAPH_UNIT_NAME`: a
+    caller-supplied target would reopen precisely the poisoned-target surface
+    this module's allow-list discipline exists to close.
+
+    Args:
+        engine_prefix: Engine argv prefix; detected via
+            :func:`~partgraph.util.container.engine_command` when None.
+        which: PATH-lookup callable used for detection; defaults to
+            :func:`shutil.which`, resolved at call time.
+        environ: Environment mapping used for detection.
+
+    Raises:
+        partgraph.util.container.ContainerEngineError: If ``engine_prefix`` is
+            None and no engine is on PATH. NEVER caught here — mirrors
+            :func:`find_partgraph_instances`: a probe that never ran must not
+            degrade into a guessed answer. The CLI layer catches it, exactly as
+            ``db down`` catches it around its own ``engine_command()`` call.
+    """
+    lookup = _resolve_which(which)
+    prefix = _resolve_engine_prefix(engine_prefix, which=lookup, environ=environ)
+
+    argv = [*prefix, "volume", "inspect", "--format", "json", PARTGRAPH_DATA_VOLUME]
+    try:
+        result = _run_capture(argv, timeout=VOLUME_INSPECT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        _LOGGER.warning(
+            "Inspecting the PartGraph data volume timed out or could not be "
+            "executed; its existence could not be determined."
+        )
+        return None
+    return result.returncode == 0
 
 
 def _parse_property_lines(stdout: str) -> dict[str, str]:
