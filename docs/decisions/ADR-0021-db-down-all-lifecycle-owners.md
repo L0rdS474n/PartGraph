@@ -73,7 +73,7 @@ enumeration**, and the four tags are tested in this **priority order**:
 | - | ----------- | -------------------------------------------------------------------- | --------------------------- |
 | 1 | **S1**      | container name is EXACTLY `partgraph-dgraph`                         | stop                        |
 | 2 | **S2**      | CONFIRMED to mount the named volume EXACTLY `partgraph_dgraph_data`  | stop                        |
-| 3 | **UNKNOWN** | mount status **undeterminable** — `container inspect` itself failed  | **never stop; see § 2a**    |
+| 3 | **UNKNOWN** | mount status undeterminable (`inspect` failed) AND holds a watched port | **never stop; see §§ 2a, 2b** |
 | 4 | **S3**      | CONFIRMED not to mount it, but holds host port `8081`/`9081`/`8001`  | **REPORT ONLY, never stop** |
 
 Anything matching none of the four is not represented at all — it never appears
@@ -108,10 +108,11 @@ while it kept running.
 The mount probe is therefore **tri-state**: mounts / does not mount / **could
 not be determined**. `None` is never collapsed into `False`.
 
-- **UNKNOWN is tested BEFORE the port check.** A container we could not classify
-  must never be confidently downgraded to "just a port holder, safe to leave"
-  merely because it happens to hold a watched port. S3 now means *positively
-  confirmed not ours*, which is a stronger and more honest claim than before.
+- **UNKNOWN is tested BEFORE the S3 port check.** A container we could not
+  classify must never be confidently downgraded to "just a port holder, safe to
+  leave". S3 now means *positively confirmed not ours*, which is a stronger and
+  more honest claim than before.
+- **UNKNOWN is SCOPED to containers holding a watched port** (§ 2b).
 - **UNKNOWN is never a stop target**, exactly like S3. We stop only what we
   positively know is ours; an unverifiable container is reported, not acted on.
   This keeps the cve-graph guarantee intact: an inspect failure can never
@@ -128,11 +129,60 @@ not be determined**. `None` is never collapsed into `False`.
   have succeeded. Exit 0 keeps its full strength — it promises that nothing
   PartGraph owns survived, and an unverifiable container cannot support that
   promise.
+- **Both conditions are reported when both occur.** Survivors and undetermined
+  containers are independent findings that can arise in the same run, so the CLI
+  prints a line for each — as *separate* lines, never merged into one sentence —
+  and only then exits 1. Reporting just the first would silently drop the other
+  from an operator who needs both.
 
 This mirrors the `_NOT_RUNNING_STATES` deny-list and `UnitState.wanted_by_default
 is None` decisions already recorded here: throughout this module, an
 undetermined answer degrades toward suspicion and a loud exit, never toward a
 silent all-clear.
+
+### 2b. …but the alarm is scoped to containers on PartGraph's own ports
+
+The first cut of § 2a escalated **every** un-inspectable row. `ps --all` returns
+every container on the host, and each one is inspected — including all five
+cve-graph and `min-web` containers. So a single transient `inspect` timeout on,
+say, `cve-alpha` during the verification pass produced:
+
+```
+Error: could not verify whether 1 container(s) belong to PartGraph: cve-alpha.
+```
+
+…and exit 1, even when PartGraph's own instance had stopped perfectly. Naming a
+cve-graph container as *possibly PartGraph's* is exactly the conflation this ADR
+exists to dispel — it made the honesty mechanism produce a dishonest sentence.
+
+**The scope.** A row escalates to UNKNOWN only if it also holds one of
+`PARTGRAPH_WATCHED_PORTS`. An un-inspectable row that holds none of our ports
+and is not an exact S1 name match is **excluded entirely**, like any other
+unrelated container. The reasoning: an instance we cannot identify has to be
+*serving on one of PartGraph's own ports* to be the survivor the exit code is
+about. One that holds none of them is neither interfering with PartGraph nor
+PartGraph's business to raise an alarm about.
+
+**The S1 path is unaffected.** The exact-name check runs *before* the mount
+branch, so a container named exactly `partgraph-dgraph` is still S1 whether or
+not its inspect succeeded — an exact name match needs no corroboration. The
+scoping can only ever affect rows that already failed S1.
+
+**A name heuristic was considered and rejected.** Widening the escalation to
+"names that look like ours" would reintroduce precisely the `-backup` / `-old`
+substring collisions that are forbidden for stop selectors (§ 2), and no case
+was found that port scoping misses but a name heuristic would catch. Ports are
+the only extra signal; the name is never one.
+
+**The trade-off, stated honestly.** A hypothetical S2-only duplicate — one that
+mounts `partgraph_dgraph_data` under some other name, publishes *none* of our
+ports, *and* whose inspect fails on the verification pass — is now excluded
+rather than reported. That is acceptable for a concrete reason, not by
+assumption: **Badger refuses two writers on one data directory**. A second
+container on that volume cannot run silently alongside the first; it fails to
+acquire the directory lock and crashes rather than corrupting. A crashed
+container is not `_is_stoppable` and so was never a survivor under any version
+of this logic. The case the scoping gives up is one that cannot occur quietly.
 
 #### Forbidden selectors
 
@@ -235,61 +285,104 @@ data volume — and therefore every ingested part — always survives a `db down
 Compose's own `down` still removes the containers Compose created; that is
 Compose's behaviour, not an additional verb PartGraph issues.
 
-### 7a. A shutdown budget Dgraph can actually meet
+### 7a. Making `stop` actually reach Dgraph
 
-`stop` is only the *right* verb if the container is given long enough to act on
-the SIGTERM it implies. It was not. `STOP_GRACE_SECONDS` was **10**, and
-`docker/docker-compose.yml` declared no `stop_grace_period` at all — which means
-it inherited Compose's own 10s default. So nowhere in PartGraph did Dgraph get
-more than ten seconds to shut down.
+`stop` is only the *right* verb if the SIGTERM it implies actually arrives. It
+did not, and the reason turned out to be nothing like the first diagnosis. This
+section records the wrong answer as well as the right one, because the wrong one
+was already shipped and a future reader deserves to know why the numbers look
+the way they do.
 
-**The evidence.** The journal on this host recorded, after a 14-hour run:
+**What surfaced it.** The journal on this host recorded, after a 14-hour run:
 
 > `StopSignal SIGTERM failed to stop container partgraph-dgraph in 10 seconds,
 > resorting to SIGKILL`
 
-with the unit exiting **137**. A short-lived instance shut down cleanly inside
-the same window, so the failure is **load-dependent**: the longer Dgraph has
-run, the more it has to flush. Badger's write-ahead log meant **no data was
-lost** — 613,396 `Part` nodes verified intact afterwards — so this is about
-**shutdown correctness and restart cost, not data integrity**. A database that
-is routinely SIGKILLed still pays for it in recovery work on the next start.
+with the unit exiting **137**. `STOP_GRACE_SECONDS` was 10 and
+`docker/docker-compose.yml` declared no `stop_grace_period` at all, so it also
+inherited Compose's own 10s default: nowhere in PartGraph did Dgraph get more
+than ten seconds.
 
-**The decision.** `STOP_GRACE_SECONDS` is raised to **60**, and
-`docker/docker-compose.yml`'s `dgraph` service now declares
-`stop_grace_period: 60s` so a Compose-started instance gets the identical
-window. A unit test imports the constant directly rather than re-declaring the
-number, so the two pins cannot silently drift apart.
+**The first, WRONG explanation.** The obvious reading — a 14-hour Dgraph has
+more to flush, so ten seconds is not enough — led to raising the budget to 60
+and adding a matching `stop_grace_period`. That hypothesis was **disproven by
+direct re-measurement**:
 
-**60 is a judgement call, not a measurement.** The evidence establishes only
-*"more than 10, and more the longer it has run"*. It does **not** establish a
-sufficient bound — nobody measured how long a 14-hour Dgraph actually needs, and
-a busier or larger instance may still exceed 60. Six times the disproven value
-is a deliberate safety factor chosen because the trade is so lopsided for a
-local tool: a slower `db down` costs a human a few seconds of waiting, while a
-premature SIGKILL costs recovery work on a multi-GB store. Read this number as
-"comfortably past the value we proved wrong", not as a measured minimum.
+```
+$ time podman stop -t 60 partgraph-dgraph   # container up ~1 minute
+warning: StopSignal SIGTERM failed to stop container in 60 seconds,
+         resorting to SIGKILL
+real 1m0,221s
+$ podman inspect ... --format '{{.State.ExitCode}}'
+137
+```
 
-`STOP_TIMEOUT_S` rises with it, to **90.0** — a 30-second margin. The Python
-watchdog must not fire before the engine has finished waiting out its own grace
-period, or the graceful path is destroyed one layer higher up and reported as a
-failed stop. The engine needs the full 60s, *then* SIGKILL, *then* container
-teardown, and a multi-GB Badger store does not unmount instantly. The margin is
-three times the minimum the tests enforce because the two failure directions are
-not symmetric: too small destroys a healthy-but-slow shutdown, too large only
-delays the report of an already-wedged engine.
+A container barely a minute old, with essentially nothing to flush, burned the
+entire 60-second window and was SIGKILLed anyway. **The failure was never
+load-dependent, and no grace-period value could ever have fixed it.**
 
-**HONESTY BOUNDARY — what this does NOT cover.** This budget reaches only the
-lifecycle paths PartGraph owns directly: this module's own engine `stop` sweep
-and Compose. It does **not** reach the quadlet path. When `stop_all` stops
-`partgraph-dgraph.service`, that unit's own `ExecStop=podman rm -v -f` applies
-whatever stop timeout was baked into the container at quadlet-generation time,
-and nothing in this repository can influence it. Raising that ceiling requires a
-host-side `StopTimeout=` drop-in, which is **PR-B1** work and is deliberately
-out of scope here. A test now pins that the `systemctl` argv never carries our
-grace value at all, precisely so this claim cannot silently rot into an implied
-guarantee. `db down` does not promise a graceful shutdown in every case — only
-that the two paths PartGraph does control now share a load-tolerant budget.
+**The real, structural cause.** `dgraph/standalone:v25.3.4` declares no
+`ENTRYPOINT` and no `STOPSIGNAL`; its `CMD` is `/run.sh`, which reads verbatim —
+including upstream's own acknowledgement:
+
+```sh
+# TODO properly handle SIGTERM for all three processes.
+dgraph zero &
+dgraph alpha
+```
+
+PID 1 is bash, running `dgraph alpha` as its **foreground** command, and bash
+defers acting on a received signal until that foreground command exits. SIGTERM
+sent to PID 1 is therefore never forwarded to `dgraph alpha` — regardless of
+uptime, load, or how long anyone waits.
+
+**The fix: `init: true`.** Setting it on the `dgraph` service puts a real init
+process (podman's `podman-init`/tini) at PID 1 instead of bash, and an init
+process *does* forward SIGTERM to its child. Measured on this host:
+
+| Configuration    | PID 1          | `podman stop -t 60` | Exit code        |
+| ---------------- | -------------- | ------------------- | ---------------- |
+| without `init`   | `bash /run.sh` | 60.2 s              | 137 (SIGKILL)    |
+| with `init: true`| `podman-init`  | **0.2 s**           | **143 (SIGTERM)**|
+
+A unit test pins `init: true` and `stop_grace_period` **together**, because
+either alone is not the fix: without the flag the budget is close to useless,
+and without the budget the flag has nothing to bound.
+
+**What the numbers mean now.** `STOP_GRACE_SECONDS` stays **60** and
+`STOP_TIMEOUT_S` stays **90.0** (a 30-second margin, three times the minimum the
+tests enforce, because the failure modes are not symmetric: too small a margin
+destroys a slow-but-healthy shutdown and misreports it, too large only delays
+the report of an already-wedged engine). But their *meaning* changed. Before,
+60 was an always-paid delay that never once produced a graceful shutdown. Now it
+is a **rarely-reached ceiling**: a healthy Dgraph exits in a fraction of a
+second, and the budget only matters when there genuinely is a lot to flush.
+
+**60 is still a judgement call, not a measurement.** The 0.2 s figure was taken
+on a near-empty instance and says nothing about a busy one — the busy case has
+**never been measured**. 60 is retained as a deliberate safety factor because
+the trade is lopsided for a local tool: a slower `db down` costs a human a few
+seconds, while a premature SIGKILL costs recovery work on a multi-GB store.
+
+Badger's write-ahead log meant the earlier SIGKILLs cost **no data** — 613,396
+`Part` nodes verified intact afterwards. This whole section is about **shutdown
+correctness and restart cost, not data integrity**.
+
+**HONESTY BOUNDARY — what this does NOT cover.** Both parts of the fix reach
+only the lifecycle paths PartGraph owns directly: this module's own engine
+`stop` sweep and Compose. Neither reaches the quadlet path, and this is worth
+stating explicitly rather than leaving implied: **the quadlet unit does not go
+through Compose, so it gets no init process from `init: true` at all**, and when
+`stop_all` stops `partgraph-dgraph.service` that unit's own
+`ExecStop=podman rm -v -f` applies the stop timeout baked into the container at
+generation time. Nothing in this repository can influence either. A
+quadlet-started Dgraph therefore still gets bash as PID 1 and is still SIGKILLed;
+fixing that needs host-side unit changes (a `StopTimeout=` drop-in and an init
+process in the generated unit), which is **PR-B1** work and deliberately out of
+scope here. A test pins that the `systemctl` argv never carries our grace value,
+precisely so this claim cannot silently rot into an implied guarantee. `db down`
+does not promise a graceful shutdown in every case — only on the two paths
+PartGraph controls.
 
 ### 8. Untrusted engine output is validated at the boundary
 

@@ -42,7 +42,9 @@ partgraph embed             # compute semantic vectors (enables --semantic)
 > it did not create, so a plain `compose down` would leave that instance
 > serving on those ports — while `db down` reported success. `partgraph db down`
 > now stops that unit too and then verifies: it exits **0** only when no
-> PartGraph instance survives, and **1** naming any that did. A container that
+> PartGraph instance survives, **1** naming any that did, and **1** as well when
+> a container's ownership *could not be verified* — a distinct message saying
+> "could not verify" rather than "still running". A container that
 > merely holds one of those ports without being PartGraph's is reported, never
 > stopped. Run `partgraph db down --dry-run` to see what would be stopped
 > without touching anything. Details in

@@ -379,9 +379,15 @@ def down(
         _print_down_dry_run(result)
         return
 
+    # Both conditions are reported before exiting, because they can co-occur and
+    # they are not the same news: one says a stop positively failed, the other
+    # says a stop cannot be confirmed. Reporting only the first would silently
+    # drop the second from an operator who needs both. They are printed as
+    # separate lines, never merged into one sentence, so "still running" and
+    # "could not verify" stay textually distinct signals.
+    # markup=False, so an engine-derived name carrying '[...]' is printed
+    # literally rather than being read as a Rich style tag.
     if result.survivors:
-        # markup=False, so an engine-derived name carrying '[...]' is printed
-        # literally rather than being read as a Rich style tag.
         _err_console.print(
             f"Error: {len(result.survivors)} PartGraph instance(s) still running "
             f"after db down: {', '.join(result.survivors)}.",
@@ -389,13 +395,7 @@ def down(
             soft_wrap=True,
             style="red",
         )
-        raise typer.Exit(code=1)
-
     if result.undetermined:
-        # Deliberately worded so it can never be confused with the survivor
-        # line above: this is "we could not check", not "it is still running".
-        # Exit 1 all the same — exit 0 promises that no PartGraph instance
-        # survived, and an unverifiable container cannot support that promise.
         _err_console.print(
             f"Error: could not verify whether {len(result.undetermined)} "
             f"container(s) belong to PartGraph: {', '.join(result.undetermined)}. "
@@ -404,6 +404,10 @@ def down(
             soft_wrap=True,
             style="red",
         )
+    if result.survivors or result.undetermined:
+        # Exit 1 for either: exit 0 promises that no PartGraph instance
+        # survived, and neither a known survivor nor an unverifiable container
+        # can support that promise.
         raise typer.Exit(code=1)
 
     _console.print(_down_success_line(result), markup=False, soft_wrap=True)

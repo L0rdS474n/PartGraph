@@ -127,45 +127,63 @@ INSPECT_TIMEOUT_S = 10.0
 
 #: Watchdog for one ``<engine> stop`` call. Must exceed
 #: :data:`STOP_GRACE_SECONDS` by a MEANINGFUL margin, not merely be greater
-#: than it: the engine first waits out its own grace period, then sends
-#: SIGKILL, then still has to tear the container down and reap it — and a
+#: than it: in the worst case the engine waits out the whole grace period, then
+#: sends SIGKILL, then still has to tear the container down and reap it — and a
 #: multi-GB Badger store does not unmount instantly. If this watchdog fired
-#: first, Python would abort the call mid-shutdown and the graceful path would
-#: be lost anyway, just one layer higher up. The 30s margin is deliberately
-#: three times the minimum the test suite enforces: the two failure modes are
-#: not symmetric. Too small, and a healthy-but-slow shutdown is destroyed and
-#: misreported; too large, and a genuinely wedged engine merely takes longer to
-#: be reported by a foreground command a human just typed.
+#: first, Python would abort the call mid-shutdown and destroy the graceful
+#: path one layer higher up. The 30s margin is deliberately three times the
+#: minimum the test suite enforces, because the two failure modes are not
+#: symmetric: too small destroys a slow-but-healthy shutdown and misreports it,
+#: while too large only makes a genuinely wedged engine take longer to be
+#: reported by a foreground command a human just typed. Neither bound is
+#: normally approached — a container with a working init process (see
+#: :data:`STOP_GRACE_SECONDS`) stops in a fraction of a second.
 STOP_TIMEOUT_S = 90.0
 
 #: Watchdog for one ``systemctl --user`` call (show or stop).
 SYSTEMCTL_TIMEOUT_S = 20.0
 
-#: The engine's OWN ``-t`` grace period, in seconds: how long the container
-#: gets to shut down cleanly before the engine escalates to SIGKILL. Distinct
-#: from the Python-level subprocess watchdog :data:`STOP_TIMEOUT_S` above.
+#: The engine's OWN ``-t`` grace period, in seconds: the CEILING on how long
+#: the container may take to shut down before the engine escalates to SIGKILL.
+#: Distinct from the Python-level subprocess watchdog :data:`STOP_TIMEOUT_S`.
 #:
-#: Raised from 10 after live journal evidence on this host disproved that
-#: budget: following a 14-hour run, ``StopSignal SIGTERM failed to stop
-#: container partgraph-dgraph in 10 seconds, resorting to SIGKILL`` (unit exit
-#: status 137). A short-lived instance shut down cleanly in the same window, so
-#: the failure is LOAD-dependent — the longer Dgraph has run, the more it has to
-#: flush. Badger's write-ahead log meant no data was lost (613,396 Part nodes
-#: verified intact afterwards), so this is about shutdown correctness and
-#: restart cost, not data integrity.
+#: This is an upper bound, not a delay paid on every stop. It is only ever
+#: reached if the process is genuinely still working; a healthy Dgraph exits in
+#: a fraction of a second (0.2s measured on this host).
 #:
-#: 60 is a JUDGEMENT CALL, not a measurement. The evidence establishes only
-#: "more than 10, and more the longer it has run"; it does not establish a
-#: sufficient bound. Six times the disproven value is a deliberate safety factor
-#: for a local tool where a slower ``db down`` costs nothing.
+#: History, recorded because the first explanation was WRONG. A 14-hour run
+#: ended with ``StopSignal SIGTERM failed to stop container partgraph-dgraph in
+#: 10 seconds, resorting to SIGKILL`` (unit exit status 137), and the budget was
+#: raised from 10 to 60 on the hypothesis that Dgraph needed longer to flush
+#: under load. A direct re-measurement DISPROVED that: a container up for barely
+#: one minute, with essentially nothing to flush, ALSO burned the full window
+#: (``podman stop -t 60`` -> 60.2s, exit 137). The cause was never load. It is
+#: structural, and lives in the image: ``dgraph/standalone:v25.3.4`` declares no
+#: ENTRYPOINT and no STOPSIGNAL, and its ``/run.sh`` runs ``dgraph alpha`` in
+#: the FOREGROUND under bash as PID 1 (upstream's own comment there reads
+#: ``# TODO properly handle SIGTERM for all three processes``). Bash defers
+#: acting on a signal until its foreground command exits, so SIGTERM never
+#: reached Dgraph at all. No value of this constant could have fixed that.
+#:
+#: The actual fix is ``init: true`` on the dgraph service in
+#: docker/docker-compose.yml, which puts a real init process at PID 1 to forward
+#: the signal: the same stop then completed in 0.2s with exit 143, a genuine
+#: SIGTERM exit. This constant only became MEANINGFUL once that landed.
+#:
+#: 60 remains a JUDGEMENT CALL, not a measured requirement. The 0.2s measurement
+#: was taken on a near-empty instance and says nothing about a busy one, which
+#: has never been measured. Badger's write-ahead log meant the earlier SIGKILLs
+#: cost no data (613,396 Part nodes verified intact afterwards), so the whole
+#: subject is shutdown correctness and restart cost, not data integrity.
 #:
 #: HONESTY BOUNDARY: this budget reaches only the lifecycle paths PartGraph owns
 #: — this module's own engine ``stop`` sweep and Compose (whose matching
-#: ``stop_grace_period`` in docker/docker-compose.yml is pinned against THIS
-#: constant, so the two cannot drift). It does NOT reach the quadlet path: that
-#: unit's own ``ExecStop=podman rm -v -f`` uses the stop timeout baked into the
-#: container at generation time, which this repo cannot influence. Raising that
-#: ceiling needs a host-side ``StopTimeout=`` drop-in (PR-B1).
+#: ``stop_grace_period`` is pinned against THIS constant, so the two cannot
+#: drift). It does NOT reach the quadlet path, and neither does ``init: true``:
+#: that unit does not go through Compose, so it gets no init process, and its
+#: own ``ExecStop=podman rm -v -f`` uses the stop timeout baked into the
+#: container at generation time. Fixing that needs host-side unit changes
+#: (PR-B1), not anything in this repository.
 STOP_GRACE_SECONDS = 60
 
 #: Finite ceiling (4 MiB) on how much ``ps`` stdout the parser will even
@@ -560,15 +578,19 @@ def _mounts_data_volume(engine_prefix: list[str], container_id: str) -> bool | N
     try:
         result = _run_capture(argv, timeout=INSPECT_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
+        # Deliberately says only what is known: the MOUNT STATUS is
+        # undetermined. Whether that escalates to an ownership alarm is
+        # _classify's decision, and for a container holding none of PartGraph's
+        # ports it does not — so this must not pre-announce a verdict.
         _LOGGER.warning(
             "Inspecting a container timed out or could not be executed; its "
-            "ownership is undetermined."
+            "volume-mount status could not be determined."
         )
         return None
     if result.returncode != 0:
         _LOGGER.warning(
-            "Inspecting a container failed (engine exit code %d); its ownership "
-            "is undetermined.",
+            "Inspecting a container failed (engine exit code %d); its "
+            "volume-mount status could not be determined.",
             result.returncode,
         )
         return None
@@ -598,22 +620,35 @@ def _classify(
     never the image name or a Compose project label. The priority order is
     load-bearing:
 
-    1. name equals :data:`PARTGRAPH_CONTAINER_NAME` -> S1;
+    1. name equals :data:`PARTGRAPH_CONTAINER_NAME` -> S1, whether or not the
+       inspect succeeded: an exact name match needs no corroboration;
     2. confirmed to mount :data:`PARTGRAPH_DATA_VOLUME` -> S2;
-    3. mount status UNDETERMINED -> ``UNKNOWN`` — checked BEFORE the port test,
-       so a container we could not classify is never confidently downgraded to
-       "just a port holder, safe to leave" merely because it happens to hold a
-       watched port;
+    3. mount status UNDETERMINED **and** the row holds a watched host port ->
+       ``UNKNOWN``. Still checked before the S3 test, so a container we could
+       not identify is never confidently downgraded to "just a port holder,
+       safe to leave" — but SCOPED to port holders, because an instance we
+       cannot identify has to be *serving on one of PartGraph's own ports* to
+       be the survivor the exit code is about. Without that scope, one
+       transient inspect timeout on an unrelated container — a cve-graph one,
+       say — would make ``db down`` name it as possibly PartGraph's, which is
+       precisely the conflation this module exists to dispel;
     4. confirmed NOT to mount it, but holds a watched host port -> S3;
-    5. otherwise not ours, and never returned at all.
+    5. otherwise not ours, and never returned at all — which now also covers
+       an undetermined mount status on a container holding none of our ports.
+
+    Note what is deliberately NOT used to widen step 3: the name. A
+    "looks like ours" substring heuristic (``-backup``, ``-old``, …) is
+    forbidden as an escalation signal for exactly the reason it is forbidden as
+    a stop selector. Ports are the only extra signal.
     """
     if name == PARTGRAPH_CONTAINER_NAME:
         return _OWNER_NAME_MATCH
     if mounts_volume:
         return _OWNER_VOLUME_MATCH
+    holds_watched_port = any(port in PARTGRAPH_WATCHED_PORTS for port in ports)
     if mounts_volume is None:
-        return _OWNER_UNDETERMINED
-    if any(port in PARTGRAPH_WATCHED_PORTS for port in ports):
+        return _OWNER_UNDETERMINED if holds_watched_port else None
+    if holds_watched_port:
         return _OWNER_PORT_HOLDER
     return None
 

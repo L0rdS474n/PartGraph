@@ -75,7 +75,9 @@ a host that has both installed).
 > volume. Compose cannot stop a container it did not create, so `db down` used
 > to report success while that instance kept running. It now stops the systemd
 > unit as well, then verifies that nothing PartGraph owns is still running:
-> **exit 0 means zero instances survive, exit 1 names the survivors.** The
+> **exit 0 means zero instances survive, exit 1 names the survivors, and exit 1
+> can also mean a container's ownership *could not be verified* — a distinct
+> message saying "could not verify", never "still running".** The
 > named data volume is still never removed. Use `partgraph db down --dry-run`
 > to see exactly what would be stopped without changing anything. Note that
 > `db down` stops such a unit but does not *disable* it — a unit wanted by
