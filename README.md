@@ -67,6 +67,21 @@ when present and otherwise Docker. To force a specific engine, set
 `PARTGRAPH_CONTAINER_ENGINE` (for example `PARTGRAPH_CONTAINER_ENGINE=docker` on
 a host that has both installed).
 
+> [!NOTE]
+> **`db down` stops every lifecycle owner, not just Compose.** A host can carry
+> a *second* owner for the same database — a `systemd --user` unit
+> (`partgraph-dgraph.service`, typically generated from this compose file by a
+> quadlet converter) that declares the same container name, ports and data
+> volume. Compose cannot stop a container it did not create, so `db down` used
+> to report success while that instance kept running. It now stops the systemd
+> unit as well, then verifies that nothing PartGraph owns is still running:
+> **exit 0 means zero instances survive, exit 1 names the survivors.** The
+> named data volume is still never removed. Use `partgraph db down --dry-run`
+> to see exactly what would be stopped without changing anything. Note that
+> `db down` stops such a unit but does not *disable* it — a unit wanted by
+> `default.target` will start again at your next login. See
+> [ADR-0021](docs/decisions/ADR-0021-db-down-all-lifecycle-owners.md).
+
 Once the database is up and populated, see **[Connecting to PartGraph](docs/connecting.md)**
 for a full guide to querying the graph from the Dgraph MCP plugin, plain Dgraph
 clients (gRPC / HTTP), AI/LLM query recipes, and the bundled `partgraph` CLI.
