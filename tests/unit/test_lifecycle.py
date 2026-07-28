@@ -65,8 +65,9 @@ Module constants (frozen, named — never derived at runtime):
 Frozen dataclasses:
   - ``Instance(id: str, name: str, image: str, status: str,
     ports: tuple[int, ...], owned_by: str, mounts_data_volume: bool)`` —
-    ``owned_by`` is one of the literal strings ``"S1"``/``"S2"``/``"S3"``.
-    Only S1/S2/S3-classified containers are ever returned by
+    ``owned_by`` is one of the literal strings ``"S1"``/``"S2"``/``"S3"``/
+    ``"UNKNOWN"`` (the fourth tag added by Gate 5 finding A — see below).
+    Only S1/S2/S3/UNKNOWN-classified containers are ever returned by
     :func:`find_partgraph_instances` — an unrelated container (e.g. every
     cve-graph container) is excluded entirely, never present in the returned
     tuple with some other tag. ``id`` is the engine-assigned, opaque
@@ -83,16 +84,22 @@ Frozen dataclasses:
     ``wanted_by_default`` is ``None`` when undeterminable (NEVER guessed).
   - ``DownResult(stopped: tuple[str, ...],
     skipped_foreign_port_holders: tuple[str, ...], unit_stopped: bool,
-    survivors: tuple[str, ...], still_serving_health: bool)``. Every tuple
-    here carries NAMES (never ids) — DownResult is the display-facing DTO.
-    Unlike :class:`~partgraph.util.health.HealthResult` and
+    survivors: tuple[str, ...], still_serving_health: bool,
+    undetermined: tuple[str, ...])``. Every tuple here carries NAMES (never
+    ids) — DownResult is the display-facing DTO. Unlike
+    :class:`~partgraph.util.health.HealthResult` and
     :class:`~partgraph.util.index_health.IndexIntegrityResult`, DownResult
     deliberately carries NO ``message: str`` field (Gate 3b finding 3b-L1):
     every user-facing string `db down` prints (the A8 survivor line, the A9
-    unowned-port advisory, the plain success line) is composed in cli.py
-    from DownResult's structured fields, keeping ALL of `db down`'s
-    user-facing text in ONE place rather than splitting it across the leaf
-    and the CLI the way `db status`/`db check-index` do.
+    unowned-port advisory, the plain success line, and the Gate 5 finding A
+    "could not verify" line below) is composed in cli.py from DownResult's
+    structured fields, keeping ALL of `db down`'s user-facing text in ONE
+    place rather than splitting it across the leaf and the CLI the way
+    `db status`/`db check-index` do. ``undetermined`` (Gate 5 finding A) is
+    the names of instances still classified ``"UNKNOWN"`` after the FINAL
+    verification pass — a ``container inspect`` failure alone during the
+    pre-stop sweep never populates it, since only verification decides the
+    exit code (mirrors A12's phase-1 absorption: "do not over-fire").
 
 Public functions (the ONLY public surface; everything else is private):
   - ``find_partgraph_instances(*, engine_prefix: list[str] | None = None,
@@ -104,16 +111,29 @@ Public functions (the ONLY public surface; everything else is private):
     crashes the whole enumeration, Gate 3a finding 3a-H3), runs ``<prefix>
     container inspect --format json <container-id>`` (by opaque ID — NEVER by
     name, so a foreign container's NAME never reaches an inspect argv) to
-    determine :attr:`Instance.mounts_data_volume`. Classifies ownership by
-    EXACT Python string comparison (S1: name == PARTGRAPH_CONTAINER_NAME; S2:
-    a mounted volume name == PARTGRAPH_DATA_VOLUME, never a
-    prefix/suffix/substring match; S3: holds a PARTGRAPH_WATCHED_PORTS host
-    port and matches neither S1 nor S2). A name failing a strict, POSITIVE
-    allow-list charset check (the Docker/podman container-name grammar
-    ``^[a-zA-Z0-9][a-zA-Z0-9_.-]*$``, Gate 3a finding 3a-M7) is EXCLUDED
-    before classification — it is never returned, and its raw string never
-    reaches any subprocess argv. ``engine_prefix`` defaults to
-    :func:`partgraph.util.container.engine_command`'s result when ``None``
+    determine :attr:`Instance.mounts_data_volume`, which is a TRI-STATE
+    result internally (mounts / does-not-mount / COULD NOT DETERMINE — the
+    inspect call itself failed: timeout, non-zero exit, or an unparseable
+    payload). Classifies ownership by EXACT Python string comparison, in this
+    PRIORITY order: (1) name == PARTGRAPH_CONTAINER_NAME -> S1; (2) mounts the
+    named volume (PARTGRAPH_DATA_VOLUME, never a prefix/suffix/substring
+    match) -> S2; (3) inspect COULD NOT DETERMINE the mount status -> "UNKNOWN"
+    (Gate 5 finding A) — checked BEFORE the port test, regardless of whether
+    the row also holds a watched port: an undetermined mount status is NEVER
+    confidently downgraded to "just a port holder, safe to leave"; (4)
+    positively does not mount the volume AND holds a PARTGRAPH_WATCHED_PORTS
+    host port -> S3; (5) else excluded entirely (not PartGraph's, never
+    returned). ``PARTGRAPH_WATCHED_PORTS`` host ports are extracted from
+    EITHER shape a `ps --format json` ``Ports`` field is observed to take —
+    podman's ``list[dict]`` (each entry carrying a ``host_port`` int) OR
+    Docker's comma-joined string (e.g. ``"0.0.0.0:8081->8080/tcp"``, Gate 5
+    finding B); either shape parses identically, and a malformed or empty
+    value of EITHER shape degrades to no ports, never raises. A name failing a
+    strict, POSITIVE allow-list charset check (the Docker/podman
+    container-name grammar ``^[a-zA-Z0-9][a-zA-Z0-9_.-]*$``, Gate 3a finding
+    3a-M7) is EXCLUDED before classification — it is never returned, and its
+    raw string never reaches any subprocess argv. ``engine_prefix`` defaults
+    to :func:`partgraph.util.container.engine_command`'s result when ``None``
     (resolved with the given ``which``/``environ``).
   - ``unit_state(*, which=shutil.which) -> UnitState`` — READ-ONLY. Runs
     ``systemctl --user show <PARTGRAPH_UNIT_NAME> --property=LoadState
@@ -142,8 +162,13 @@ Public functions (the ONLY public surface; everything else is private):
     S1/S2 instance, run ``<prefix> stop -t <STOP_GRACE_SECONDS> <id>``
     (target is the instance's ``id``, never its ``name`` — skipped under
     ``dry_run=True``, enumeration/inspection still happens, nothing is
-    stopped); (4) call :func:`find_partgraph_instances` AGAIN (verification
-    re-enumeration) to populate ``survivors`` (by NAME, for display).
+    stopped; an "UNKNOWN"-classified instance is NEVER a stop target here
+    either, same as S3 — Gate 5 finding A); (4) call
+    :func:`find_partgraph_instances` AGAIN (verification re-enumeration) to
+    populate ``survivors`` (by NAME, for display) AND ``undetermined``: the
+    names of every instance STILL classified "UNKNOWN" in THIS final pass
+    (Gate 5 finding A) — an inspect failure confined to phase 3 alone never
+    reaches ``undetermined``; only phase 4's verdict does.
     ``probe_health`` defaults to a lazy import of
     :func:`partgraph.util.health.probe_health` when ``None``; the injected
     seam is how `partgraph.cli`'s ALREADY module-level-imported
@@ -239,6 +264,32 @@ def _mounts(*volume_names: str, destination: str = "/dgraph") -> list[dict]:
     ]
 
 
+def _docker_ports_string(*host_ports: int, container_port: int = 8080,
+                          protocol: str = "tcp", host_ip: str = "0.0.0.0") -> str:
+    """Build a Docker-style comma-joined `Ports` string, e.g.
+    "0.0.0.0:8081->8080/tcp, 0.0.0.0:9081->8080/tcp" — mirrors the EXACT
+    shape `docker ps --format json` reports (Gate 5 finding B), distinct
+    from podman's `list[dict]` shape `_ps_row` builds by default.
+    """
+    return ", ".join(f"{host_ip}:{p}->{container_port}/{protocol}" for p in host_ports)
+
+
+def _ps_row_with_ports_field(container_id: str, name: str, image: str, *,
+                              state: str = "running", ports_field: object) -> dict:
+    """Like `_ps_row`, but with an EXPLICIT, already-shaped `Ports` value —
+    a Docker-style string, a malformed string, or an empty string (Gate 5
+    finding B; podman's `list[dict]` shape is already covered by `_ps_row`
+    itself).
+    """
+    return {
+        "Id": container_id,
+        "Names": [name],
+        "Image": image,
+        "State": state,
+        "Ports": ports_field,
+    }
+
+
 class _Proc:
     """Minimal stand-in for subprocess.CompletedProcess."""
 
@@ -282,6 +333,7 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
     stop_returncode: int = 0,
     stop_fails_ids: frozenset[str] = frozenset(),
     ps_raises_on_call_index: int | None = None,
+    inspect_fails_ids_by_pass: dict[int, frozenset[str]] | None = None,
 ):
     """Return (fake_run, calls) — a STATEFUL subprocess.run stand-in.
 
@@ -295,9 +347,18 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
     3a-M6). ``ps_stdout_override`` lets a test replace the ps response body
     verbatim (empty string / malformed text / an oversized payload) for
     every ps call. ``calls`` records every (argv, kwargs) pair in order.
+
+    ``inspect_fails_ids_by_pass`` (Gate 5 finding A) maps a 1-indexed `ps`
+    PASS NUMBER (1 = the first `find_partgraph_instances()` call a test
+    makes — e.g. `stop_all()`'s pre-stop sweep; 2 = a SECOND call — e.g.
+    `stop_all()`'s verification re-enumeration) to the set of container ids
+    whose `container inspect` call should FAIL (non-zero exit) during that
+    specific pass, so "fails on both passes" vs "only during verification"
+    vs "only during the pre-stop sweep" are all independently scriptable.
     """
     mounts_by_id = mounts_by_id or {}
     unit_lines = unit_lines if unit_lines is not None else _UNIT_NOT_FOUND_LINES
+    inspect_fails_ids_by_pass = inspect_fails_ids_by_pass or {}
     live: dict[str, dict] = {row["Id"]: row for row in initial_rows}
     calls: list[tuple[list[str], dict]] = []
     ps_call_count = 0
@@ -311,6 +372,9 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
             return _Proc(returncode=0)
         if _is_inspect_call(argv):
             cid = argv[-1]
+            failing_ids = inspect_fails_ids_by_pass.get(ps_call_count, frozenset())
+            if cid in failing_ids:
+                return _Proc(returncode=1, stderr="inspect failed")
             return _Proc(stdout=json.dumps([{"Id": cid, "Mounts": mounts_by_id.get(cid, [])}]))
         if _is_ps_call(argv):
             ps_call_count += 1
@@ -396,7 +460,8 @@ def test_dataclasses_are_frozen_with_exact_contract_fields() -> None:
     Then each exposes EXACTLY its pinned field set and is frozen (a consumer
     cannot mutate a result after the fact — mirrors HealthResult).
     Instance's field set includes ``id`` (Gate 3a finding 3a-H1) alongside
-    the display-only ``name``.
+    the display-only ``name``. DownResult's field set includes
+    ``undetermined`` (Gate 5 finding A) alongside the existing ``survivors``.
     """
     instance = Instance(
         id="cid-abc123", name="partgraph-dgraph", image="dgraph/standalone:v25.3.4",
@@ -418,11 +483,11 @@ def test_dataclasses_are_frozen_with_exact_contract_fields() -> None:
 
     result = DownResult(
         stopped=(), skipped_foreign_port_holders=(), unit_stopped=False,
-        survivors=(), still_serving_health=False,
+        survivors=(), still_serving_health=False, undetermined=(),
     )
     assert {f.name for f in dataclasses.fields(result)} == {
         "stopped", "skipped_foreign_port_holders", "unit_stopped",
-        "survivors", "still_serving_health",
+        "survivors", "still_serving_health", "undetermined",
     }
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.unit_stopped = True  # type: ignore[misc]
@@ -633,6 +698,166 @@ def test_parse_ps_row_missing_id_excluded_not_crashed() -> None:
     )
     for argv, _kwargs in calls:
         assert "nameless-id-row" not in argv
+
+
+# ---------------------------------------------------------------------------
+# [Gate 5 Finding B] Docker's `Ports` shape (a comma-joined string, e.g.
+# "0.0.0.0:8081->8081/tcp") must parse IDENTICALLY to podman's `list[dict]`
+# shape. `_row_ports` only handled the podman shape, so S3 silently never
+# fired on a Docker engine — mirrors the dual-shape coverage already given to
+# `Id`/`Names` above (Gate 3a finding 3a-H3-adjacent), now extended to
+# `Ports`.
+# ---------------------------------------------------------------------------
+
+
+def test_docker_shaped_ports_string_single_mapping_matches_podman_list_shape() -> None:
+    """Gate 5 Finding B: Given the EXACT Docker `ps --format json` shape —
+    "0.0.0.0:8081->8080/tcp" — for a container matching neither S1 nor S2,
+    and the SAME logical mapping expressed in podman's `list[dict]` shape.
+    When find_partgraph_instances() is called on each independently.
+    Then BOTH are classified S3 (holds a watched host port) identically.
+    """
+    docker_row = _ps_row_with_ports_field(
+        "id-docker", "some-other-service", "nginx:1.27.3",
+        ports_field=_docker_ports_string(8081),
+    )
+    podman_row = _ps_row("id-podman", "some-other-service", "nginx:1.27.3",
+                          host_ports=(8081,))
+
+    for row, cid in [(docker_row, "id-docker"), (podman_row, "id-podman")]:
+        fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={cid: []})
+        with patch("subprocess.run", side_effect=fake_run):
+            instances = find_partgraph_instances(engine_prefix=["docker"])
+        assert len(instances) == 1, f"{cid}: {instances!r}"
+        assert instances[0].owned_by == "S3", f"{cid}: {instances!r}"
+        assert set(instances[0].ports) == {8081}, f"{cid}: {instances!r}"
+
+
+def test_docker_shaped_ports_string_multiple_comma_separated_mappings_parsed() -> None:
+    """Gate 5 Finding B: Given a Docker-shaped `Ports` string with TWO
+    comma-separated host-port mappings — "0.0.0.0:8081->8080/tcp,
+    0.0.0.0:9081->9080/tcp".
+    When find_partgraph_instances() is called.
+    Then BOTH host ports (8081 and 9081) are extracted into Instance.ports,
+    and the container is classified S3.
+    """
+    ports_string = ", ".join(["0.0.0.0:8081->8080/tcp", "0.0.0.0:9081->9080/tcp"])
+    row = _ps_row_with_ports_field(
+        "id-multi", "some-other-service", "nginx:1.27.3", ports_field=ports_string,
+    )
+    fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={"id-multi": []})
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert set(instances[0].ports) == {8081, 9081}
+    assert instances[0].owned_by == "S3"
+
+
+def test_docker_shaped_ports_string_malformed_degrades_to_no_ports() -> None:
+    """Gate 5 Finding B: Given a `Ports` string matching neither engine's
+    real shape (garbage text).
+    When find_partgraph_instances() is called on a container matching
+    neither S1 nor S2.
+    Then it degrades to NO ports — excluded entirely, never crashes —
+    mirrors the existing "malformed row degrades to omission" philosophy
+    (Gate 3a finding 3a-H3).
+    """
+    row = _ps_row_with_ports_field(
+        "id-malformed", "some-other-service", "nginx:1.27.3",
+        ports_field="not-a-port-mapping-at-all",
+    )
+    fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={"id-malformed": []})
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert instances == (), (
+        f"a malformed Ports string must degrade to no ports, not crash: {instances!r}"
+    )
+
+
+def test_docker_shaped_ports_string_empty_degrades_to_no_ports() -> None:
+    """Gate 5 Finding B: Given an EMPTY `Ports` string (a real, common
+    Docker shape for a container publishing no ports at all).
+    When find_partgraph_instances() is called on a container matching
+    neither S1 nor S2.
+    Then it degrades to no ports, excluded entirely, never crashes.
+    """
+    row = _ps_row_with_ports_field(
+        "id-empty-ports", "some-other-service", "nginx:1.27.3", ports_field="",
+    )
+    fake_run, _calls = _make_scripted_run(initial_rows=[row], mounts_by_id={"id-empty-ports": []})
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert instances == ()
+
+
+def test_podman_list_shaped_ports_still_work_unchanged() -> None:
+    """Gate 5 Finding B (regression pin): Given the ORIGINAL podman
+    `list[dict]` `Ports` shape, unchanged, for a container matching
+    neither S1 nor S2, holding a watched port.
+    When find_partgraph_instances() is called.
+    Then it is STILL classified S3 — the Docker-string fix must not break
+    the podman shape that already worked.
+    """
+    row = _ps_row("id-podman-still-ok", "some-other-service", "nginx:1.27.3",
+                   host_ports=(9081,))
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row], mounts_by_id={"id-podman-still-ok": []},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert instances[0].owned_by == "S3"
+    assert set(instances[0].ports) == {9081}
+
+
+def test_docker_shaped_ports_on_s1_container_does_not_change_classification() -> None:
+    """Gate 5 Finding B: Given a container named EXACTLY
+    PARTGRAPH_CONTAINER_NAME (S1) that ALSO publishes a Docker-shaped
+    `Ports` string.
+    When find_partgraph_instances() is called.
+    Then it is still classified S1 — ports never override name-based
+    ownership, regardless of the `Ports` field's shape.
+    """
+    row = _ps_row_with_ports_field(
+        "id-s1-docker-ports", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4",
+        ports_field=_docker_ports_string(8081, 9081, 8001),
+    )
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row], mounts_by_id={"id-s1-docker-ports": []},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert instances[0].owned_by == "S1"
+    assert set(instances[0].ports) == {8081, 9081, 8001}
+
+
+def test_docker_shaped_ports_on_s2_container_does_not_change_classification() -> None:
+    """Gate 5 Finding B: Given a container with an ARBITRARY name that
+    mounts the PartGraph data volume (S2) and ALSO publishes a Docker-shaped
+    `Ports` string.
+    When find_partgraph_instances() is called.
+    Then it is still classified S2 — ports never override volume-mount
+    ownership, regardless of the `Ports` field's shape.
+    """
+    row = _ps_row_with_ports_field(
+        "id-s2-docker-ports", "systemd-partgraph-dgraph-duplicate",
+        "dgraph/standalone:v25.3.4", ports_field=_docker_ports_string(8081),
+    )
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row],
+        mounts_by_id={"id-s2-docker-ports": _mounts(PARTGRAPH_DATA_VOLUME)},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert instances[0].owned_by == "S2"
 
 
 # ---------------------------------------------------------------------------
@@ -1239,6 +1464,177 @@ def test_stop_all_survivor_and_verification_end_to_end() -> None:
     assert "systemd-partgraph-dgraph-duplicate" not in result.stopped
     assert "systemd-partgraph-dgraph-duplicate" in result.survivors
     assert PARTGRAPH_CONTAINER_NAME not in result.survivors
+
+
+# ---------------------------------------------------------------------------
+# [Gate 5 Finding A] An `inspect` failure must never silently manufacture a
+# clean result. `Instance.owned_by` gains a FOURTH tag, "UNKNOWN", for a row
+# that is not S1 (name mismatch) and whose volume-mount status could not be
+# determined (the `container inspect` call failed) — checked BEFORE the port
+# test, so an undetermined mount status is NEVER confidently downgraded to
+# "just a port holder, safe to leave" (mirrors the existing NOT_RUNNING
+# deny-list philosophy: degrade toward suspicion, never toward a silent
+# all-clear). "UNKNOWN" instances are NEVER stopped (same as S3), but
+# DownResult gains `undetermined: tuple[str, ...]` — names of instances still
+# classified UNKNOWN in the FINAL verification pass ONLY (an inspect failure
+# confined to the pre-stop sweep alone is NOT fatal — "do not over-fire",
+# mirrors A12's phase-1 absorption).
+# ---------------------------------------------------------------------------
+
+
+def test_inspect_failure_on_non_s1_row_yields_unknown_not_silent_exclusion() -> None:
+    """Gate 5 Finding A: Given a container whose name does NOT match S1 and
+    holds no watched port, whose `container inspect` call FAILS (non-zero
+    exit).
+    When find_partgraph_instances() is called.
+    Then the row is NOT silently excluded — it is returned with
+    owned_by == "UNKNOWN", never silently dropped as if unrelated.
+    """
+    row = _ps_row("id-maybe", "maybe-partgraph-duplicate", "dgraph/standalone:v25.3.4")
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row],
+        inspect_fails_ids_by_pass={1: frozenset({"id-maybe"})},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1, (
+        f"an inspect failure must not silently exclude the row: {instances!r}"
+    )
+    assert instances[0].id == "id-maybe"
+    assert instances[0].owned_by == "UNKNOWN"
+
+
+def test_inspect_failure_on_row_holding_watched_port_still_unknown_not_s3() -> None:
+    """Gate 5 Finding A: Given a container that ALSO holds a watched port
+    (8081) but whose `inspect` call fails.
+    When find_partgraph_instances() is called.
+    Then it is classified UNKNOWN, NOT S3 — an undetermined volume-mount
+    status must never be confidently downgraded to "just a port holder,
+    safe to leave"; S3 is reserved for containers POSITIVELY confirmed not
+    to mount our volume.
+    """
+    row = _ps_row("id-maybe-port", "maybe-partgraph-duplicate", "dgraph/standalone:v25.3.4",
+                   host_ports=(8081,))
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row],
+        inspect_fails_ids_by_pass={1: frozenset({"id-maybe-port"})},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        instances = find_partgraph_instances(engine_prefix=["docker"])
+
+    assert len(instances) == 1
+    assert instances[0].owned_by == "UNKNOWN"
+
+
+def test_stop_all_inspect_fails_both_passes_s2_only_container_marks_undetermined() -> None:
+    """Gate 5 Finding A: Given a container that WOULD classify S2 if inspect
+    succeeded (an "S2-only-named" duplicate — not S1 by name, no watched
+    port), but its `container inspect` call FAILS on BOTH the pre-stop
+    sweep AND the verification pass.
+    When stop_all() runs.
+    Then DownResult.undetermined contains its name — `db down` must NEVER
+    report clean success (empty survivors) while a possibly-still-running
+    PartGraph instance's ownership could not be verified.
+    """
+    row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4")
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row],
+        inspect_fails_ids_by_pass={1: frozenset({"cid-maybe"}), 2: frozenset({"cid-maybe"})},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        result = stop_all(
+            engine_prefix=["docker"], compose_down=lambda: None,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
+
+    assert "systemd-partgraph-dgraph-maybe" in result.undetermined, (
+        f"an inspect failure on both passes must mark the container "
+        f"undetermined, never silently clean: {result!r}"
+    )
+    assert "systemd-partgraph-dgraph-maybe" not in result.stopped
+    assert "systemd-partgraph-dgraph-maybe" not in result.survivors
+
+
+def test_stop_all_inspect_fails_only_during_verification_marks_undetermined() -> None:
+    """Gate 5 Finding A: Given the SAME S2-only-named container, but inspect
+    SUCCEEDS during the pre-stop sweep (correctly classified S2, and a
+    `stop` IS attempted) yet FAILS again during the verification pass (a
+    transient re-failure — `ps --all` may still list it and its ownership
+    can no longer be confirmed).
+    When stop_all() runs.
+    Then DownResult.undetermined contains its name — a verification-pass
+    inspect failure alone is enough to withhold a clean result, regardless
+    of what the pre-stop sweep saw.
+    """
+    row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4")
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row],
+        mounts_by_id={"cid-maybe": _mounts(PARTGRAPH_DATA_VOLUME)},
+        inspect_fails_ids_by_pass={2: frozenset({"cid-maybe"})},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        result = stop_all(
+            engine_prefix=["docker"], compose_down=lambda: None,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
+
+    assert "systemd-partgraph-dgraph-maybe" in result.undetermined, (
+        f"a verification-pass-only inspect failure must still withhold a "
+        f"clean result: {result!r}"
+    )
+
+
+def test_stop_all_inspect_fails_only_during_pre_stop_sweep_is_not_fatal() -> None:
+    """Gate 5 Finding A (the required asymmetry — "do not over-fire"): Given
+    inspect FAILS during the pre-stop sweep for a container that, in
+    truth, does NOT mount the PartGraph volume (a transient failure only —
+    it resolves cleanly on retry), but SUCCEEDS during the verification
+    pass and reveals it mounts nothing of ours.
+    When stop_all() runs.
+    Then DownResult.undetermined is EMPTY — a pre-stop-sweep-only inspect
+    failure, on its own, is NOT fatal: only the verification pass decides
+    the exit code (mirrors A12's phase-1 absorption).
+    """
+    row = _ps_row("cid-unrelated", "totally-unrelated-service", "nginx:1.27.3")
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row],
+        mounts_by_id={"cid-unrelated": []},
+        inspect_fails_ids_by_pass={1: frozenset({"cid-unrelated"})},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        result = stop_all(
+            engine_prefix=["docker"], compose_down=lambda: None,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
+
+    assert result.undetermined == (), (
+        "a pre-stop-sweep-only inspect failure must not, by itself, mark "
+        f"anything undetermined once verification succeeds: {result!r}"
+    )
+    assert result.survivors == ()
+
+
+def test_stop_all_inspect_succeeds_everywhere_undetermined_stays_empty() -> None:
+    """Gate 5 Finding A (the happy path must stay clean): Given a normal S1
+    survivor and inspect succeeding on every call.
+    When stop_all() runs its full sweep + verification.
+    Then DownResult.undetermined is EMPTY — adding this new field must never
+    make an already-clean run noisier.
+    """
+    row = _ps_row("cid-1", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row], mounts_by_id={"cid-1": []},
+    )
+    with patch("subprocess.run", side_effect=fake_run):
+        result = stop_all(
+            engine_prefix=["docker"], compose_down=lambda: None,
+            probe_health=lambda: SimpleNamespace(healthy=False),
+        )
+
+    assert result.undetermined == ()
+    assert result.survivors == ()
+    assert PARTGRAPH_CONTAINER_NAME in result.stopped
 
 
 # ---------------------------------------------------------------------------

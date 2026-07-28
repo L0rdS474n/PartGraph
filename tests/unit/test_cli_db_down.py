@@ -43,8 +43,24 @@ original design before partgraph.util.health existed):
     (`stopped`/`survivors`/`skipped_foreign_port_holders`) still carry
     NAMES — display-only, never the ids used as engine `stop` targets.
   - Exit-code formula: `result.survivors` non-empty -> exit 1 (A8); else if
+    `result.undetermined` non-empty -> exit 1 with a message DISTINCT from
+    the survivor one (Gate 5 finding A, below); else if
     `result.still_serving_health` -> exit 0 + one advisory stderr line (A9);
     else exit 0. `--dry-run` always exits 0.
+
+Gate 5 finding A amendment (pinned RED here at commit b96be7c; the leaf-level
+`Instance.owned_by == "UNKNOWN"` / `DownResult.undetermined` contract this is
+built on is pinned in tests/unit/test_lifecycle.py, not re-derived here): a
+`container inspect` failure during the VERIFICATION pass, for a container not
+already resolved as S1 (by name) or S3 (by port), must never silently make
+`db down` claim clean success — that container's ownership is UNDETERMINED,
+not "confirmed absent". `db down` prints a single, path-free line containing
+the phrase "could not verify" (deliberately NOT containing "still running",
+so it can never be confused with the A8 survivor message) and exits 1. A
+`container inspect` failure during the PRE-stop sweep ALONE — one that
+resolves cleanly by the time verification runs — is explicitly NOT fatal
+(mirrors A12's phase-1 absorption): only the verification pass decides the
+exit code.
 
 HERMETICITY (HARD CONSTRAINT): every test in this file patches ONLY
 `subprocess.run`, `partgraph.cli.compose_command`, `partgraph.cli.
@@ -167,6 +183,7 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
     stop_fails_ids: frozenset[str] = frozenset(),
     systemctl_stop_raises: Exception | None = None,
     ps_raises_on_call_index: int | None = None,
+    inspect_fails_ids_by_pass: dict[int, frozenset[str]] | None = None,
 ):
     """Return (fake_run, calls) — a STATEFUL subprocess.run replacement.
 
@@ -177,9 +194,18 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
     order for ordering/timeout/argv assertions. The engine `stop` TARGET
     (``argv[-1]``) is always a container ID (Gate 3a finding 3a-H1) —
     ``stop_fails_ids``/removal-from-``live`` are keyed by id, never by name.
+
+    ``inspect_fails_ids_by_pass`` (Gate 5 finding A) maps a 1-indexed `ps`
+    PASS NUMBER (1 = the pre-stop sweep's enumeration, 2 = the verification
+    re-enumeration — `stop_all()` calls `find_partgraph_instances()` exactly
+    twice, in that order) to the set of container ids whose `container
+    inspect` call should FAIL (non-zero exit) during that specific pass —
+    so "inspect fails on both passes" vs "only during verification" vs
+    "only during the pre-stop sweep" are all independently scriptable.
     """
     mounts_by_id = mounts_by_id or {}
     unit_lines = unit_lines if unit_lines is not None else _UNIT_NOT_FOUND_LINES
+    inspect_fails_ids_by_pass = inspect_fails_ids_by_pass or {}
     live: dict[str, dict] = {row["Id"]: row for row in initial_rows}
     calls: list[tuple[list[str], dict]] = []
     ps_call_count = 0
@@ -203,6 +229,9 @@ def _make_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptabl
             return _Proc(returncode=compose_returncode)
         if _is_inspect_call(argv):
             cid = argv[-1]
+            failing_ids = inspect_fails_ids_by_pass.get(ps_call_count, frozenset())
+            if cid in failing_ids:
+                return _Proc(returncode=1, stderr="inspect failed")
             return _Proc(stdout=json.dumps([{"Id": cid, "Mounts": mounts_by_id.get(cid, [])}]))
         if _is_ps_call(argv):
             ps_call_count += 1
@@ -671,6 +700,138 @@ def test_a9_verification_empty_but_health_still_200_exit_zero_with_advisory() ->
         f"expected exactly one advisory line about an unowned port responder, "
         f"got: {result.output!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# [Gate 5 Finding A] An `inspect` failure during verification must never
+# silently forge a clean `db down`. Pins the CLI-boundary exit-code/message
+# contract; see tests/unit/test_lifecycle.py for the leaf-level
+# `Instance.owned_by == "UNKNOWN"` / `DownResult.undetermined` contract this
+# is built on.
+# ---------------------------------------------------------------------------
+
+
+def test_finding_a_inspect_fails_both_passes_exit_nonzero_undetermined_message() -> None:
+    """Gate 5 Finding A: Given an S2-only-named container (name != S1, holds
+    no watched port) whose `container inspect` call FAILS on BOTH the
+    pre-stop sweep AND the verification pass.
+    When `partgraph db down` runs.
+    Then the exit code is 1, and some output line names the container AND
+    contains the phrase "could not verify" — deliberately NOT containing
+    "still running", so the message is textually distinguishable from the
+    A8 survivor message — and that line is path-free.
+    """
+    row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4")
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row],
+        inspect_fails_ids_by_pass={1: frozenset({"cid-maybe"}), 2: frozenset({"cid-maybe"})},
+    )
+    with (
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "down"])
+
+    assert result.exit_code == 1, result.output
+    named_lines = [
+        ln for ln in result.output.splitlines()
+        if "systemd-partgraph-dgraph-maybe" in ln
+    ]
+    assert named_lines, f"the undetermined container's name was not found in any output line:\n{result.output}"
+    for ln in named_lines:
+        assert "could not verify" in ln.lower(), f"line does not name the failure mode: {ln!r}"
+        assert "still running" not in ln.lower(), (
+            f"the undetermined message must be textually distinct from the "
+            f"survivor (A8) message: {ln!r}"
+        )
+        assert "/" not in ln, f"line leaks a path: {ln!r}"
+
+
+def test_finding_a_inspect_fails_only_verification_pass_exit_nonzero() -> None:
+    """Gate 5 Finding A: Given the SAME S2-only-named container, but inspect
+    SUCCEEDS during the pre-stop sweep (correctly classified S2, so a
+    `stop` IS attempted) and FAILS only during the verification pass.
+    When `partgraph db down` runs.
+    Then the exit code is still 1 with the same "could not verify" message
+    — a verification-pass-only failure is sufficient on its own to
+    withhold a clean result.
+    """
+    row = _ps_row("cid-maybe", "systemd-partgraph-dgraph-maybe", "dgraph/standalone:v25.3.4")
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row],
+        mounts_by_id={"cid-maybe": _mounts(PARTGRAPH_DATA_VOLUME)},
+        inspect_fails_ids_by_pass={2: frozenset({"cid-maybe"})},
+    )
+    with (
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "down"])
+
+    assert result.exit_code == 1, result.output
+    assert "systemd-partgraph-dgraph-maybe" in result.output
+    assert "could not verify" in result.output.lower()
+
+
+def test_finding_a_inspect_fails_only_pre_stop_sweep_not_fatal_exit_zero() -> None:
+    """Gate 5 Finding A (the required asymmetry — "do not over-fire"): Given
+    inspect FAILS only during the pre-stop sweep, for a container that in
+    truth mounts nothing of PartGraph's, and SUCCEEDS during the
+    verification pass (revealing it is genuinely unrelated).
+    When `partgraph db down` runs.
+    Then the exit code is 0 — a pre-stop-sweep-only inspect failure must
+    NOT, by itself, make `db down` fail; only the verification pass
+    decides the exit code (mirrors A12's phase-1 absorption).
+    """
+    row = _ps_row("cid-unrelated", "totally-unrelated-service", "nginx:1.27.3")
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row],
+        mounts_by_id={"cid-unrelated": []},
+        inspect_fails_ids_by_pass={1: frozenset({"cid-unrelated"})},
+    )
+    with (
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "down"])
+
+    assert result.exit_code == 0, result.output
+    assert "could not verify" not in result.output.lower()
+
+
+def test_finding_a_inspect_succeeds_everywhere_clean_exit_zero_no_new_noise() -> None:
+    """Gate 5 Finding A (the happy path must stay clean): Given a normal
+    single S1 instance and inspect succeeding on every call.
+    When `partgraph db down` runs.
+    Then the exit code is 0 and the output never mentions "could not
+    verify" or "undetermined" — the new indeterminate-ownership machinery
+    must never leak noise into an already-clean run.
+    """
+    row = _ps_row("cid-1", PARTGRAPH_CONTAINER_NAME, "dgraph/standalone:v25.3.4")
+    fake_run, _calls = _make_scripted_run(
+        initial_rows=[row], mounts_by_id={"cid-1": []}, compose_removes_ids=frozenset(),
+    )
+    with (
+        patch("partgraph.cli.compose_command", return_value=["docker", "compose"]),
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "down"])
+
+    assert result.exit_code == 0, result.output
+    assert "could not verify" not in result.output.lower()
+    assert "undetermined" not in result.output.lower()
 
 
 # ---------------------------------------------------------------------------
