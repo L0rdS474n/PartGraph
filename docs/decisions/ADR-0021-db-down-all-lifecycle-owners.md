@@ -235,6 +235,62 @@ data volume — and therefore every ingested part — always survives a `db down
 Compose's own `down` still removes the containers Compose created; that is
 Compose's behaviour, not an additional verb PartGraph issues.
 
+### 7a. A shutdown budget Dgraph can actually meet
+
+`stop` is only the *right* verb if the container is given long enough to act on
+the SIGTERM it implies. It was not. `STOP_GRACE_SECONDS` was **10**, and
+`docker/docker-compose.yml` declared no `stop_grace_period` at all — which means
+it inherited Compose's own 10s default. So nowhere in PartGraph did Dgraph get
+more than ten seconds to shut down.
+
+**The evidence.** The journal on this host recorded, after a 14-hour run:
+
+> `StopSignal SIGTERM failed to stop container partgraph-dgraph in 10 seconds,
+> resorting to SIGKILL`
+
+with the unit exiting **137**. A short-lived instance shut down cleanly inside
+the same window, so the failure is **load-dependent**: the longer Dgraph has
+run, the more it has to flush. Badger's write-ahead log meant **no data was
+lost** — 613,396 `Part` nodes verified intact afterwards — so this is about
+**shutdown correctness and restart cost, not data integrity**. A database that
+is routinely SIGKILLed still pays for it in recovery work on the next start.
+
+**The decision.** `STOP_GRACE_SECONDS` is raised to **60**, and
+`docker/docker-compose.yml`'s `dgraph` service now declares
+`stop_grace_period: 60s` so a Compose-started instance gets the identical
+window. A unit test imports the constant directly rather than re-declaring the
+number, so the two pins cannot silently drift apart.
+
+**60 is a judgement call, not a measurement.** The evidence establishes only
+*"more than 10, and more the longer it has run"*. It does **not** establish a
+sufficient bound — nobody measured how long a 14-hour Dgraph actually needs, and
+a busier or larger instance may still exceed 60. Six times the disproven value
+is a deliberate safety factor chosen because the trade is so lopsided for a
+local tool: a slower `db down` costs a human a few seconds of waiting, while a
+premature SIGKILL costs recovery work on a multi-GB store. Read this number as
+"comfortably past the value we proved wrong", not as a measured minimum.
+
+`STOP_TIMEOUT_S` rises with it, to **90.0** — a 30-second margin. The Python
+watchdog must not fire before the engine has finished waiting out its own grace
+period, or the graceful path is destroyed one layer higher up and reported as a
+failed stop. The engine needs the full 60s, *then* SIGKILL, *then* container
+teardown, and a multi-GB Badger store does not unmount instantly. The margin is
+three times the minimum the tests enforce because the two failure directions are
+not symmetric: too small destroys a healthy-but-slow shutdown, too large only
+delays the report of an already-wedged engine.
+
+**HONESTY BOUNDARY — what this does NOT cover.** This budget reaches only the
+lifecycle paths PartGraph owns directly: this module's own engine `stop` sweep
+and Compose. It does **not** reach the quadlet path. When `stop_all` stops
+`partgraph-dgraph.service`, that unit's own `ExecStop=podman rm -v -f` applies
+whatever stop timeout was baked into the container at quadlet-generation time,
+and nothing in this repository can influence it. Raising that ceiling requires a
+host-side `StopTimeout=` drop-in, which is **PR-B1** work and is deliberately
+out of scope here. A test now pins that the `systemctl` argv never carries our
+grace value at all, precisely so this claim cannot silently rot into an implied
+guarantee. `db down` does not promise a graceful shutdown in every case — only
+that the two paths PartGraph does control now share a load-tolerant budget.
+
 ### 8. Untrusted engine output is validated at the boundary
 
 - Container names **and** IDs must match a **positive allow-list** — the
@@ -406,8 +462,12 @@ shrinks when a `stop` succeeds, so "was stopped" and "survived the stop" are
 distinguishable rather than a static snapshot.
 
 `tests/unit/test_lifecycle.py` (leaf contract) pins: the frozen constants and
-their compose-file agreement; finite positive timeouts and
-`STOP_TIMEOUT_S > STOP_GRACE_SECONDS`; a positive `MAX_PS_OUTPUT_BYTES` and
+their compose-file agreement; finite positive timeouts, `STOP_GRACE_SECONDS ==
+60`, and a watchdog margin `STOP_TIMEOUT_S - STOP_GRACE_SECONDS >= 10.0` (a
+bare "greater than" would not do); that the engine stop argv's `-t` value is
+read from the constant rather than written as a literal, and that the
+`systemctl` argv never carries it (§ 7a's honesty boundary, mechanically
+pinned); a positive `MAX_PS_OUTPUT_BYTES` and
 oversized-output rejection *without* decoding; frozen dataclass field sets;
 identical parsing of the JSON-array and NDJSON envelopes; per-row degradation
 for missing `Names`, empty `Names`, non-dict elements and missing `Id`; S1
@@ -448,6 +508,11 @@ the sweep still execute; both `compose_command()` and `engine_command()` raising
 container name never reaching any argv; every call carrying a bounded timeout
 and a hung `ps` exiting cleanly instead of hanging; and `--dry-run` mutating
 nothing while printing both the would-stop set and the report-only set.
+
+`tests/unit/test_docker_compose.py` pins the compose side of § 7a: the `dgraph`
+service must declare a `stop_grace_period` that normalises to
+`STOP_GRACE_SECONDS`, which it **imports** rather than re-declaring, so the
+Compose budget and the engine-sweep budget cannot drift apart.
 
 `tests/integration/test_gate_pr7.py` (marked `integration`) re-derives the
 must-not-touch set from a live read-only scan and asserts a real `db down`

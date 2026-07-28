@@ -125,18 +125,48 @@ ENUMERATE_TIMEOUT_S = 15.0
 #: Watchdog for one ``<engine> container inspect`` call.
 INSPECT_TIMEOUT_S = 10.0
 
-#: Watchdog for one ``<engine> stop`` call. Deliberately larger than
-#: :data:`STOP_GRACE_SECONDS`, so the Python side never aborts before the
-#: engine's own grace period has elapsed.
-STOP_TIMEOUT_S = 45.0
+#: Watchdog for one ``<engine> stop`` call. Must exceed
+#: :data:`STOP_GRACE_SECONDS` by a MEANINGFUL margin, not merely be greater
+#: than it: the engine first waits out its own grace period, then sends
+#: SIGKILL, then still has to tear the container down and reap it — and a
+#: multi-GB Badger store does not unmount instantly. If this watchdog fired
+#: first, Python would abort the call mid-shutdown and the graceful path would
+#: be lost anyway, just one layer higher up. The 30s margin is deliberately
+#: three times the minimum the test suite enforces: the two failure modes are
+#: not symmetric. Too small, and a healthy-but-slow shutdown is destroyed and
+#: misreported; too large, and a genuinely wedged engine merely takes longer to
+#: be reported by a foreground command a human just typed.
+STOP_TIMEOUT_S = 90.0
 
 #: Watchdog for one ``systemctl --user`` call (show or stop).
 SYSTEMCTL_TIMEOUT_S = 20.0
 
 #: The engine's OWN ``-t`` grace period, in seconds: how long the container
-#: gets to shut down cleanly before the engine escalates. Distinct from the
-#: Python-level subprocess watchdog :data:`STOP_TIMEOUT_S` above.
-STOP_GRACE_SECONDS = 10
+#: gets to shut down cleanly before the engine escalates to SIGKILL. Distinct
+#: from the Python-level subprocess watchdog :data:`STOP_TIMEOUT_S` above.
+#:
+#: Raised from 10 after live journal evidence on this host disproved that
+#: budget: following a 14-hour run, ``StopSignal SIGTERM failed to stop
+#: container partgraph-dgraph in 10 seconds, resorting to SIGKILL`` (unit exit
+#: status 137). A short-lived instance shut down cleanly in the same window, so
+#: the failure is LOAD-dependent — the longer Dgraph has run, the more it has to
+#: flush. Badger's write-ahead log meant no data was lost (613,396 Part nodes
+#: verified intact afterwards), so this is about shutdown correctness and
+#: restart cost, not data integrity.
+#:
+#: 60 is a JUDGEMENT CALL, not a measurement. The evidence establishes only
+#: "more than 10, and more the longer it has run"; it does not establish a
+#: sufficient bound. Six times the disproven value is a deliberate safety factor
+#: for a local tool where a slower ``db down`` costs nothing.
+#:
+#: HONESTY BOUNDARY: this budget reaches only the lifecycle paths PartGraph owns
+#: — this module's own engine ``stop`` sweep and Compose (whose matching
+#: ``stop_grace_period`` in docker/docker-compose.yml is pinned against THIS
+#: constant, so the two cannot drift). It does NOT reach the quadlet path: that
+#: unit's own ``ExecStop=podman rm -v -f`` uses the stop timeout baked into the
+#: container at generation time, which this repo cannot influence. Raising that
+#: ceiling needs a host-side ``StopTimeout=`` drop-in (PR-B1).
+STOP_GRACE_SECONDS = 60
 
 #: Finite ceiling (4 MiB) on how much ``ps`` stdout the parser will even
 #: attempt to decode. Output at or beyond this bound is treated as malformed

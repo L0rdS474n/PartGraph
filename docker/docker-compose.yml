@@ -18,6 +18,18 @@ services:
     # match a foreign container (e.g. a cve-graph stack on the same machine).
     container_name: partgraph-dgraph
     restart: unless-stopped
+    # Shutdown budget. Compose's own default is 10s, and live evidence on this
+    # machine disproved it: after a 14h run, SIGTERM failed to stop the
+    # container within 10s and the engine escalated to SIGKILL (exit 137). The
+    # failure is load-dependent — the longer Dgraph runs, the more it flushes.
+    # Badger's WAL meant nothing was lost, but SIGKILL is not the intended
+    # shutdown path and costs recovery work on the next start. This value MUST
+    # equal partgraph.util.lifecycle.STOP_GRACE_SECONDS, which is the same
+    # budget PartGraph's own engine `stop` sweep passes as `-t`; a unit test
+    # imports that constant and fails if the two ever drift apart. 60 is a
+    # judgement call informed by "10 is proven insufficient", not a measured
+    # minimum (ADR-0021).
+    stop_grace_period: 60s
     ports:
       # host_ip:host_port:container_port — host ports are offset by +1 because
       # 8080/9080 are reserved by other local stacks on this machine.
