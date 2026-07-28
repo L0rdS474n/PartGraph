@@ -87,9 +87,12 @@ Verify it took effect — the same read-only command as before:
 $ partgraph db doctor
 ```
 
-The `Autostart at login (WantedBy=default.target):` line should no longer say
-`yes`. If it says `unknown`, systemd gave no evidence either way; check the unit
-by hand with `systemctl --user show partgraph-dgraph.service --property=WantedBy`.
+The `Autostart at login (WantedBy=default.target):` line should now say `no`:
+the drop-in leaves `WantedBy=` present and empty, and an empty `WantedBy=` on a
+loaded unit is systemd stating that nothing wants it. If it still says `yes`,
+the drop-in did not take effect. If it says `unknown`, systemd gave no evidence
+either way; check the unit by hand with
+`systemctl --user show partgraph-dgraph.service --property=WantedBy`.
 
 Stopping autostart does **not** stop a database that is running right now. Run
 `partgraph db down` for that; the named data volume is never removed.
