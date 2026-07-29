@@ -465,6 +465,65 @@ def test_dql_builder_limit_cap_enforced() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# AC-LM-7 — RULING: the low-end `max(1, ...)` clamp in build_search_dql
+# (dql_builder.py:557, `first = max(1, min(int(limit), MAX_RESULT_LIMIT))`)
+# stays, unchanged, even after `partgraph search`'s CLI layer starts
+# rejecting a non-positive --limit (see tests/unit/test_cli_search.py,
+# AC-LM-1..6).
+#
+# Ruling: build_search_dql is a PUBLIC function of partgraph.query.dql_builder,
+# not a private CLI helper — nothing in its signature or docstring restricts
+# callers to the `search` Typer command. Rejecting `search --limit 0` at the
+# CLI boundary (ADR-0024) is a UX/contract decision about ONE caller; it does
+# not, and must not, remove the builder's own defense-in-depth against a
+# non-positive `first:` clause for every OTHER caller (a future library
+# consumer -- no command outside `search` calls it today (ADR-0024 says so
+# without going through _validate_limit, or a Python caller that never sees
+# a Typer/Click option at all and could pass any int, including 0 or
+# negative, straight through). Removing the clamp is a SEPARATE decision
+# from "make the CLI reject the input" and is explicitly NOT made by this
+# fix. Confirmed via `grep`: no existing test in this file pinned the
+# low-end clamp before this test was added (only the upper
+# MAX_RESULT_LIMIT=200 cap was pinned, by test_dql_builder_limit_cap_enforced
+# above) — so this test is the first to lock the low-end behaviour in place.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -5, -999])
+def test_dql_builder_non_positive_limit_stays_clamped_to_one_defense_in_depth(
+    bad_limit: int,
+) -> None:
+    """AC-LM-7: Given a ParsedQuery and build_search_dql(parsed, limit=N) for
+    N <= 0 (0, -1, -5, -999), called DIRECTLY — bypassing the CLI and
+    `_validate_limit` entirely, the way a non-CLI caller of this public
+    function would.
+    When build_search_dql is called.
+    Then it does NOT raise, and every 'first: N' clause in the query text is
+    'first: 1' (the existing `max(1, ...)` floor, unchanged).
+
+    RULING (see the block comment above this test): this low-end clamp is
+    intentionally KEPT as defense-in-depth for callers other than the CLI.
+    Making `partgraph search --limit 0` exit 1 (AC-LM-1) is a CLI-boundary
+    contract change; it is a different objective from, and must not be
+    conflated with, removing this builder-level floor.
+    """
+    parsed = _make_parsed(text_tokens=["MAX232"])
+
+    query_text, _variables = build_search_dql(parsed, limit=bad_limit)
+
+    first_values = re.findall(r"first\s*:\s*(\d+)", query_text)
+    assert first_values, (
+        f"Expected at least one 'first: N' clause in the query text. Got:\n{query_text}"
+    )
+    for raw_val in first_values:
+        assert int(raw_val) == 1, (
+            f"AC-LM-7: build_search_dql(limit={bad_limit}) must stay clamped to "
+            f"'first: 1' (defense-in-depth for non-CLI callers), not raise and "
+            f"not emit a non-positive/zero first: clause. Got first: {raw_val} "
+            f"in:\n{query_text}"
+        )
+
+
 def test_dql_builder_float_format_locale_safe() -> None:
     """Given a ParsedQuery with resistance=10000.0 (produces 9900/10100 bounds).
     When build_search_dql is called.
