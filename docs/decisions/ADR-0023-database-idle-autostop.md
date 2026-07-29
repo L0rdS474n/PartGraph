@@ -231,6 +231,31 @@ could not record it" — two states this ADR deliberately keeps apart. A follow-
 should add the distinct tag, wire it to `touch_activity`'s existing internal
 write result, and pin it with its own test.
 
+**Resolved 2026-07-29 — the follow-up landed.** The distinct tag is
+`stamp-unrecordable` (`REASON_STAMP_UNRECORDABLE`), returned by
+`_stamp_decision` from **both** callers that share the write — the bootstrap
+path and the poison-recovery path — whenever the stamp did not land. It is
+wired to exactly the internal result this section named: `_atomic_write` already
+computed "did it land", `touch_activity` no longer discards it and now returns
+`bool` instead of `None`. `nothing-to-do` was *not* reused, keeping the two
+states this section insists on keeping apart; the boundary stays structural
+rather than a guard, because `nothing-to-do` returns from the `not db_reachable`
+branch before any write is attempted. `True` from `touch_activity` covers the
+monotonic guard's intentional "no write was needed, the record is already
+correct" no-op as a success, and `_stamp_decision` carries a comment recording
+why that case cannot reach it. Pinned by eight tests: four on
+`touch_activity`'s return value (write landed, `os.replace` failed,
+`mkdir` failed, write correctly skipped), three in `tests/unit/test_activity.py`
+on the new tag (bootstrap failure leaves no stamp on disk, poison-recovery
+failure leaves the poisoned stamp untouched, the constant is distinct from all
+seven existing tags), and one in `tests/unit/test_cli_idle_stop.py` proving
+`db idle-stop` prints the leaf's own constant and stays path-free on this
+branch. What deliberately did **not** change: the 15 `touch_activity` call
+sites in `partgraph.cli` still discard the result, exactly as they discarded
+`None` — a bookkeeping failure must still never propagate into the database
+command it is a side effect of. The failure direction is unchanged: an
+unrecordable stamp still stops nothing.
+
 ### 5. `PARTGRAPH_IDLE_TIMEOUT_MINUTES`
 
 Parsing lives in `partgraph.cli._idle_timeout_minutes()`, not in the leaf,

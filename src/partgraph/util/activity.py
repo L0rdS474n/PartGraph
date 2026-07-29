@@ -48,7 +48,10 @@ Every degradation here fails toward **not stopping**:
 - a bookkeeping failure never propagates: :func:`touch_activity` and
   :func:`acquire_lease` warn once per state directory and return, because the
   database command they are a side effect of must not crash over its own
-  telemetry.
+  telemetry. It is still never *claimed* as a success: ``touch_activity``
+  returns whether the stamp landed, and :func:`evaluate_idle` reports a write
+  that did not with its own :data:`REASON_STAMP_UNRECORDABLE` tag instead of a
+  bootstrap it never performed.
 
 The one place that fails toward *stopping* is deliberate: a stamp implausibly
 far in the future (see :data:`STAMP_FUTURE_POISON_CEILING_MINUTES`) is treated
@@ -81,6 +84,7 @@ __all__ = [
     "REASON_STALE",
     "REASON_STAMP_BOOTSTRAPPED",
     "REASON_STAMP_POISON_RECOVERED",
+    "REASON_STAMP_UNRECORDABLE",
     "REASON_UNDETERMINED_LEASE",
     "STAMP_FUTURE_POISON_CEILING_MINUTES",
     "IdleDecision",
@@ -160,6 +164,16 @@ REASON_STALE = "stale"
 REASON_NOTHING_TO_DO = "nothing-to-do"
 REASON_STAMP_BOOTSTRAPPED = "stamp-bootstrapped"
 REASON_STAMP_POISON_RECOVERED = "stamp-poison-recovered"
+
+#: The database was reachable and a stamp was owed, but the write did not land
+#: (an unwritable, root-owned or full state directory). Deliberately NOT
+#: :data:`REASON_NOTHING_TO_DO`: that tag means "the database is down, so there
+#: is nothing to protect and nothing to stop", while this one means "the
+#: database IS up and I could not record it" — the same "could not tell" versus
+#: "checked" distinction this module already refuses to collapse for leases.
+#: The boundary between the two is structural, not a guard: ``nothing-to-do``
+#: returns from the ``not db_reachable`` branch before any write is attempted.
+REASON_STAMP_UNRECORDABLE = "stamp-unrecordable"
 
 #: File names inside the state directory. The lease is scoped BY PID: a single
 #: shared lease file would let a second concurrent invocation clobber a first,
@@ -456,7 +470,7 @@ def _stamp_is_protected(existing: datetime, moment: datetime) -> bool:
 
 def touch_activity(
     *, state_dir: Path | str, now: Callable[[], datetime] | None = None
-) -> None:
+) -> bool:
     """Record that PartGraph just did real database work.
 
     Monotonic-safe within the poison ceiling (a backward clock step cannot make
@@ -467,14 +481,27 @@ def touch_activity(
 
     Never raises: a failure is warned once per state directory and returned
     from. *now* is injectable so callers and tests can pin the instant.
+
+    Returns:
+        True iff the durable record is trustworthy once this call returns —
+        either :func:`_atomic_write` reported that the stamp landed, or the
+        monotonic guard correctly skipped the write because the stamp already
+        on disk is at least as recent. That second case is a SUCCESS, not a
+        failure: "landed" here means "the record is right", never "bytes were
+        written just now". False means a write was owed, was attempted, and did
+        not land — the only state in which a caller may not claim it recorded
+        anything. Returning the boolean does not make it a raised error: every
+        caller in :mod:`partgraph.cli` is free to discard it, exactly as it
+        discarded the previous ``None``, because a bookkeeping failure must
+        never propagate into the database command it is a side effect of.
     """
     directory = Path(state_dir)
     moment = _resolve_now(now)
     existing = read_activity_stamp(directory)
     if existing is not None and _stamp_is_protected(existing, moment):
-        return
+        return True
     payload = json.dumps({_STAMP_KEY: moment.astimezone(UTC).isoformat()})
-    _atomic_write(directory, activity_stamp_path(directory), payload, kind="stamp")
+    return _atomic_write(directory, activity_stamp_path(directory), payload, kind="stamp")
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +710,10 @@ def _stamp_decision(
     routing them together means the bootstrap path is the only one that has to
     be right. The two are still reported DISTINCTLY so a self-heal is never
     silently indistinguishable from a first install.
+
+    All three reported outcomes name what is actually on disk afterwards: a
+    write that did not land is :data:`REASON_STAMP_UNRECORDABLE`, never a
+    bootstrap or self-heal it did not perform.
     """
     stamp = read_activity_stamp(directory)
     poisoned = stamp is not None and (stamp - moment) > timedelta(
@@ -691,7 +722,15 @@ def _stamp_decision(
     if stamp is None or poisoned:
         if not db_reachable:
             return IdleDecision(should_stop=False, reason=REASON_NOTHING_TO_DO)
-        touch_activity(state_dir=directory, now=lambda: moment)
+        # INVARIANT that makes touch_activity's two-state bool sufficient here:
+        # this branch runs ONLY when the stamp is absent or poisoned, so a write
+        # is always genuinely owed and touch_activity's "skipped, the record was
+        # already correct" success is structurally unreachable from this caller.
+        # True therefore means "the stamp on disk now says `moment`", nothing
+        # weaker. Widening the gating above to admit an already-correct stamp
+        # would reintroduce exactly the ambiguity this branch exists to remove.
+        if not touch_activity(state_dir=directory, now=lambda: moment):
+            return IdleDecision(should_stop=False, reason=REASON_STAMP_UNRECORDABLE)
         return IdleDecision(
             should_stop=False,
             reason=REASON_STAMP_POISON_RECOVERED if poisoned else REASON_STAMP_BOOTSTRAPPED,
@@ -728,7 +767,10 @@ def evaluate_idle(
        written now and this observation becomes the instant the first full
        budget window is measured from; if it is down there is nothing to
        protect and nothing to stop, and no stamp is fabricated for a database
-       that was never seen running.
+       that was never seen running. When the database is up but that write does
+       not land, the answer is :data:`REASON_STAMP_UNRECORDABLE` — the decision
+       reports the write's real outcome rather than asserting one it never
+       observed, and still does not stop anything.
     5. Otherwise the stamp's age decides: an age at or beyond the budget is
        stale (stop), anything younger is fresh. A stamp modestly ahead of the
        clock is clamped to age zero rather than read as negative.
