@@ -22,22 +22,44 @@ Context (the evidence this policy is argued from, not asserted from memory):
   stop through while real work is in flight."
 
   Read directly from psutil's own published changelog
-  (https://psutil.io/changelog/, fetched during this analysis):
+  (https://psutil.io/changelog/, fetched during this analysis, and RE-fetched
+  and re-checked line-by-line against a second pull after an earlier draft of
+  this file mis-dated the fix — see the correction note below):
 
-    * `7.1.0` (2025-09-17): "[Linux]: `Process.create_time()` now uses a
-      monotonic clock, preventing `Process.is_running()` from returning
-      wrong results after system clock updates." (#2526)
-    * `7.1.1`/`7.1.2`/`7.1.3` (2025-10-19 .. 2025-11-02): "[Linux], [macOS],
-      [NetBSD]: `Process.create_time()` does not reflect system clock
-      updates." (#2541, #2570, #2578)
+    * `7.1.0` (2025-09-17) — ONE release, carrying BOTH of the following
+      entries: "[Linux]: `Process.create_time()` now uses a monotonic clock,
+      preventing `Process.is_running()` from returning wrong results after
+      system clock updates." (#2526); and "[Linux], [macOS], [NetBSD]:
+      `Process.create_time()` does not reflect system clock updates."
+      (#2541, #2570, #2578).
 
-  Together these confirm that, on Linux (this repository's actual target
-  platform), every psutil release BEFORE `7.1.0` could return a
-  `create_time()` value for a still-running process that shifts after an
-  ordinary NTP correction — which is exactly the "false dead" misclassification
-  `activity.py`'s tolerance comment calls out as the unsafe direction. `7.1.3`
-  is used as the floor here (the last release in that specific fix cluster,
-  comfortably below the installed `7.2.2`).
+  All four issue numbers (#2526, #2541, #2570, #2578) sit inside the single
+  `7.1.0 — 2025-09-17` section of the changelog. `7.1.1` (2025-10-19), `7.1.2`
+  (2025-10-25) and `7.1.3` (2025-11-02) were each individually re-read in
+  full and contain NO `create_time` entry of any kind — `7.1.1` is SunOS-only
+  fixes; `7.1.2` and `7.1.3` carry macOS/BSD-only `ZombieProcess`/
+  `NoSuchProcess` fixes (#2650, #2672), neither on Linux (this repository's
+  actual target platform) nor about `create_time`. The whole clock fix landed
+  in one release, not a series.
+
+  CORRECTION: an earlier draft of this file (and the reasoning it fed into
+  `pyproject.toml`'s comment and ADR-0025) misread the changelog's layout —
+  a long, densely cross-referenced bug-fix list within the single 7.1.0
+  section was misattributed across 7.1.1-7.1.3 — and floored psutil at
+  `7.1.3`, rejecting `7.1.2` for a reason that does not exist. That was
+  caught in review, re-verified independently against a fresh fetch of the
+  changelog (grep line offsets confirmed all four issue numbers fall between
+  the `7.1.0` and `7.0.0` section headers, i.e. strictly inside `7.1.0`'s own
+  section), and is corrected here. No independent, evidenced reason to floor
+  later than `7.1.0` was found while re-checking `7.1.1`-`7.1.3`'s own
+  content, so none is claimed.
+
+  Together these confirm that, on Linux, every psutil release BEFORE `7.1.0`
+  could return a `create_time()` value for a still-running process that
+  shifts after an ordinary NTP correction — which is exactly the "false
+  dead" misclassification `activity.py`'s tolerance comment calls out as the
+  unsafe direction. `7.1.0` is the floor: the release the fix actually
+  shipped in, no later and no earlier.
 
   The same changelog's `8.0.0 (IN DEVELOPMENT)` section opens with: "psutil
   8.0 introduces breaking API changes. See the migration guide if upgrading
@@ -185,39 +207,49 @@ def test_every_runtime_dependency_parses_as_a_valid_pep_508_requirement() -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_psutil_dependency_excludes_the_pre_7_1_3_create_time_ntp_bug() -> None:
+def test_psutil_dependency_excludes_versions_below_7_1_0() -> None:
     """Given [project.dependencies]'s psutil entry.
-    When its specifier is checked against 7.1.2 — the newest release still
-    carrying the confirmed create_time()-drifts-across-a-system-clock-update
-    bug psutil's own changelog documents as fixed across 7.1.0-7.1.3
-    (#2526, #2541, #2570, #2578).
-    Then 7.1.2 must NOT satisfy the declared specifier: a bare "psutil" (the
-    status quo) happily resolves it, and that release's create_time() can
-    misclassify a still-running lease as a recycled (dead) PID after an
-    ordinary NTP correction — the exact unsafe direction activity.py's own
-    tolerance comment names ("a false 'dead' would let a stop through while
-    real work is in flight").
+    When its specifier is checked against 7.0.0 (the real, published release
+    immediately preceding 7.1.0 — the only 7.0.x release that ever shipped)
+    and 6.1.1 (a much older, unambiguously pre-fix release).
+    Then NEITHER must satisfy the declared specifier: both predate the
+    single `7.1.0` release that carries the confirmed
+    create_time()-drifts-across-a-system-clock-update fix (psutil's own
+    changelog, #2526/#2541/#2570/#2578 — all four inside the ONE `7.1.0`
+    section, re-verified directly; see the module docstring's correction
+    note). A bare "psutil" (the status quo) happily resolves either, and
+    both releases' create_time() can misclassify a still-running lease as a
+    recycled (dead) PID after an ordinary NTP correction — the exact unsafe
+    direction activity.py's own tolerance comment names ("a false 'dead'
+    would let a stop through while real work is in flight").
     """
     req = _requirement_named(_runtime_dependencies(), "psutil")
-    assert not req.specifier.contains("7.1.2", prereleases=True), (
-        f"psutil's pyproject.toml specifier {req.specifier!r} still admits 7.1.2, which "
-        "carries the create_time()/NTP-update bug psutil fixed in 7.1.0-7.1.3. It must "
-        "declare a floor of at least psutil>=7.1.3."
+    assert not req.specifier.contains("7.0.0", prereleases=True), (
+        f"psutil's pyproject.toml specifier {req.specifier!r} still admits 7.0.0, which "
+        "predates the create_time()/NTP-update fix that shipped in 7.1.0. It must "
+        "declare a floor of at least psutil>=7.1.0."
+    )
+    assert not req.specifier.contains("6.1.1", prereleases=True), (
+        f"psutil's pyproject.toml specifier {req.specifier!r} still admits 6.1.1, which "
+        "predates the create_time()/NTP-update fix that shipped in 7.1.0. It must "
+        "declare a floor of at least psutil>=7.1.0."
     )
 
 
 def test_psutil_dependency_admits_the_fixed_and_currently_installed_versions() -> None:
     """Given the psutil specifier.
-    When checked against 7.1.3 (the fix's last release) and 7.2.2 (the
-    version actually installed in this repository's environment, confirmed
-    via `importlib.metadata.version("psutil")`).
-    Then both must satisfy it — the floor must not be so tight it excludes
-    the version already verified to work.
+    When checked against 7.1.0 (the exact release the create_time()/NTP fix
+    shipped in — the floor boundary itself, not a later patch chosen for no
+    evidenced reason) and 7.2.2 (the version actually installed in this
+    repository's environment, confirmed via
+    `importlib.metadata.version("psutil")`).
+    Then both must satisfy it — the floor must admit the release that fixed
+    the bug, not merely something safely past it.
     """
     req = _requirement_named(_runtime_dependencies(), "psutil")
-    assert req.specifier.contains("7.1.3", prereleases=True), (
-        f"psutil's specifier {req.specifier!r} excludes 7.1.3, the fixed release "
-        "the recommended floor is meant to admit."
+    assert req.specifier.contains("7.1.0", prereleases=True), (
+        f"psutil's specifier {req.specifier!r} excludes 7.1.0, the exact release the "
+        "create_time()/NTP-update fix shipped in and the floor this policy argues for."
     )
     assert req.specifier.contains("7.2.2", prereleases=True), (
         f"psutil's specifier {req.specifier!r} excludes 7.2.2, the version actually "

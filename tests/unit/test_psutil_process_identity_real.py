@@ -19,10 +19,13 @@ subprocesses.
 Every claim below was directly executed against this repository's installed
 psutil (7.2.2, confirmed via `importlib.metadata.version("psutil")`) before
 being written as an assertion — see the accompanying pyproject-pin analysis
-for the psutil changelog evidence (7.1.0-7.1.3's create_time()/NTP fixes;
-8.0.0's documented breaking changes) that this behavioural pin complements.
-A version bound protects AGAINST a regression; this file proves the
-CURRENTLY installed version has the property the bound exists to preserve.
+for the psutil changelog evidence (the single `7.1.0` release's
+create_time()/NTP fixes — #2526, #2541, #2570, #2578, all inside that one
+section, not spread across 7.1.1-7.1.3, which was an earlier misreading
+corrected in `test_pyproject_dependency_pins.py`; and 8.0.0's documented
+breaking changes) that this behavioural pin complements. A version bound
+protects AGAINST a regression; this file proves the CURRENTLY installed
+version has the property the bound exists to preserve.
 
 Hermetic despite touching real processes: every process this file creates is
 spawned and reaped by the test itself under a bounded wait, mirroring
@@ -107,7 +110,7 @@ def test_create_time_of_a_live_process_is_stable_across_repeated_real_reads() ->
     `math.isclose(..., abs_tol=_CREATE_TIME_TOLERANCE_S)` comparison
     depends on to never misclassify a still-alive process as a recycled PID
     under ordinary operation (no system clock change involved here; the
-    9.1.0-era create_time()/NTP-update bug this repository's psutil floor
+    pre-7.1.0 create_time()/NTP-update bug this repository's psutil floor
     guards against is exercised only under an actual clock step, which this
     test does not attempt to simulate).
     """

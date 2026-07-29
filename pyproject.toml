@@ -19,14 +19,45 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
 ]
+# Only two of these carry a bound, and only because there is evidence they can
+# change behaviour this repository decides on — the same test the `ruff` pin
+# below had to be paid for the hard way. The other five are bare on purpose;
+# ADR-0025 records the reason for each, and a test holds them bare so a future
+# `pip freeze`-shaped pin cannot land unargued.
 dependencies = [
     "typer",
     "rich",
-    "pydgraph",
+    # Bound because it tracks the Dgraph SERVER's release line, not because a
+    # release was observed breaking us — weaker evidence than psutil below, and
+    # ADR-0025 says so. 25.0.0 regenerated the protos "to support Dgraph v25
+    # API"; 25.1.0 deprecated `DgraphClientStub.from_cloud()`/`.parse_host()`
+    # with removal planned for 26.0.0. docker/docker-compose.yml pins the server
+    # to `dgraph/standalone:v25.3.4`, so a client resolving a major line ahead
+    # of the server is a coupling nothing in this repo would catch. Move the
+    # ceiling when the compose file moves to a v26 server, not before.
+    "pydgraph>=25.2.0,<26",
     "httpx",
     "pyyaml",
     "requests",
-    "psutil",
+    # The FLOOR is the load-bearing half. `db idle-stop` decides whether a
+    # lease's owner is still alive from `(pid, create_time)` — psutil's own
+    # documented anti-PID-recycling technique. psutil's changelog makes
+    # `create_time()` monotonic-clock-based in ONE release, 7.1.0: all four
+    # issues (#2526, #2541, #2570, #2578) sit inside that single section.
+    # 7.1.1 is SunOS-only; 7.1.2/7.1.3 are macOS/BSD zombie-reaping fixes and
+    # touch neither Linux nor create_time — so 7.1.0 is the floor, and flooring
+    # higher would reject working releases for a reason that does not exist
+    # (this bound was first written `>=7.1.3` on exactly that misreading; see
+    # ADR-0025). Before 7.1.0, an ordinary NTP correction could shift the value
+    # for a still-running process: a false "dead", which `util/activity.py`'s
+    # tolerance comment names as the unsafe direction because it lets a stop
+    # through while real work is in flight. psutil's FAQ says the same from
+    # another angle — the check is disabled outright on several BSDs because
+    # create_time is not NTP-stable there. Lowering this floor does not fail a
+    # gate; it silently re-arms a wrong stop decision. The ceiling is upstream's
+    # own disclosure that 8.0 introduces breaking API changes (nothing listed
+    # there touches `create_time`, `is_running` or `NoSuchProcess`).
+    "psutil>=7.1.0,<8",
 ]
 
 [project.optional-dependencies]
