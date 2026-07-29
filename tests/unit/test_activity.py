@@ -31,10 +31,15 @@ activity in return; the two are combined only inside `partgraph.cli`'s
 import `partgraph.cli`, `partgraph.util.lifecycle`, `partgraph.util.container`,
 or any embed/query/load module.
 
-NOT YET IMPLEMENTED. `src/partgraph/util/activity.py` does not exist yet —
-this whole file is expected to ERROR at COLLECTION with ModuleNotFoundError,
-mirroring `tests/unit/test_cli_db_down.py`'s own documented pre-PR-A history
-for `partgraph.util.lifecycle`. This is the correct test-first RED state.
+IMPLEMENTED. `src/partgraph/util/activity.py` exists and this file collects
+and runs normally now. The paragraph above ("Pinned contract this file
+specifies") is a live, present-tense inventory; this one is history, kept
+for context rather than because it is still true: this file ORIGINALLY
+collected with every test below erroring with `ModuleNotFoundError` (its
+own top-level `from partgraph.util.activity import (...)`), mirroring
+`tests/unit/test_cli_db_down.py`'s own documented pre-PR-A history for
+`partgraph.util.lifecycle` — the correct test-first RED state PR-C started
+from, not a claim about where it stands today.
 
 Pinned contract this file specifies:
 
@@ -50,10 +55,18 @@ Pinned contract this file specifies:
 
     `REASON_DISABLED`, `REASON_LIVE_LEASE`, `REASON_UNDETERMINED_LEASE`,
     `REASON_FRESH_STAMP`, `REASON_STALE`, `REASON_NOTHING_TO_DO`,
-    `REASON_STAMP_BOOTSTRAPPED`, `REASON_STAMP_POISON_RECOVERED` — plain
-    string tags (mirrors `partgraph.util.lifecycle`'s own
-    `_OWNER_NAME_MATCH = "S1"` style), naming WHY an `IdleDecision` was
-    reached, so a test can assert the reason, not merely the boolean.
+    `REASON_STAMP_BOOTSTRAPPED`, `REASON_STAMP_POISON_RECOVERED`,
+    `REASON_STAMP_UNRECORDABLE` — plain string tags (mirrors
+    `partgraph.util.lifecycle`'s own `_OWNER_NAME_MATCH = "S1"` style),
+    naming WHY an `IdleDecision` was reached, so a test can assert the
+    reason, not merely the boolean. This inventory is enforced, not merely
+    hand-maintained: `test_activity_architecture.py`'s
+    `test_reason_tags_docstring_inventory_matches_the_modules_actual_reason_constants`
+    diffs the `REASON_*` tokens listed here against
+    `partgraph.util.activity.__all__`'s actual set, so it cannot silently
+    go stale the way it did once already — `REASON_STAMP_UNRECORDABLE`
+    landed and this exact list was not updated to match, and nothing went
+    red, because prose is not an assertion.
 
     `STAMP_FUTURE_POISON_CEILING_MINUTES: float` — see "[Gate 3a BLOCKING]
     the stamp-poisoning ceiling" below.
@@ -75,7 +88,13 @@ Pinned contract this file specifies:
     below, "two concurrent leases").
     `lease_paths(state_dir) -> tuple[Path, ...]` — every currently-present
     lease file, regardless of liveness.
-    `touch_activity(*, state_dir, now=None) -> None`
+    `touch_activity(*, state_dir, now=None) -> bool` — True iff the durable
+    record is trustworthy once the call returns (a landed write, or a
+    write correctly declined under monotonic protection because the stamp
+    already on disk is at least as recent); False iff a write was owed and
+    did not land. Originally `-> None`, silently discarding the boolean
+    `_atomic_write` (below) already computes — see
+    `REASON_STAMP_UNRECORDABLE` further down.
     `read_activity_stamp(state_dir) -> datetime | None`
     `acquire_lease(*, state_dir, pid=None, now=None, psutil_module=None) -> None`
     `release_lease(*, state_dir, pid=None) -> None`
@@ -599,6 +618,94 @@ def test_touch_activity_warn_once_scope_is_per_state_dir_not_global(
 
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 2, warnings
+
+
+# ---------------------------------------------------------------------------
+# `touch_activity`'s return-value contract (honesty fix — landed).
+# `_atomic_write`'s own docstring already promised "Return True iff it
+# landed" (see its definition above), but `touch_activity` discarded that
+# boolean and returned `None` unconditionally — the outcome was not merely
+# ignored, it was UNOBSERVABLE one frame up. Before this section was added,
+# no test anywhere in this suite asserted `touch_activity(...)`'s return
+# value (confirmed by inspection: `grep -n "touch_activity(" tests/` showed
+# every call site as a bare statement); the ONLY place `-> None` had
+# appeared was this file's own module-docstring "Pinned contract" prose near
+# the top (now updated to `-> bool` alongside this fix), which was
+# documentation, never an executable assertion. Widening the return type to
+# `bool` therefore weakened no existing pin, and every real caller
+# (`src/partgraph/cli.py`'s nine-plus `touch_activity(state_dir=...)` call
+# sites) already discards the return value as a bare expression statement,
+# so this was additive, not breaking.
+# ---------------------------------------------------------------------------
+
+
+def test_touch_activity_returns_true_when_the_write_lands(tmp_path) -> None:
+    """Given an ordinary, writable state dir.
+    When `touch_activity` is called.
+    Then it returns True — the write genuinely landed, threading
+    `_atomic_write`'s own "Return True iff it landed" promise all the way up
+    to `touch_activity`'s caller, its only consumer inside this module."""
+    state_dir = tmp_path / "state"
+    assert touch_activity(state_dir=state_dir, now=lambda: _dt(2026, 7, 28)) is True
+
+
+def test_touch_activity_returns_false_when_os_replace_fails(tmp_path, monkeypatch) -> None:
+    """Given the final `os.replace` step of the atomic write fails (a full
+    disk, a read-only mount, or — the scenario this whole fix exists for — a
+    state dir that turned root-owned or read-only after a stray `sudo`).
+    When `touch_activity` is called.
+    Then it does not raise (the existing C-14 contract, already proven above
+    by `test_touch_activity_warns_once_and_never_raises_when_rename_fails`)
+    AND it returns False — not None, not True — so a caller can finally tell
+    "I tried and it did not land" apart from "it landed", which
+    `_stamp_decision` (exercised further below) needs in order to stop
+    asserting a write that never happened."""
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(
+        os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("simulated: disk full"))
+    )
+    assert touch_activity(state_dir=state_dir, now=lambda: _dt(2026, 7, 28)) is False
+
+
+def test_touch_activity_returns_false_when_the_state_dir_cannot_be_created(
+    tmp_path, monkeypatch
+) -> None:
+    """Mirrors the test above for the OTHER OSError site inside
+    `_atomic_write` (`directory.mkdir(...)` failing, rather than
+    `os.replace`) — both failure sites must report the same False, not only
+    one of the two."""
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(
+        pathlib.Path,
+        "mkdir",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("simulated: permission denied")),
+    )
+    assert touch_activity(state_dir=state_dir, now=lambda: _dt(2026, 7, 28)) is False
+
+
+def test_touch_activity_returns_true_when_a_write_is_correctly_skipped_by_monotonic_protection(
+    tmp_path,
+) -> None:
+    """Given a stamp already recorded at T2, and a call with an OLDER `now`
+    T1 well within the poison ceiling — the "protected, no write needed"
+    branch (a SUCCESS, not a failure: the durable state on disk is already
+    correct and current).
+    When `touch_activity` is called.
+    Then it still returns True — "landed" is read as "the durable record is
+    fine after this call returns", never "a write literally executed just
+    now". A naive implementation that returns False whenever
+    `_atomic_write` itself was never invoked would wrongly report the
+    monotonic-protection guard — an intentional, correct no-op — as an
+    unrecordable failure, which would be the wrong direction one layer up
+    for every OTHER `touch_activity` call site in `partgraph.cli` that this
+    change also touches."""
+    state_dir = tmp_path / "state"
+    t2 = _dt(2026, 7, 28, 12, 0, 0)
+    t1 = t2 - timedelta(minutes=2)
+    touch_activity(state_dir=state_dir, now=lambda: t2)
+
+    assert touch_activity(state_dir=state_dir, now=lambda: t1) is True
+    assert read_activity_stamp(state_dir) == t2, "sanity: the protection itself still held"
 
 
 def test_read_activity_stamp_returns_none_for_missing_file(tmp_path) -> None:
@@ -1353,6 +1460,275 @@ def test_no_stamp_bootstrap_protects_for_a_full_budget_window_then_goes_stale(tm
     assert call3 == IdleDecision(should_stop=True, reason=REASON_STALE), (
         "must go stale once a FULL budget window has elapsed since the first observation"
     )
+
+
+# ---------------------------------------------------------------------------
+# REASON_STAMP_UNRECORDABLE (honesty fix — landed). `_stamp_decision` used to
+# call `touch_activity(state_dir=directory, now=lambda: moment)` and return
+# REASON_STAMP_BOOTSTRAPPED / REASON_STAMP_POISON_RECOVERED
+# UNCONDITIONALLY, discarding the boolean pinned in the section above — so on
+# a read-only or root-owned `data/state`, every `db idle-stop` run claimed a
+# stamp was written when NONE ever landed, and the database was never
+# stopped: permanently, silently. `REASON_STAMP_UNRECORDABLE` now exists in
+# `src/partgraph/util/activity.py`; it is still imported LOCALLY inside each
+# test below (never at this file's module level) rather than added to this
+# file's own top-level import list, so that a future regression to this one
+# symbol errors only these tests at run time, not the ~120 other tests this
+# same file collects.
+#
+# Every test below makes the write GENUINELY fail (`os.replace` raises,
+# exactly like the leaf-level failure injection just above — never a mocked
+# call-count or a hand-typed proxy string) and then asserts both which
+# REASON comes back AND what is actually left on disk — the property, not a
+# proxy. An implementation that returns REASON_STAMP_UNRECORDABLE
+# UNCONDITIONALLY (ignoring whether the write actually failed) is caught by
+# the EXISTING, unmodified tests above —
+# `test_no_stamp_and_db_reachable_bootstraps_a_stamp_and_does_not_stop_yet`,
+# `test_no_stamp_bootstrap_protects_for_a_full_budget_window_then_goes_stale`,
+# `test_future_stamp_beyond_the_poison_ceiling_is_untrustworthy_and_self_
+# heals_via_bootstrap`, `test_extremely_future_stamp_does_not_crash_and_
+# self_heals` — all of which pin the OLD reasons against a genuinely
+# writable tmp_path, so that direction of the mutation is already covered
+# and is not duplicated here.
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_write_failure_reports_unrecordable_not_bootstrapped_and_writes_no_stamp(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """Given a fresh install (no stamp, no lease) with the database
+    REACHABLE right now — ordinarily the bootstrap case — but the state dir
+    is genuinely unwritable (`os.replace` raises).
+    When `evaluate_idle` runs.
+    Then `should_stop` stays False (the safe direction is unchanged) BUT
+    `reason` is `REASON_STAMP_UNRECORDABLE` — NEVER `REASON_STAMP_
+    BOOTSTRAPPED`, which would assert a write that did not happen — and (the
+    actual property, not merely a different string) NO stamp file exists on
+    disk afterward, proving the reported reason matches what is actually
+    durable. A WARNING is logged exactly once, proving the failure is routed
+    through the SAME swallow-and-warn path `_atomic_write` already uses, not
+    a new, separately-untested error path.
+    """
+    from partgraph.util.activity import REASON_STAMP_UNRECORDABLE  # noqa: PLC0415
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(
+        os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("simulated: read-only"))
+    )
+
+    with caplog.at_level("WARNING"):
+        decision = evaluate_idle(
+            state_dir=state_dir,
+            idle_timeout_minutes=30.0,
+            db_reachable=True,
+            now=lambda: _dt(2026, 7, 28, 9, 0, 0),
+            psutil_module=_fake_psutil(),
+        )
+
+    assert decision.should_stop is False
+    assert decision.reason == REASON_STAMP_UNRECORDABLE, (
+        f"a write that genuinely did not land must never be reported as "
+        f"REASON_STAMP_BOOTSTRAPPED: got {decision.reason!r}"
+    )
+    assert not activity_stamp_path(state_dir).exists(), (
+        "no stamp file may exist on disk when the reported reason admits the write failed"
+    )
+    assert any(r.levelname == "WARNING" for r in caplog.records)
+
+
+def test_poison_recovery_write_failure_reports_unrecordable_and_leaves_the_poisoned_stamp_untouched(
+    tmp_path, monkeypatch
+) -> None:
+    """Given a stamp poisoned beyond the ceiling — ordinarily the self-heal/
+    poison-recovery case — with the database reachable, but the write
+    genuinely fails.
+    When `evaluate_idle` runs.
+    Then `reason` is `REASON_STAMP_UNRECORDABLE` — NEVER `REASON_STAMP_
+    POISON_RECOVERED`, which would claim a self-heal that never happened —
+    and the ORIGINAL poisoned stamp is left completely UNCHANGED on disk (a
+    failed `os.replace` never touches the real target, only the temp file it
+    wrote to first), proving the failed self-heal attempt neither corrupted
+    nor partially overwrote the existing record either.
+    """
+    from partgraph.util.activity import REASON_STAMP_UNRECORDABLE  # noqa: PLC0415
+
+    state_dir = tmp_path / "state"
+    now_value = _dt(2026, 7, 28, 12, 0, 0)
+    poisoned = now_value + timedelta(hours=1)
+    touch_activity(state_dir=state_dir, now=lambda: poisoned)  # lands: still writable here
+
+    monkeypatch.setattr(
+        os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("simulated: read-only"))
+    )
+    decision = evaluate_idle(
+        state_dir=state_dir,
+        idle_timeout_minutes=30.0,
+        db_reachable=True,
+        now=lambda: now_value,
+        psutil_module=_fake_psutil(),
+    )
+
+    assert decision.should_stop is False
+    assert decision.reason == REASON_STAMP_UNRECORDABLE, (
+        f"a failed self-heal write must never be reported as "
+        f"REASON_STAMP_POISON_RECOVERED: got {decision.reason!r}"
+    )
+    assert read_activity_stamp(state_dir) == poisoned, (
+        "the original poisoned stamp must survive a failed self-heal attempt untouched"
+    )
+
+
+def test_stamp_unrecordable_reason_constant_is_a_new_distinct_plain_string() -> None:
+    """Given the module's existing REASON_* tags are all distinct, path-free
+    plain strings (module docstring's own stated invariant: "every value is
+    safe to print verbatim: no path, no separator, no operator data").
+    When `REASON_STAMP_UNRECORDABLE` is read.
+    Then it is a `str`, contains no `/`, and collides with none of the seven
+    reason tags this file already imports — including `REASON_NOTHING_TO_DO`
+    (reusing it would conflate "the database is not reachable" with "the
+    database IS up but the record could not be written", exactly the
+    state-collapse this module's own docstring forbids for leases, now
+    pinned here for the stamp too) — proving the new tag is genuinely
+    additive, never an accidental alias for an existing one."""
+    from partgraph.util.activity import REASON_STAMP_UNRECORDABLE  # noqa: PLC0415
+
+    existing = {
+        REASON_DISABLED, REASON_LIVE_LEASE, REASON_UNDETERMINED_LEASE,
+        REASON_FRESH_STAMP, REASON_STALE, REASON_NOTHING_TO_DO,
+        REASON_STAMP_BOOTSTRAPPED, REASON_STAMP_POISON_RECOVERED,
+    }
+    assert isinstance(REASON_STAMP_UNRECORDABLE, str)
+    assert "/" not in REASON_STAMP_UNRECORDABLE
+    assert REASON_STAMP_UNRECORDABLE not in existing
+
+
+# ---------------------------------------------------------------------------
+# [Gate 5 finding 2] The two-state invariant, pinned as a BLACK-BOX
+# regression test, not merely argued in a comment. `_stamp_decision`'s own
+# comment (`src/partgraph/util/activity.py`) records WHY `touch_activity`'s
+# "declined a needless write under monotonic protection -> True" success
+# case is structurally unreachable from its one call site: that branch runs
+# ONLY when the freshly-read stamp is absent or poisoned, and a fresh read
+# of an already-correct (non-poisoned) stamp is neither. That reasoning was
+# confirmed by inspection but asserted nowhere — precisely the "prose only"
+# criticism this commit's own earlier finding made of the docstring it
+# fixed. These two tests patch the module's OWN `touch_activity` name with
+# a fail-fast fake and prove it is NEVER CALLED AT ALL when an existing
+# stamp is already fresh or already stale (both are "already correct":
+# present and non-poisoned) — so a future change that widens the gating to
+# also call `touch_activity` in either of those cases trips this
+# immediately, rather than only being caught if someone happens to reread
+# the comment.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("existing_stamp_age_minutes", "expected_reason"),
+    [
+        pytest.param(5.0, REASON_FRESH_STAMP, id="already_fresh"),
+        pytest.param(120.0, REASON_STALE, id="already_stale"),
+    ],
+)
+def test_stamp_decision_never_calls_touch_activity_when_an_existing_stamp_is_already_correct(
+    tmp_path, monkeypatch, existing_stamp_age_minutes: float, expected_reason: str
+) -> None:
+    """[Gate 5 finding 2 — the regression test] Given a stamp already on
+    disk that is neither absent nor poisoned — either FRESH (well within
+    the timeout) or STALE (well past it), the two ways an "already correct"
+    stamp reaches `_stamp_decision`.
+    When `evaluate_idle` runs, with `partgraph.util.activity.touch_activity`
+    itself replaced by a fake that raises `AssertionError` if ever called.
+    Then the decision is unaffected (still the ordinary fresh/stale reason)
+    AND the fake is never invoked — proving, black-box, that widening
+    `_stamp_decision`'s gating to call `touch_activity` for an
+    already-correct stamp would be caught here, not left to a comment."""
+    import partgraph.util.activity as activity_module
+
+    state_dir = tmp_path / "state"
+    t0 = _dt(2026, 7, 28, 9, 0, 0)
+    touch_activity(state_dir=state_dir, now=lambda: t0)  # a real, landed, non-poisoned stamp
+
+    def _forbid_touch_activity(**kwargs):
+        raise AssertionError(
+            "touch_activity must never be called by _stamp_decision when an "
+            "existing stamp is already correct (fresh or stale, never absent "
+            "or poisoned) — this is exactly the gating widening Gate 5 asked "
+            "to be regression-tested"
+        )
+
+    monkeypatch.setattr(activity_module, "touch_activity", _forbid_touch_activity)
+
+    decision = evaluate_idle(
+        state_dir=state_dir,
+        idle_timeout_minutes=30.0,
+        db_reachable=True,
+        now=lambda: t0 + timedelta(minutes=existing_stamp_age_minutes),
+        psutil_module=_fake_psutil(),
+    )
+    assert decision == IdleDecision(should_stop=(expected_reason == REASON_STALE), reason=expected_reason)
+
+
+# ---------------------------------------------------------------------------
+# [Gate 5 finding 3] "Not sticky" — pinned hermetically, not only by hand
+# with a real `chmod 0500` (as both the implementer's and the reviewer's own
+# commit messages record). A call-counter over `os.replace` fails exactly
+# ONCE, then behaves normally, across TWO SEQUENTIAL `evaluate_idle` calls
+# sharing the SAME on-disk state — mirroring
+# `test_no_stamp_bootstrap_protects_for_a_full_budget_window_then_goes_stale`'s
+# own "two real, sequential calls sharing on-disk state" pattern, the actual
+# property rather than a single-call proxy.
+# ---------------------------------------------------------------------------
+
+
+def test_unrecordable_state_self_heals_to_bootstrapped_once_the_write_succeeds_again(
+    tmp_path, monkeypatch
+) -> None:
+    """[Gate 5 finding 3 — hermetic, not manual-only] Given a fresh install
+    (no stamp) where the FIRST `evaluate_idle` call's underlying write
+    genuinely fails (`os.replace` raises), and the SECOND call's write
+    succeeds — modelling the state directory becoming writable again (an
+    operator fixing a permission, or a full disk being freed), driven by an
+    in-process call-counter, never a real filesystem permission change.
+    When both calls run in sequence against the same `tmp_path` state dir.
+    Then the FIRST reports `REASON_STAMP_UNRECORDABLE` and leaves no stamp
+    on disk; the SECOND reports `REASON_STAMP_BOOTSTRAPPED` and a real
+    stamp now exists — proving the unrecordable state reflects only THIS
+    call's own write attempt, never a remembered failure from a previous
+    one: it is not sticky.
+    """
+    from partgraph.util.activity import REASON_STAMP_UNRECORDABLE  # noqa: PLC0415
+
+    state_dir = tmp_path / "state"
+    real_replace = os.replace
+    call_count = {"n": 0}
+
+    def _fails_once_then_succeeds(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OSError("simulated: read-only (first attempt only)")
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", _fails_once_then_succeeds)
+
+    first = evaluate_idle(
+        state_dir=state_dir, idle_timeout_minutes=30.0, db_reachable=True,
+        now=lambda: _dt(2026, 7, 28, 9, 0, 0), psutil_module=_fake_psutil(),
+    )
+    assert first.reason == REASON_STAMP_UNRECORDABLE
+    assert not activity_stamp_path(state_dir).exists()
+
+    second_moment = _dt(2026, 7, 28, 9, 1, 0)
+    second = evaluate_idle(
+        state_dir=state_dir, idle_timeout_minutes=30.0, db_reachable=True,
+        now=lambda: second_moment, psutil_module=_fake_psutil(),
+    )
+    assert second == IdleDecision(should_stop=False, reason=REASON_STAMP_BOOTSTRAPPED), (
+        "the state must self-heal to an honest bootstrap the moment the write "
+        "starts landing again — it must never stay stuck reporting unrecordable "
+        "once the underlying failure is gone"
+    )
+    assert read_activity_stamp(state_dir) == second_moment
+    assert call_count["n"] == 2, "sanity: both evaluate_idle calls must have attempted the write"
 
 
 # ---------------------------------------------------------------------------

@@ -25,12 +25,14 @@ from __future__ import annotations
 import ast
 import inspect
 import pathlib
+import re
 
 import pytest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 _ACTIVITY_PATH = _REPO_ROOT / "src" / "partgraph" / "util" / "activity.py"
 _LIFECYCLE_PATH = _REPO_ROOT / "src" / "partgraph" / "util" / "lifecycle.py"
+_TEST_ACTIVITY_PATH = _REPO_ROOT / "tests" / "unit" / "test_activity.py"
 
 
 def _read_activity_source_or_skip() -> str:
@@ -308,3 +310,170 @@ def test_partgraph_util_package_does_not_reexport_activity_functions() -> None:
             f"partgraph.util must NOT re-export {forbidden_name!r} — it must "
             "only be reachable via partgraph.util.activity directly."
         )
+
+
+# ---------------------------------------------------------------------------
+# `test_activity.py`'s own module docstring hand-enumerates every
+# `REASON_*` tag in its "Pinned contract" section — a prose inventory a
+# reader trusts as authoritative. It silently went one tag short: when
+# `REASON_STAMP_UNRECORDABLE` landed, nothing forced that enumeration to be
+# updated to match, because prose is not an assertion — the exact shape a
+# separate finding in this body of work has already named for `cli.py`'s
+# phantom convention claim, the false `subprocess.run` idiom claim, and a
+# `--limit 0` scenario that never existed. This guard makes the inventory
+# self-checking instead of relying on a human to notice next time: it
+# extracts every backtick-quoted `REASON_...` token from that file's OWN
+# raw source, between two stable, single-line anchor phrases bracketing the
+# list, and diffs it against `partgraph.util.activity.__all__`'s ACTUAL
+# `REASON_*` names — never a second hand-typed copy of either side.
+#
+# [Gate 5 finding 1] The FIRST version of these anchors bracketed the WHOLE
+# "Module-level constants" paragraph ("Module-level constants:" through
+# "State-file mechanics (C-1, C-3, C-14):"), not only the enumerated list —
+# and that paragraph's own explanatory aside, right after the list, mentions
+# `REASON_STAMP_UNRECORDABLE` BY NAME too (the sentence recording that this
+# very guard exists). A tag removed from the LIST alone, with that aside
+# left untouched, would still be "found" by the wide anchors — the guard
+# would pass green on exactly the drift it exists to catch: a guard whose
+# anchors are wider than the thing it guards, one commit after the guard
+# that fixed the same shape elsewhere. The anchors below are now tightened
+# to bracket ONLY the four-line list itself — starting immediately AFTER
+# the last sentence of the PRECEDING paragraph and ending immediately
+# BEFORE the aside begins — so the aside's own mention of the tag is
+# provably outside the span. `test_reason_inventory_guard_is_tripped_by_a_
+# tag_removed_from_the_list_alone` below demonstrates this against a real,
+# targeted mutation rather than merely asserting the anchors look right.
+# ---------------------------------------------------------------------------
+
+_REASON_INVENTORY_START = "ever receives an already-parsed `idle_timeout_minutes: float`."
+_REASON_INVENTORY_END = "— plain string tags"
+
+
+def _extract_documented_reason_names(source: str) -> set[str]:
+    """Extract every backtick-quoted `REASON_[A-Z_]+` token from *source*,
+    strictly between the two module-level anchor phrases above (both
+    excluded from the span itself). Shared by the guard test and its own
+    controls below, so the controls exercise the EXACT SAME extraction
+    logic the guard uses — never a second, independently-drifting copy."""
+    start = source.index(_REASON_INVENTORY_START) + len(_REASON_INVENTORY_START)
+    end = source.index(_REASON_INVENTORY_END, start)
+    return set(re.findall(r"REASON_[A-Z_]+", source[start:end]))
+
+
+def test_reason_tags_docstring_inventory_matches_the_modules_actual_reason_constants() -> None:
+    """Given `tests/unit/test_activity.py`'s own module docstring hand-lists
+    every `REASON_*` tag strictly between its two tight anchor phrases
+    (immediately before the list and immediately after it — neither anchor
+    itself, nor anything outside that span, is scanned).
+    When every backtick-quoted `REASON_[A-Z_]+` token in that span is
+    extracted via regex and compared against
+    `partgraph.util.activity.__all__`'s ACTUAL `REASON_*` names, read live
+    from the module rather than re-typed here.
+    Then the two sets are IDENTICAL. A tag added to the module without
+    updating that prose — exactly what happened when
+    `REASON_STAMP_UNRECORDABLE` landed — now fails a real assertion instead
+    of silently reading as an authoritative, quietly-wrong inventory; a tag
+    removed or renamed is caught the same way. If either anchor phrase is
+    ever reworded, extraction finds an empty or wrong span and this test
+    fails loudly rather than passing on a false positive — the anchors are
+    checked live against the real file, never assumed stable forever.
+    Skips cleanly (not error) if `partgraph.util.activity` does not exist
+    yet, mirroring every other test in this file.
+    """
+    activity = pytest.importorskip(
+        "partgraph.util.activity",
+        reason="partgraph.util.activity does not exist yet (expected pre-PR-C).",
+    )
+    actual_reason_names = {name for name in activity.__all__ if name.startswith("REASON_")}
+    assert actual_reason_names, "sanity: activity.py must define at least one REASON_* tag"
+
+    assert _TEST_ACTIVITY_PATH.exists(), f"expected {_TEST_ACTIVITY_PATH} to exist"
+    source = _TEST_ACTIVITY_PATH.read_text(encoding="utf-8")
+    documented_reason_names = _extract_documented_reason_names(source)
+
+    assert documented_reason_names == actual_reason_names, (
+        "tests/unit/test_activity.py's module-docstring 'Pinned contract' "
+        "REASON_* inventory has drifted from partgraph.util.activity.__all__'s "
+        f"actual set. documented={sorted(documented_reason_names)!r} "
+        f"actual={sorted(actual_reason_names)!r}"
+    )
+
+
+def test_reason_inventory_anchor_phrases_are_themselves_present_in_the_real_source() -> None:
+    """[Negative control for the guard above] Given the same two anchor
+    phrases the guard above relies on to bracket the inventory.
+    When `tests/unit/test_activity.py`'s real source is searched for each.
+    Then both are found, in order — proving the guard above is not silently
+    matching an empty span (e.g. via `str.index` raising `ValueError` and
+    the test erroring in a way that could be mistaken for "nothing to
+    check") but genuinely bracketing real, non-empty content."""
+    if not _TEST_ACTIVITY_PATH.exists():
+        pytest.skip("tests/unit/test_activity.py does not exist.")
+    source = _TEST_ACTIVITY_PATH.read_text(encoding="utf-8")
+    assert _REASON_INVENTORY_START in source
+    assert _REASON_INVENTORY_END in source
+    assert source.index(_REASON_INVENTORY_START) < source.index(_REASON_INVENTORY_END)
+
+
+def test_reason_inventory_guard_is_tripped_by_a_tag_removed_from_the_list_alone() -> None:
+    """[Gate 5 finding 1 — demonstrated against a real mutation, not merely
+    asserted] Given the SAME paragraph's own aside sentence mentions
+    `REASON_STAMP_UNRECORDABLE` by name, OUTSIDE the tightened list span
+    (sanity-checked below via `_extract_documented_reason_names` finding it
+    absent from a span that does NOT include the aside).
+    When the REAL source of `tests/unit/test_activity.py` is read and then
+    surgically mutated to remove `REASON_STAMP_UNRECORDABLE` from the LIST
+    ONLY — a single, targeted string replacement of the exact phrase
+    joining the list's last item to the prose that follows it — leaving
+    every other character, INCLUDING the aside's own separate mention of
+    the identical tag, completely untouched.
+    Then the SAME extraction function the real guard test uses reports a
+    documented set that is MISSING the tag and DIFFERS from
+    `partgraph.util.activity.__all__`'s actual set — proving the tightened
+    anchors genuinely trip on this exact scenario (a tag dropped from the
+    list while surrounding prose survives), the precise blind spot the wide
+    anchors had. This is a demonstration against real, mutated text, not an
+    assertion about what the anchors are expected to do.
+    """
+    activity = pytest.importorskip(
+        "partgraph.util.activity",
+        reason="partgraph.util.activity does not exist yet (expected pre-PR-C).",
+    )
+    actual_reason_names = {name for name in activity.__all__ if name.startswith("REASON_")}
+    assert "REASON_STAMP_UNRECORDABLE" in actual_reason_names, (
+        "sanity: this control is only meaningful while the module actually "
+        "defines this tag"
+    )
+
+    assert _TEST_ACTIVITY_PATH.exists(), f"expected {_TEST_ACTIVITY_PATH} to exist"
+    source = _TEST_ACTIVITY_PATH.read_text(encoding="utf-8")
+
+    aside_mention = "go stale the way it did once already — `REASON_STAMP_UNRECORDABLE`"
+    assert aside_mention in source, (
+        "expected the paragraph's own aside to mention REASON_STAMP_UNRECORDABLE "
+        "by name, outside the list — the scenario this control exercises"
+    )
+
+    list_tail = "`REASON_STAMP_UNRECORDABLE` — plain string tags"
+    assert source.count(list_tail) == 1, (
+        f"expected exactly one occurrence of the list's own tail to mutate: "
+        f"{source.count(list_tail)}"
+    )
+    mutated_source = source.replace(list_tail, "— plain string tags", 1)
+    assert mutated_source != source, "sanity: the targeted mutation must change something"
+    assert aside_mention in mutated_source, (
+        "the mutation must leave the aside's own separate mention of the tag "
+        "completely untouched — proving this is a genuine 'removed from the "
+        "list alone' scenario, not a strawman that also strips the aside"
+    )
+
+    documented_after_mutation = _extract_documented_reason_names(mutated_source)
+    assert "REASON_STAMP_UNRECORDABLE" not in documented_after_mutation, (
+        "the tightened guard must not recover the removed tag from the "
+        "aside sentence outside its span"
+    )
+    assert documented_after_mutation != actual_reason_names, (
+        "removing a tag from the list alone, with the aside's own mention of "
+        "the SAME tag left completely untouched, must trip the guard — this "
+        "is exactly the blind spot Gate 5 found in the pre-tightening anchors"
+    )

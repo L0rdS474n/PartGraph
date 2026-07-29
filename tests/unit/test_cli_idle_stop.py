@@ -454,6 +454,76 @@ def test_idle_stop_fresh_stamp_is_a_noop_never_calls_stop_all(
 
 
 # ---------------------------------------------------------------------------
+# REASON_STAMP_UNRECORDABLE at the CLI boundary (honesty fix — landed).
+# `db idle-stop` must report the write's ACTUAL outcome, and its output must
+# stay path-free even on this new failure branch — `_report_idle_stop_
+# outcome`'s own sibling contract ("Every line is path-free... never the
+# opaque container ID") extended to the reason line printed before any
+# `stop_all` delegation is even reached. `REASON_STAMP_UNRECORDABLE` now
+# exists in `partgraph.util.activity`; it is still imported LOCALLY inside
+# the test body rather than added to this file's own top-level import list,
+# so a future regression to this one symbol errors only this test, not the
+# rest of this file.
+# ---------------------------------------------------------------------------
+
+
+def test_idle_stop_reports_stamp_unrecordable_and_stays_path_free_when_the_activity_write_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Given a fresh install (no stamp, no lease) in a DEEP tmp_path state
+    dir, the database genuinely REACHABLE (`probe_health` healthy), and the
+    underlying activity-stamp write forced to fail (`os.replace` raises —
+    mirrors the leaf-level failure injection this whole fix is built on).
+    `PARTGRAPH_AUTOSTART` is left ON, matching this file's own established
+    "prove the guarantee against the harder case" discipline (see the
+    disabled-timeout test above).
+    When `partgraph db idle-stop` runs.
+    Then it exits 0 (unattended: never fails), `stop_all` is NEVER called
+    (should_stop stays False even though the write failed — the safe
+    direction must not regress), `subprocess.run` is NEVER called either (a
+    genuine no-op: this decision needs no container engine at all), the
+    printed reason equals the leaf's OWN `REASON_STAMP_UNRECORDABLE`
+    constant (never a hand-typed duplicate string, so the two levels cannot
+    silently drift apart) and is NOT the ordinary bootstrap reason, and —
+    the defect report's own explicit ask — the output never leaks the state
+    dir's path: neither `str(state_dir)` nor `str(tmp_path)` appears
+    anywhere in it, and (mirroring this file's own established survivor/
+    undetermined path-free checks above) it contains no `/` at all.
+    """
+    from partgraph.util.activity import REASON_STAMP_UNRECORDABLE  # noqa: PLC0415
+
+    monkeypatch.delenv("PARTGRAPH_IDLE_TIMEOUT_MINUTES", raising=False)
+    monkeypatch.setenv("PARTGRAPH_AUTOSTART", "1")
+    state_dir = tmp_path / "some" / "deep" / "state" / "dir"
+    monkeypatch.setattr(
+        os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("simulated: read-only"))
+    )
+
+    with (
+        patch.object(cli_mod, "ACTIVITY_STATE_DIR", state_dir),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(True)),
+        patch("subprocess.run", side_effect=_forbid_any_subprocess),
+        patch("partgraph.cli.stop_all", side_effect=_forbid_stop_all),
+        patch("partgraph.cli.ensure_running", side_effect=_forbid_ensure_running),
+    ):
+        result = _invoke(["db", "idle-stop"])
+
+    assert result.exit_code == 0, result.output
+    assert REASON_STAMP_UNRECORDABLE in result.output, (
+        f"expected the reported reason to name {REASON_STAMP_UNRECORDABLE!r}: {result.output!r}"
+    )
+    assert "stamp-bootstrapped" not in result.output, (
+        "a write that genuinely did not land must never be reported as "
+        f"the ordinary bootstrap reason: {result.output!r}"
+    )
+    assert str(state_dir) not in result.output
+    assert str(tmp_path) not in result.output
+    assert "/" not in result.output, (
+        f"an unwritable state dir must never leak its path into idle-stop's output: {result.output!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # C-7 — must REUSE stop_all, inherited from PR-A, never re-derived.
 # ---------------------------------------------------------------------------
 
