@@ -37,11 +37,42 @@ could alter without failing loudly?" Two of the seven do.
 
 `db idle-stop` (ADR-0023) decides whether to stop a running database. It must
 not stop one that is in use, so it establishes whether a lease's owning process
-is genuinely alive from `(pid, create_time)` — psutil's own documented technique
-for defeating PID recycling, and named as such in `Lease`'s docstring
-(`src/partgraph/util/activity.py`). A lease is cleaned only on a *confirmed*
-dead process: a clean `NoSuchProcess`, or a live PID whose `create_time` differs
-from the recorded one.
+is genuinely alive from `(pid, create_time)` — the technique psutil documents
+for defeating PID recycling. A lease is cleaned only on a *confirmed* dead
+process: a clean `NoSuchProcess`, or a live PID whose `create_time` differs from
+the recorded one.
+
+**The comparison is ours, not psutil's, and that is why the floor matters.**
+psutil's FAQ is explicit about the split: most read-only methods (`name()`,
+`cpu_percent()`) do **not** check for PID reuse and simply query whatever
+process holds that PID now, while the signal and set methods (`send_signal()`,
+`kill()`, …) **do** check, via PID + creation time, and raise `NoSuchProcess`
+if the PID was recycled. So psutil performs the check only on a code path this
+repository never takes: `grep -rnE "\.(send_signal|kill|terminate|suspend|resume|nice|ionice|rlimit|cpu_affinity)\("
+src/ --include=*.py` returns **nothing** (verified here) — the stop always
+routes through the container engine, never through a signal.
+
+What `src/partgraph/util/activity.py` actually does is call `create_time()` and
+compare the float itself:
+
+```python
+create_time = float(psutil_module.Process(lease.pid).create_time())
+...
+if math.isclose(create_time, lease.create_time, rel_tol=0.0,
+                abs_tol=_CREATE_TIME_TOLERANCE_S):
+    return _LEASE_LIVE
+return _LEASE_DEAD
+```
+
+(`activity.py:655-664`, read directly.) The mismatch branch is ours. We are not
+inheriting psutil's guarded behaviour; we are re-implementing the guard on top
+of the one primitive it is built from, which means we inherit that primitive's
+fragility **without** whatever hardening psutil applies internally to its own
+signal methods. An earlier version of this ADR called `(pid, create_time)`
+"psutil's own documented anti-PID-recycling technique". The technique is indeed
+documented by psutil; psutil is not applying it on our behalf. Read the first
+way, that sentence was misleading, and it mattered — it made the floor look like
+belt-and-braces when it is the only belt.
 
 The whole scheme rests on `create_time()` being a stable identifier for the
 lifetime of a process. psutil's published changelog says it was not, on this
@@ -76,13 +107,39 @@ saying anything was wrong — the stop looks exactly like a correct one. This is
 the class of change the `ruff` incident was, minus the part where anyone finds
 out.
 
-psutil's own FAQ corroborates the fragility from a second, independent angle:
-the `create_time`-based identity check is disabled outright on several BSDs
-because `create_time` is not NTP-stable there. The technique is known by its
-authors to be clock-dependent, and the Linux fix is recent.
+psutil's own FAQ corroborates the fragility from a second, independent angle,
+verbatim:
+
+> On FreeBSD, OpenBSD, SunOS and AIX the PID reuse check is disabled, and
+> process identity is based on the PID alone. That's because on these platforms
+> the process creation time is not stable across system clock updates (e.g.
+> NTP), which previously caused false `NoSuchProcess` exceptions for processes
+> which were still alive.
+
+psutil's authors know the primitive is clock-dependent, disable their own check
+where it cannot be trusted, and name the resulting failure as a **false**
+`NoSuchProcess` for a live process — the same false-dead direction, reached the
+same way.
+
+**Two different platform lists appear in this ADR and they must not be merged.**
+The FAQ's disabled-check list is FreeBSD, OpenBSD, SunOS and AIX — **NetBSD is
+not in it**. NetBSD appears in the `7.1.0` changelog entry above, which is a
+different statement about a different thing (which platforms received the fix,
+not which platforms have the check switched off). An earlier draft of this ADR
+blurred them into "several BSDs"; that phrasing was wrong twice over, since
+SunOS and AIX are not BSDs and NetBSD was not on the list.
+
+**Scope, stated plainly:** on those four platforms `create_time` is documented
+as not NTP-stable, so the manual comparison in `activity.py` would be
+unreliable there *at any psutil version* — no floor fixes that. This repository
+targets Linux and has never claimed otherwise, so this is a limit on where the
+lease check is meaningful, not a defect in it. It is written down because
+"psutil handles it" would be the wrong thing for a future reader to assume on a
+BSD host.
 
 `7.1.0` is the floor: the release the fix actually shipped in, no later and no
-earlier.
+earlier — and it is load-bearing precisely because § 1's comparison is ours to
+get right.
 
 #### Correction: this floor was first set at `7.1.3`, on a misreading
 
@@ -115,13 +172,38 @@ survive review unless someone re-fetches the source. Re-fetch the source.
 The ceiling, `<8`, is weaker evidence and is recorded as such: psutil's changelog
 opens its `8.0.0` section with "psutil 8.0 introduces breaking API changes. See
 the migration guide if upgrading from 7.x." That is a direct textual statement,
-not an inference — but **nothing listed there touches `create_time`,
-`is_running` or `NoSuchProcess`** (re-confirmed during the correction above).
-The ceiling is not a claim that 8.0 breaks this repository. It is a refusal to
-let a major version whose author says "breaking" resolve implicitly into a code
-path that decides whether to kill a running database. It should be lifted by
-reading the migration guide, which is a small, bounded piece of work, not by
-deleting the line.
+not an inference, and it is the **entire** basis for the ceiling. Nothing
+narrower supports it.
+
+Specifically — and this is the second correction in this ADR, see § 6 — what can
+be said about `8.0.0`'s contents is only this: **on Linux, and outside the
+section's Compatibility notes, it touches none of `create_time`, `is_running` or
+`NoSuchProcess`.** `create_time` and `is_running` do not appear in the section at
+all. `NoSuchProcess` appears **eight times**, in BSD and Windows bug fixes, two
+of which are directly about the mechanism the lease check depends on:
+
+> #2888 [FreeBSD], [OpenBSD]: `Process` methods could wrongly raise
+> `NoSuchProcess` ("PID has been reused") for a process still alive, after a
+> system clock update (e.g. NTP).
+
+> #2895: `Process` methods could wrongly raise `NoSuchProcess` ("PID has been
+> reused") when the process creation time could not be determined, e.g. for
+> zombies on NetBSD / OpenBSD or on `AccessDenied` on Windows.
+
+**Both fixes point our way.** They make psutil raise `NoSuchProcess` *less*
+often on a false positive — and a spurious `NoSuchProcess` is exactly a false
+"dead", the direction `activity.py` calls unsafe because it lets a stop through
+while work is in flight. So these entries are an argument *for* 8.0, not against
+it. Neither platform is this repository's target, so neither changes anything
+today; but they must not be cited as ceiling evidence, because they are the
+opposite.
+
+The ceiling is therefore not a claim that 8.0 breaks this repository — it is
+narrower than it may look. It is a refusal to let a major version whose author
+says "breaking" resolve implicitly into a code path that decides whether to kill
+a running database. It should be lifted by reading the migration guide, which is
+a small, bounded piece of work, not by deleting the line — and § 6's row on this
+claim should be read first by whoever does.
 
 ### 2. `pydgraph>=25.2.0,<26` — [PROBABLE], structural coupling, no observed break
 
@@ -216,28 +298,64 @@ the line may go.
 ### 6. Provenance: which sentences here carry weight, and why
 
 Every bound in this ADR rests on a claim about an **upstream** document nobody
-in this repository controls, and the § 1 correction happened because one such
-claim was repeated confidently without being re-fetched. So the sourcing is
-stated explicitly rather than left uniform, and a reader should weight the
-sentences accordingly:
+in this repository controls. **Three** of those claims have now been corrected
+after the fact — two from psutil's changelog, one from its FAQ — and a fourth
+re-reading turned up a finding that changed how § 1 argues its case. Every one
+was repeated confidently before anyone re-fetched the source, and every one was
+caught by re-fetching it. So the sourcing is stated explicitly rather than left
+uniform, and a reader should weight the sentences accordingly:
 
 | Claim | How it was established |
 | --- | --- |
 | psutil changelog: all four issues inside the single `7.1.0` section; `7.1.1`–`7.1.3` contain no `create_time` entry | Fetched from psutil's published changelog and re-checked **twice independently** — once per-issue by number, once by reading section boundaries line by line — after the first reading proved wrong (§ 1) |
-| psutil changelog: `8.0.0` declares breaking API changes, none touching `create_time` / `is_running` / `NoSuchProcess` | Fetched, and re-confirmed during the same correction pass |
-| psutil FAQ: the `create_time` identity check is disabled on several BSDs because it is not NTP-stable there | Reported upstream text, **not re-fetched** during the correction pass |
-| pydgraph CHANGELOG: `25.0.0` "v25 API" protos; `25.1.0` deprecates `from_cloud()`/`parse_host()`, "removal planned for 26.0.0" | Reported upstream text, **not independently re-fetched** |
-| `requests`' float-timeout split traces to 2.4.0 (2014) without regression | Reported upstream history, **not independently re-fetched** — but the behaviour itself is pinned executably against the installed library in `tests/unit/test_requests_timeout_semantics_real.py` |
+| psutil changelog: `7.1.2`/`7.1.3`'s zombie fixes are #2650 and #2672 | **Single-sourced** — one pass, never separately re-confirmed. Load-bearing for nothing: it supports *not* flooring higher, which the bound already does. Anyone arguing to RAISE the floor later should re-check these two numbers first, because that argument is the only one they would support |
+| psutil changelog: `8.0.0` declares "breaking API changes" | Fetched, and re-confirmed twice |
+| psutil changelog: `8.0.0` touches none of `create_time` / `is_running` / `NoSuchProcess` — **FALSE as originally written; now narrowed to "on Linux, and outside Compatibility notes"** | **Re-fetched and CORRECTED.** The original claim came from a *summarised* fetch, whose answer was "none of the listed changes mention create_time, NoSuchProcess or is_running". A **raw** fetch of the same page finds `NoSuchProcess` eight times, including #2888 and #2895 (§ 1). `create_time` and `is_running` are genuinely absent, so two-thirds of the claim held — which is why it read as plausible on review |
+| psutil FAQ: the PID-reuse check is disabled on FreeBSD, OpenBSD, SunOS and AIX because `create_time` is not NTP-stable there | **Re-fetched and quoted verbatim.** The pass produced a CORRECTION — the earlier "several BSDs" wrongly included NetBSD (that list is the `7.1.0` changelog's, a different statement) and wrongly called SunOS/AIX BSDs |
+| psutil FAQ: PID-reuse checking happens only in signal/set methods, not read-only ones | **Re-fetched.** A FINDING from the same pass, not previously in this ADR: it establishes that `activity.py`'s comparison is ours, not psutil's (§ 1). Corroborated locally — no signal/set method call exists anywhere in `src/`, and `activity.py:655-664` does the `math.isclose` comparison itself |
+| pydgraph CHANGELOG: `25.0.0` "v25 API" protos; `25.1.0` deprecates `from_cloud()`/`parse_host()`, "removal planned for 26.0.0" | **Re-fetched and confirmed.** Both lines hold verbatim, including the "(removal planned for 26.0.0)" parenthetical on both `from_cloud()` and `parse_host()`, sync and async |
+| `requests`' float-timeout split traces to 2.4.0 (2014) without regression | **Single-sourced, and deliberately left so.** Never independently re-fetched. Being wrong here costs nothing a bound would have caught, because this claim argues for leaving the dependency *bare* — the failure mode of a bad "leave it unpinned" argument is the status quo. The behaviour itself is pinned executably against the real installed library in `tests/unit/test_requests_timeout_semantics_real.py`, driven through the real adapter over a loopback socket, so the property this row is about is verified even though the history behind it is not |
 | Compose pins `dgraph/standalone:v25.3.4` | Read directly from `docker/docker-compose.yml` in this repository |
 | `pyyaml` has zero `src/` usage; two test consumers | `grep -rn "yaml" src/ --include=*.py` (empty) plus the two importing test files, run in this repository |
 | Both `httpx.Client` call sites pass `follow_redirects` explicitly | Read directly: `src/partgraph/ingest/fetch.py:144`, `src/partgraph/cli.py:3017` |
 | gRPC message-size options set explicitly | Read directly: `src/partgraph/cli.py:1287-1288` |
 | psutil 7.2.2 / pydgraph 25.2.0 installed and satisfying these bounds | Resolved in the real environment via `importlib.metadata` against a real `SpecifierSet` |
 
-The rows marked **not re-fetched** are the ones to check first if any of this
-stops adding up. Nothing in the bottom half of that table depends on a document
-outside this repository; the rows above it do, and only the psutil changelog
-rows have survived deliberate re-verification.
+**Two rows remain single-sourced**, and both are marked as such above:
+`requests`' 2.4.0 history, and the `#2650`/`#2672` issue numbers behind
+`7.1.2`/`7.1.3`'s zombie fixes. Neither is load-bearing, and the reason is the
+same in both cases: each argues for *not* adding a constraint — leaving
+`requests` bare, and not flooring psutil higher — so an error in either leaves
+the manifest exactly where it already is. Every row that argues *for* a bound
+has been re-fetched. Check these two first if any of this stops adding up, and
+re-check `#2650`/`#2672` specifically before ever raising the psutil floor.
+
+A further caveat about this table itself: the re-fetches recorded here were
+performed by the reviewer, not by the author of the surrounding prose, who
+transcribed them. That hand-off is precisely the step that produced two of the
+three corrections above. The table is written per-claim rather than per-source
+so that a reader who doubts a specific quote knows which one to re-pull, and
+the repository-local rows at the bottom — the greps, the line references, the
+installed-version resolution — are the only ones that were established and
+written by the same pass.
+
+One pattern is worth extracting, because it produced every correction here and
+will produce the next one: **a summarising layer between the source and the
+claim reads as a fetch but is not one.** All three were that shape. The first
+flattened a long section's internal structure and scattered four issue numbers
+across three releases that never carried them. The second answered a
+"does X appear?" question with "no" about a page where X appears eight times.
+The third merged two adjacent platform lists into one that matched neither.
+None looked like a guess; all three produced specific, well-formed, checkable
+citations, which is precisely what let them survive to a bound. A raw fetch, or
+a grep of the raw page, caught all three in seconds.
+
+The re-reads also paid for themselves in a way that has nothing to do with
+error-correction: the FAQ pass is what surfaced that psutil's PID-reuse check
+never runs on our code path, which is the strongest argument in § 1 and was
+absent from the first three drafts. Re-reading a source you have already cited
+is not just auditing — prefer the raw read for anything that ends up as a
+version constraint, and read the whole section, not the part you came for.
 
 None of the upstream claims is load-bearing for *correctness today* — the
 installed versions are what they are, and their behaviour is pinned by tests

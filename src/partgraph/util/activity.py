@@ -238,8 +238,18 @@ class Lease:
         pid: The recording process's PID.
         create_time: That process's start time as psutil reports it. The PID
             alone is not identity — PIDs are recycled — so both halves must
-            match before a lease counts as live. This is psutil's own
-            documented anti-PID-recycling technique.
+            match before a lease counts as live. The ``(pid, create_time)``
+            technique is psutil's, and documented by it, but the comparison
+            is OURS: psutil applies the check only inside its signal and set
+            methods (``kill()``, ``send_signal()``, ...), never in a read-only
+            call like ``create_time()``. This repository invokes none of those
+            methods — a stop always goes through the container engine — so
+            :func:`_lease_status` reads the value and compares it itself.
+            That is why ``pyproject.toml`` floors psutil at ``7.1.0`` (see
+            ADR-0025): before that release ``create_time()`` could shift under
+            a system clock update on Linux, and a shifted value reads here as
+            DEAD — the unsafe direction named at
+            :data:`_CREATE_TIME_TOLERANCE_S`.
         acquired_utc: When the lease was taken, ISO-8601 in UTC. Recorded for
             operator diagnosis only; no decision reads it.
     """

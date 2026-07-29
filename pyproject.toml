@@ -40,8 +40,12 @@ dependencies = [
     "pyyaml",
     "requests",
     # The FLOOR is the load-bearing half. `db idle-stop` decides whether a
-    # lease's owner is still alive from `(pid, create_time)` — psutil's own
-    # documented anti-PID-recycling technique. psutil's changelog makes
+    # lease's owner is still alive from `(pid, create_time)` — the technique
+    # psutil documents, but which WE perform: psutil only checks PID reuse
+    # inside its signal/set methods, and nothing in src/ calls one (the stop
+    # goes through the container engine). `util/activity.py` reads create_time
+    # and compares it itself, so the floor is the only thing standing between a
+    # clock step and a wrong answer. psutil's changelog makes
     # `create_time()` monotonic-clock-based in ONE release, 7.1.0: all four
     # issues (#2526, #2541, #2570, #2578) sit inside that single section.
     # 7.1.1 is SunOS-only; 7.1.2/7.1.3 are macOS/BSD zombie-reaping fixes and
@@ -52,11 +56,22 @@ dependencies = [
     # for a still-running process: a false "dead", which `util/activity.py`'s
     # tolerance comment names as the unsafe direction because it lets a stop
     # through while real work is in flight. psutil's FAQ says the same from
-    # another angle — the check is disabled outright on several BSDs because
-    # create_time is not NTP-stable there. Lowering this floor does not fail a
-    # gate; it silently re-arms a wrong stop decision. The ceiling is upstream's
-    # own disclosure that 8.0 introduces breaking API changes (nothing listed
-    # there touches `create_time`, `is_running` or `NoSuchProcess`).
+    # another angle: it disables its own PID-reuse check on FreeBSD, OpenBSD,
+    # SunOS and AIX (NOT NetBSD — that list is from the 7.1.0 changelog and is
+    # a different statement) because create_time is not NTP-stable there, and
+    # names the symptom as false NoSuchProcess for a live process. On those four
+    # our manual comparison is unreliable at ANY version; we target Linux.
+    # Lowering this floor does not fail a gate; it silently re-arms a wrong stop
+    # decision. The ceiling rests on the 8.0.0 section's own "psutil 8.0
+    # introduces breaking API changes" line, and on nothing narrower: it names
+    # no create_time change. On Linux, and outside that section's Compatibility
+    # notes, it touches none of `create_time`, `is_running` or `NoSuchProcess` —
+    # but it DOES carry BSD/Windows `NoSuchProcess` fixes, two of them (#2888,
+    # #2895) about wrongly raising it for a process that is still alive after a
+    # clock update. Those remove FALSE "dead" answers, which is our safe
+    # direction, so they argue for 8.0 rather than against it. An earlier draft
+    # of this comment said the section touched none of the three at all. It
+    # names `NoSuchProcess` eight times; ADR-0025 § 6 records how that got in.
     "psutil>=7.1.0,<8",
 ]
 
