@@ -53,6 +53,18 @@ already covers the recycled-PID DECISION path with an injected fake
 (`test_recycled_pid_is_not_mistaken_for_a_live_lease`). What IS proven here
 is the primitive that decision depends on: create_time() is stable for a
 live process and raises NoSuchProcess for a confirmed-dead one.
+
+EXTENDED for ADR-0025 § 1's "Open risk" (the clock-step defect fixed on
+branch `fix/lease-identity-survives-clock-step`): two further tests measure
+`create_time() - boot_time()`, the fix's own candidate replacement quantity,
+against the real kernel and the real library — supporting evidence for that
+fix's design questions, kept here because it is the SAME kind of claim this
+file already makes ("measured on the installed library", not quoted from an
+ADR). The clock-step DEFECT itself, and the migration contract the fix's
+persisted-format change creates, are pinned separately in
+`tests/unit/test_lease_survives_clock_step.py`, not here — this file stays
+scoped to primitives that are ALREADY true today, never to a not-yet-landed
+fix's own behaviour.
 """
 
 from __future__ import annotations
@@ -170,3 +182,96 @@ def test_create_time_of_a_terminated_and_reaped_process_raises_no_such_process()
 
     with pytest.raises(psutil.NoSuchProcess):
         psutil.Process(dead_pid).create_time()
+
+
+# ---------------------------------------------------------------------------
+# `create_time() - boot_time()` — the seconds-since-boot quantity
+# ADR-0025 § 1's "Open risk" names as the fix's own candidate ("persist and
+# compare create_time() - boot_time(), the seconds-since-boot form _ident
+# itself uses"). These two tests measure, against the REAL installed library
+# and the REAL kernel (never assumed from the ADR's own prose), whether that
+# reconstruction is numerically sound enough to replace the epoch comparison
+# `tests/unit/test_lease_survives_clock_step.py` proves is broken — i.e.
+# whether `_CREATE_TIME_TOLERANCE_S` (1e-3) still fits once the quantity being
+# compared changes (this fix's design question 3). Both are GREEN today: they
+# pin an ALREADY-true property of the installed library and kernel, not the
+# fix itself — the fix's own RED tests live in
+# `test_lease_survives_clock_step.py`.
+# ---------------------------------------------------------------------------
+
+
+def test_create_time_minus_boot_time_matches_the_kernel_starttime_field_directly() -> None:
+    """[decode-before-hypothesise] Given the REAL, currently-running pytest
+    worker process, and Linux's own `/proc/<pid>/stat` field 22 (`starttime`
+    — "the number of clock ticks since the system booted until the process
+    was created", per `proc(5)`) read directly, independent of psutil
+    entirely, and converted to seconds via `os.sysconf("SC_CLK_TCK")`.
+    When `psutil.Process(pid).create_time() - psutil.boot_time()` (both
+    PUBLIC calls — the exact expression ADR-0025 § 1 sketches as the fix) is
+    computed for the SAME process.
+    Then the two values agree within `_CREATE_TIME_TOLERANCE_S` — proving the
+    public-API reconstruction recovers the kernel's own ground-truth
+    boot-relative start time, not merely psutil's private `_ident`/`_ctime`
+    (a DIFFERENT, unverified source this test deliberately does not consult).
+    Linux-only (the `/proc/<pid>/stat` format is a Linux kernel contract);
+    skips cleanly on any other platform.
+    """
+    if sys.platform != "linux":
+        pytest.skip("/proc/<pid>/stat is a Linux-specific kernel interface.")
+
+    pid = os.getpid()
+    create_time = psutil.Process(pid).create_time()
+    boot_time = psutil.boot_time()
+    reconstructed_since_boot = create_time - boot_time
+
+    clock_ticks_per_second = os.sysconf("SC_CLK_TCK")
+    with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+        raw_stat = handle.read()
+    # `comm` (field 2) is parenthesised and may itself contain ')' or spaces,
+    # so split on the LAST ')' — the standard, kernel-documented technique —
+    # rather than a naive whitespace split from the start of the line.
+    fields_after_comm = raw_stat.rpartition(")")[2].split()
+    starttime_ticks = int(fields_after_comm[22 - 3])  # field 22, 1-indexed overall
+    kernel_since_boot = starttime_ticks / clock_ticks_per_second
+
+    assert reconstructed_since_boot == pytest.approx(
+        kernel_since_boot, abs=_CREATE_TIME_TOLERANCE_S
+    ), (
+        f"create_time() - boot_time() ({reconstructed_since_boot!r}) must match "
+        f"the kernel's own starttime field ({kernel_since_boot!r}) within "
+        f"_CREATE_TIME_TOLERANCE_S ({_CREATE_TIME_TOLERANCE_S}) for the "
+        f"public-API reconstruction to be a safe drop-in for the epoch form"
+    )
+
+
+def test_create_time_minus_boot_time_is_stable_across_repeated_real_reads_with_an_elapsed_gap() -> (
+    None
+):
+    """Given a real, currently-running child process (spawned by this test,
+    deliberately left running across two reads).
+    When `create_time() - boot_time()` (both PUBLIC calls) is computed TWICE,
+    each via a FRESH `psutil.Process` construction (never the same cached
+    object — mirroring `_lease_status`'s own per-call construction), with a
+    real, elapsed wall-clock gap between the two reads.
+    Then both reads agree within `_CREATE_TIME_TOLERANCE_S` — mirroring
+    `test_create_time_of_a_live_process_is_stable_across_repeated_real_reads`
+    above for the RECONSTRUCTED since-boot quantity: proving it is at least
+    as stable, absent an actual clock step, as the epoch form already proven
+    stable there — the numerical precondition for design question 1's ruling
+    that no widening of `_CREATE_TIME_TOLERANCE_S` is needed for the fix.
+    """
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3)"])
+    try:
+        first = float(psutil.Process(child.pid).create_time()) - float(psutil.boot_time())
+        time.sleep(0.3)
+        second = float(psutil.Process(child.pid).create_time()) - float(psutil.boot_time())
+    finally:
+        child.terminate()
+        child.wait(timeout=_SUBPROCESS_WAIT_TIMEOUT_S)
+
+    assert first == pytest.approx(second, abs=_CREATE_TIME_TOLERANCE_S), (
+        f"create_time() - boot_time() drifted between two reads of the SAME "
+        f"live process, absent any clock step ({first} vs {second}, "
+        f"diff={abs(first - second)}), beyond _CREATE_TIME_TOLERANCE_S "
+        f"({_CREATE_TIME_TOLERANCE_S})"
+    )
