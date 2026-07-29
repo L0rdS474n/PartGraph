@@ -454,15 +454,16 @@ def test_idle_stop_fresh_stamp_is_a_noop_never_calls_stop_all(
 
 
 # ---------------------------------------------------------------------------
-# [RED — pre-fix, honesty fix] REASON_STAMP_UNRECORDABLE at the CLI
-# boundary. `db idle-stop` must report the write's ACTUAL outcome, and its
-# output must stay path-free even on this new failure branch —
-# `_report_idle_stop_outcome`'s own sibling contract ("Every line is
-# path-free... never the opaque container ID") extended to the reason line
-# printed before any `stop_all` delegation is even reached.
-# `REASON_STAMP_UNRECORDABLE` does not exist yet; imported LOCALLY inside
-# the test body so this one new symbol failing to import errors only this
-# test, not the rest of this already-green file.
+# REASON_STAMP_UNRECORDABLE at the CLI boundary (honesty fix — landed).
+# `db idle-stop` must report the write's ACTUAL outcome, and its output must
+# stay path-free even on this new failure branch — `_report_idle_stop_
+# outcome`'s own sibling contract ("Every line is path-free... never the
+# opaque container ID") extended to the reason line printed before any
+# `stop_all` delegation is even reached. `REASON_STAMP_UNRECORDABLE` now
+# exists in `partgraph.util.activity`; it is still imported LOCALLY inside
+# the test body rather than added to this file's own top-level import list,
+# so a future regression to this one symbol errors only this test, not the
+# rest of this file.
 # ---------------------------------------------------------------------------
 
 

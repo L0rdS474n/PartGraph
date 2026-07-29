@@ -25,12 +25,14 @@ from __future__ import annotations
 import ast
 import inspect
 import pathlib
+import re
 
 import pytest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 _ACTIVITY_PATH = _REPO_ROOT / "src" / "partgraph" / "util" / "activity.py"
 _LIFECYCLE_PATH = _REPO_ROOT / "src" / "partgraph" / "util" / "lifecycle.py"
+_TEST_ACTIVITY_PATH = _REPO_ROOT / "tests" / "unit" / "test_activity.py"
 
 
 def _read_activity_source_or_skip() -> str:
@@ -308,3 +310,82 @@ def test_partgraph_util_package_does_not_reexport_activity_functions() -> None:
             f"partgraph.util must NOT re-export {forbidden_name!r} — it must "
             "only be reachable via partgraph.util.activity directly."
         )
+
+
+# ---------------------------------------------------------------------------
+# `test_activity.py`'s own module docstring hand-enumerates every
+# `REASON_*` tag in its "Pinned contract" section — a prose inventory a
+# reader trusts as authoritative. It silently went one tag short: when
+# `REASON_STAMP_UNRECORDABLE` landed, nothing forced that enumeration to be
+# updated to match, because prose is not an assertion — the exact shape a
+# separate finding in this body of work has already named for `cli.py`'s
+# phantom convention claim, the false `subprocess.run` idiom claim, and a
+# `--limit 0` scenario that never existed. This guard makes the inventory
+# self-checking instead of relying on a human to notice next time: it
+# extracts every backtick-quoted `REASON_...` token from that file's OWN
+# raw source, between two stable, single-line anchor phrases bracketing the
+# list, and diffs it against `partgraph.util.activity.__all__`'s ACTUAL
+# `REASON_*` names — never a second hand-typed copy of either side.
+# ---------------------------------------------------------------------------
+
+_REASON_INVENTORY_START = "Module-level constants:"
+_REASON_INVENTORY_END = "State-file mechanics (C-1, C-3, C-14):"
+
+
+def test_reason_tags_docstring_inventory_matches_the_modules_actual_reason_constants() -> None:
+    """Given `tests/unit/test_activity.py`'s own module docstring hand-lists
+    every `REASON_*` tag between its "Module-level constants:" and
+    "State-file mechanics (C-1, C-3, C-14):" anchor phrases (both stable,
+    single-line, and outside the list itself, so editing the list cannot
+    accidentally remove them).
+    When every backtick-quoted `REASON_[A-Z_]+` token in that span is
+    extracted via regex and compared against
+    `partgraph.util.activity.__all__`'s ACTUAL `REASON_*` names, read live
+    from the module rather than re-typed here.
+    Then the two sets are IDENTICAL. A tag added to the module without
+    updating that prose — exactly what happened when
+    `REASON_STAMP_UNRECORDABLE` landed — now fails a real assertion instead
+    of silently reading as an authoritative, quietly-wrong inventory; a tag
+    removed or renamed is caught the same way. If either anchor phrase is
+    ever reworded, extraction finds an empty or wrong span and this test
+    fails loudly rather than passing on a false positive — the anchors are
+    checked live against the real file, never assumed stable forever.
+    Skips cleanly (not error) if `partgraph.util.activity` does not exist
+    yet, mirroring every other test in this file.
+    """
+    activity = pytest.importorskip(
+        "partgraph.util.activity",
+        reason="partgraph.util.activity does not exist yet (expected pre-PR-C).",
+    )
+    actual_reason_names = {name for name in activity.__all__ if name.startswith("REASON_")}
+    assert actual_reason_names, "sanity: activity.py must define at least one REASON_* tag"
+
+    assert _TEST_ACTIVITY_PATH.exists(), f"expected {_TEST_ACTIVITY_PATH} to exist"
+    source = _TEST_ACTIVITY_PATH.read_text(encoding="utf-8")
+    start = source.index(_REASON_INVENTORY_START)
+    end = source.index(_REASON_INVENTORY_END, start)
+    inventory_span = source[start:end]
+    documented_reason_names = set(re.findall(r"REASON_[A-Z_]+", inventory_span))
+
+    assert documented_reason_names == actual_reason_names, (
+        "tests/unit/test_activity.py's module-docstring 'Pinned contract' "
+        "REASON_* inventory has drifted from partgraph.util.activity.__all__'s "
+        f"actual set. documented={sorted(documented_reason_names)!r} "
+        f"actual={sorted(actual_reason_names)!r}"
+    )
+
+
+def test_reason_inventory_anchor_phrases_are_themselves_present_in_the_real_source() -> None:
+    """[Negative control for the guard above] Given the same two anchor
+    phrases the guard above relies on to bracket the inventory.
+    When `tests/unit/test_activity.py`'s real source is searched for each.
+    Then both are found — proving the guard above is not silently matching
+    an empty span (e.g. via `str.index` raising `ValueError` and the test
+    erroring in a way that could be mistaken for "nothing to check") but
+    genuinely bracketing real, non-empty content."""
+    if not _TEST_ACTIVITY_PATH.exists():
+        pytest.skip("tests/unit/test_activity.py does not exist.")
+    source = _TEST_ACTIVITY_PATH.read_text(encoding="utf-8")
+    assert _REASON_INVENTORY_START in source
+    assert _REASON_INVENTORY_END in source
+    assert source.index(_REASON_INVENTORY_START) < source.index(_REASON_INVENTORY_END)

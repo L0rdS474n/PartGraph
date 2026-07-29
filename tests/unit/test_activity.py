@@ -31,10 +31,15 @@ activity in return; the two are combined only inside `partgraph.cli`'s
 import `partgraph.cli`, `partgraph.util.lifecycle`, `partgraph.util.container`,
 or any embed/query/load module.
 
-NOT YET IMPLEMENTED. `src/partgraph/util/activity.py` does not exist yet —
-this whole file is expected to ERROR at COLLECTION with ModuleNotFoundError,
-mirroring `tests/unit/test_cli_db_down.py`'s own documented pre-PR-A history
-for `partgraph.util.lifecycle`. This is the correct test-first RED state.
+IMPLEMENTED. `src/partgraph/util/activity.py` exists and this file collects
+and runs normally now. The paragraph above ("Pinned contract this file
+specifies") is a live, present-tense inventory; this one is history, kept
+for context rather than because it is still true: this file ORIGINALLY
+collected with every test below erroring with `ModuleNotFoundError` (its
+own top-level `from partgraph.util.activity import (...)`), mirroring
+`tests/unit/test_cli_db_down.py`'s own documented pre-PR-A history for
+`partgraph.util.lifecycle` — the correct test-first RED state PR-C started
+from, not a claim about where it stands today.
 
 Pinned contract this file specifies:
 
@@ -50,10 +55,18 @@ Pinned contract this file specifies:
 
     `REASON_DISABLED`, `REASON_LIVE_LEASE`, `REASON_UNDETERMINED_LEASE`,
     `REASON_FRESH_STAMP`, `REASON_STALE`, `REASON_NOTHING_TO_DO`,
-    `REASON_STAMP_BOOTSTRAPPED`, `REASON_STAMP_POISON_RECOVERED` — plain
-    string tags (mirrors `partgraph.util.lifecycle`'s own
-    `_OWNER_NAME_MATCH = "S1"` style), naming WHY an `IdleDecision` was
-    reached, so a test can assert the reason, not merely the boolean.
+    `REASON_STAMP_BOOTSTRAPPED`, `REASON_STAMP_POISON_RECOVERED`,
+    `REASON_STAMP_UNRECORDABLE` — plain string tags (mirrors
+    `partgraph.util.lifecycle`'s own `_OWNER_NAME_MATCH = "S1"` style),
+    naming WHY an `IdleDecision` was reached, so a test can assert the
+    reason, not merely the boolean. This inventory is enforced, not merely
+    hand-maintained: `test_activity_architecture.py`'s
+    `test_reason_tags_docstring_inventory_matches_the_modules_actual_reason_constants`
+    diffs the `REASON_*` tokens listed here against
+    `partgraph.util.activity.__all__`'s actual set, so it cannot silently
+    go stale the way it did once already — `REASON_STAMP_UNRECORDABLE`
+    landed and this exact list was not updated to match, and nothing went
+    red, because prose is not an assertion.
 
     `STAMP_FUTURE_POISON_CEILING_MINUTES: float` — see "[Gate 3a BLOCKING]
     the stamp-poisoning ceiling" below.
@@ -75,7 +88,13 @@ Pinned contract this file specifies:
     below, "two concurrent leases").
     `lease_paths(state_dir) -> tuple[Path, ...]` — every currently-present
     lease file, regardless of liveness.
-    `touch_activity(*, state_dir, now=None) -> None`
+    `touch_activity(*, state_dir, now=None) -> bool` — True iff the durable
+    record is trustworthy once the call returns (a landed write, or a
+    write correctly declined under monotonic protection because the stamp
+    already on disk is at least as recent); False iff a write was owed and
+    did not land. Originally `-> None`, silently discarding the boolean
+    `_atomic_write` (below) already computes — see
+    `REASON_STAMP_UNRECORDABLE` further down.
     `read_activity_stamp(state_dir) -> datetime | None`
     `acquire_lease(*, state_dir, pid=None, now=None, psutil_module=None) -> None`
     `release_lease(*, state_dir, pid=None) -> None`
@@ -602,20 +621,21 @@ def test_touch_activity_warn_once_scope_is_per_state_dir_not_global(
 
 
 # ---------------------------------------------------------------------------
-# [RED — pre-fix, honesty fix] `touch_activity`'s return-value contract.
-# `_atomic_write`'s own docstring already promises "Return True iff it
+# `touch_activity`'s return-value contract (honesty fix — landed).
+# `_atomic_write`'s own docstring already promised "Return True iff it
 # landed" (see its definition above), but `touch_activity` discarded that
 # boolean and returned `None` unconditionally — the outcome was not merely
-# ignored, it was UNOBSERVABLE one frame up. No test anywhere in this suite
-# asserted `touch_activity(...)`'s return value before this section
-# (confirmed by inspection: `grep -n "touch_activity(" tests/` shows every
-# call site is a bare statement); the ONLY place `-> None` appeared was this
-# file's own module-docstring "Pinned contract" prose near the top, which is
+# ignored, it was UNOBSERVABLE one frame up. Before this section was added,
+# no test anywhere in this suite asserted `touch_activity(...)`'s return
+# value (confirmed by inspection: `grep -n "touch_activity(" tests/` showed
+# every call site as a bare statement); the ONLY place `-> None` had
+# appeared was this file's own module-docstring "Pinned contract" prose near
+# the top (now updated to `-> bool` alongside this fix), which was
 # documentation, never an executable assertion. Widening the return type to
-# `bool` therefore weakens no existing pin, and every real caller
+# `bool` therefore weakened no existing pin, and every real caller
 # (`src/partgraph/cli.py`'s nine-plus `touch_activity(state_dir=...)` call
 # sites) already discards the return value as a bare expression statement,
-# so this is additive, not breaking.
+# so this was additive, not breaking.
 # ---------------------------------------------------------------------------
 
 
@@ -1443,17 +1463,18 @@ def test_no_stamp_bootstrap_protects_for_a_full_budget_window_then_goes_stale(tm
 
 
 # ---------------------------------------------------------------------------
-# [RED — pre-fix, honesty fix] REASON_STAMP_UNRECORDABLE. Today
-# `_stamp_decision` calls `touch_activity(state_dir=directory, now=lambda:
-# moment)` and returns REASON_STAMP_BOOTSTRAPPED / REASON_STAMP_POISON_
-# RECOVERED UNCONDITIONALLY, discarding the boolean pinned in the section
-# above — so on a read-only or root-owned `data/state`, every `db idle-stop`
-# run claims a stamp was written when NONE ever lands, and the database is
-# never stopped: permanently, silently. `REASON_STAMP_UNRECORDABLE` does not
-# exist in `src/partgraph/util/activity.py` yet; it is imported LOCALLY
-# inside each test below (never at this file's module level) specifically so
-# that ONE missing symbol errors only THESE new tests at collection-adjacent
-# run time, not the ~120 other, already-green tests this same file collects.
+# REASON_STAMP_UNRECORDABLE (honesty fix — landed). `_stamp_decision` used to
+# call `touch_activity(state_dir=directory, now=lambda: moment)` and return
+# REASON_STAMP_BOOTSTRAPPED / REASON_STAMP_POISON_RECOVERED
+# UNCONDITIONALLY, discarding the boolean pinned in the section above — so on
+# a read-only or root-owned `data/state`, every `db idle-stop` run claimed a
+# stamp was written when NONE ever landed, and the database was never
+# stopped: permanently, silently. `REASON_STAMP_UNRECORDABLE` now exists in
+# `src/partgraph/util/activity.py`; it is still imported LOCALLY inside each
+# test below (never at this file's module level) rather than added to this
+# file's own top-level import list, so that a future regression to this one
+# symbol errors only these tests at run time, not the ~120 other tests this
+# same file collects.
 #
 # Every test below makes the write GENUINELY fail (`os.replace` raises,
 # exactly like the leaf-level failure injection just above — never a mocked
