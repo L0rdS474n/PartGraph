@@ -4344,7 +4344,7 @@ def test_ac_lm_1_search_limit_non_positive_exits_1_reuses_validate_limit_message
     contains the EXACT existing "--limit must be a positive integer."
     message — the same fixed, path-free string `_validate_limit` already
     emits for `ingest jlcparts` / `embed` / `refresh-links` / `refresh`
-    (cli.py:1259). No Dgraph client is ever built (parity with
+    (the message `_validate_limit` itself prints). No Dgraph client is ever built (parity with
     `_connect_dgraph`'s own contract: "a bad --limit must be reported
     without starting anything").
 
@@ -4390,7 +4390,7 @@ def test_ac_lm_2_search_limit_one_boundary_still_succeeds() -> None:
     Then exit code is 0 (UNCHANGED by this fix: 1 was never rejected, before
     or after), and the captured DQL's `first:` clause is 1 for every block —
     the boundary sits exactly at "1 is accepted, 0 is not", matching
-    `_validate_limit`'s own `value <= 0` check (cli.py:1258) exactly, with no
+    `_validate_limit`'s own `value <= 0` check exactly, with no
     off-by-one drift introduced by threading validation into `search`.
     """
     mock_txn, captured = _make_capturing_txn()

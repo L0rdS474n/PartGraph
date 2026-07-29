@@ -478,7 +478,7 @@ def test_dql_builder_limit_cap_enforced() -> None:
 # CLI boundary (ADR-0024) is a UX/contract decision about ONE caller; it does
 # not, and must not, remove the builder's own defense-in-depth against a
 # non-positive `first:` clause for every OTHER caller (a future library
-# consumer, `refresh_links`'s or another command's own re-use of the builder
+# consumer -- no command outside `search` calls it today (ADR-0024 says so
 # without going through _validate_limit, or a Python caller that never sees
 # a Typer/Click option at all and could pass any int, including 0 or
 # negative, straight through). Removing the clamp is a SEPARATE decision
