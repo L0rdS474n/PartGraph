@@ -19,14 +19,63 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
 ]
+# Only two of these carry a bound, and only because there is evidence they can
+# change behaviour this repository decides on — the same test the `ruff` pin
+# below had to be paid for the hard way. The other five are bare on purpose;
+# ADR-0025 records the reason for each, and a test holds them bare so a future
+# `pip freeze`-shaped pin cannot land unargued.
 dependencies = [
     "typer",
     "rich",
-    "pydgraph",
+    # Bound because it tracks the Dgraph SERVER's release line, not because a
+    # release was observed breaking us — weaker evidence than psutil below, and
+    # ADR-0025 says so. 25.0.0 regenerated the protos "to support Dgraph v25
+    # API"; 25.1.0 deprecated `DgraphClientStub.from_cloud()`/`.parse_host()`
+    # with removal planned for 26.0.0. docker/docker-compose.yml pins the server
+    # to `dgraph/standalone:v25.3.4`, so a client resolving a major line ahead
+    # of the server is a coupling nothing in this repo would catch. Move the
+    # ceiling when the compose file moves to a v26 server, not before.
+    "pydgraph>=25.2.0,<26",
     "httpx",
     "pyyaml",
     "requests",
-    "psutil",
+    # READ ADR-0025's "Open risk" BEFORE trusting this floor. The floor does
+    # NOT protect `db idle-stop`, though an earlier version of this comment
+    # said it did. 7.1.0 made psutil's INTERNAL identity (`Process._ident`)
+    # monotonic — that is what `is_running()` and the reuse check inside
+    # `ppid()`/`children()`/`nice()`/the signal methods compare. We call none
+    # of those. `util/activity.py` calls the PUBLIC `create_time()`, which
+    # returns `monotonic_start + boot_time()` and is re-derived from the wall
+    # clock on every call — psutil's own docstring in the installed 7.2.2 still
+    # says it "may be affected by ... time synchronization (e.g. NTP)".
+    # Verified on this machine: create_time() - _ident[1] == boot_time()
+    # exactly. So a clock step still breaks our stored-vs-live comparison by
+    # whole seconds against a 1 ms tolerance, and the false-DEAD risk is OPEN.
+    # The real fix is in our code (persist `create_time() - boot_time()`), not
+    # in this bound. `>=7.1.0` is kept because it is harmless and keeps us off
+    # releases with a known identity bug on adjacent paths — not because it
+    # buys the property this comment used to claim. The floor is 7.1.0 and not
+    # higher: #2526/#2541/#2570/#2578 all sit in that ONE section; 7.1.1 is
+    # SunOS-only and 7.1.2/7.1.3 are macOS/BSD zombie fixes, so flooring higher
+    # would reject working releases for a reason that does not exist (this
+    # bound was first written `>=7.1.3` on exactly that misreading; see
+    # ADR-0025). psutil's FAQ describes disabling the reuse check on FreeBSD,
+    # OpenBSD, SunOS and AIX (NOT NetBSD — that list is the 7.1.0 changelog's,
+    # a different statement), but that passage describes 8.0.0; under the
+    # pinned 7.x the check is not disabled there. The ceiling rests on the
+    # 8.0.0 section's own "psutil 8.0 introduces breaking API changes" line and
+    # on nothing narrower: it names no create_time change. On Linux, and
+    # outside that section's Compatibility notes, it touches none of
+    # `create_time`, `is_running` or `NoSuchProcess` — but it DOES carry
+    # BSD/Windows `NoSuchProcess` fixes. #2888 is the clock case (FreeBSD/
+    # OpenBSD, wrongly raising for a live process after a clock update); #2895
+    # is a different one — an undeterminable creation time (zombies on NetBSD/
+    # OpenBSD, AccessDenied on Windows), not a clock update. Both remove FALSE
+    # "dead" answers, our safe direction, so they argue for 8.0 rather than
+    # against it. An earlier draft of this comment said the section touched
+    # none of the three at all. It names `NoSuchProcess` eight times; ADR-0025
+    # § 6 records how that got in.
+    "psutil>=7.1.0,<8",
 ]
 
 [project.optional-dependencies]
