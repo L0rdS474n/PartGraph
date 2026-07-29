@@ -236,20 +236,41 @@ class Lease:
 
     Attributes:
         pid: The recording process's PID.
-        create_time: That process's start time as psutil reports it. The PID
-            alone is not identity — PIDs are recycled — so both halves must
-            match before a lease counts as live. The ``(pid, create_time)``
-            technique is psutil's, and documented by it, but the comparison
-            is OURS: psutil applies the check only inside its signal and set
-            methods (``kill()``, ``send_signal()``, ...), never in a read-only
-            call like ``create_time()``. This repository invokes none of those
-            methods — a stop always goes through the container engine — so
-            :func:`_lease_status` reads the value and compares it itself.
-            That is why ``pyproject.toml`` floors psutil at ``7.1.0`` (see
-            ADR-0025): before that release ``create_time()`` could shift under
-            a system clock update on Linux, and a shifted value reads here as
-            DEAD — the unsafe direction named at
-            :data:`_CREATE_TIME_TOLERANCE_S`.
+        create_time: That process's start time as psutil reports it, in
+            EPOCH form. The PID alone is not identity — PIDs are recycled —
+            so both halves must match before a lease counts as live.
+
+            The ``(pid, create_time)`` technique is psutil's own, but the
+            comparison here is OURS and it does NOT inherit psutil's
+            clock-stability. psutil builds its internal identity from
+            ``Process._ident``, whose second element on Linux/macOS/NetBSD is
+            the MONOTONIC start time since boot; that is what its own reuse
+            check compares, and that check runs in ``ppid()``, ``children()``,
+            ``connections()``, ``nice()`` and the signal methods
+            (``send_signal()``, ``suspend()``, ``resume()``, ``terminate()``,
+            ``kill()``). ``create_time()`` is not one of them and performs no
+            reuse check. This repository calls none of them either — a stop
+            always goes through the container engine — so :func:`_lease_status`
+            reads the value and compares it itself.
+
+            What ``create_time()`` returns is ``monotonic_start + boot_time()``,
+            and ``boot_time()`` is re-read from the wall clock on every call.
+            psutil says so on the method itself: "based on the system clock,
+            which means it may be affected by changes such as manual
+            adjustments or time synchronization (e.g. NTP)."
+
+            OPEN GAP — see ADR-0025's "Open risk" section. A system clock step
+            during a long run shifts this value by the size of the step: whole
+            seconds against :data:`_CREATE_TIME_TOLERANCE_S`'s 1 ms. The
+            comparison then misses and :func:`_lease_status` reports a
+            still-live owner as DEAD, which is the unsafe direction — it lets a
+            stop through while real work is in flight. The ``psutil>=7.1.0``
+            floor in ``pyproject.toml`` does NOT prevent this: 7.1.0 made
+            ``_ident`` monotonic, not the epoch value persisted here. The fix
+            belongs in this module — persist and compare
+            ``create_time() - boot_time()``, the seconds-since-boot form
+            ``_ident`` itself uses — and is deliberately not made in this
+            change.
         acquired_utc: When the lease was taken, ISO-8601 in UTC. Recorded for
             operator diagnosis only; no decision reads it.
     """
