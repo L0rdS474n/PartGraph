@@ -601,6 +601,93 @@ def test_touch_activity_warn_once_scope_is_per_state_dir_not_global(
     assert len(warnings) == 2, warnings
 
 
+# ---------------------------------------------------------------------------
+# [RED — pre-fix, honesty fix] `touch_activity`'s return-value contract.
+# `_atomic_write`'s own docstring already promises "Return True iff it
+# landed" (see its definition above), but `touch_activity` discarded that
+# boolean and returned `None` unconditionally — the outcome was not merely
+# ignored, it was UNOBSERVABLE one frame up. No test anywhere in this suite
+# asserted `touch_activity(...)`'s return value before this section
+# (confirmed by inspection: `grep -n "touch_activity(" tests/` shows every
+# call site is a bare statement); the ONLY place `-> None` appeared was this
+# file's own module-docstring "Pinned contract" prose near the top, which is
+# documentation, never an executable assertion. Widening the return type to
+# `bool` therefore weakens no existing pin, and every real caller
+# (`src/partgraph/cli.py`'s nine-plus `touch_activity(state_dir=...)` call
+# sites) already discards the return value as a bare expression statement,
+# so this is additive, not breaking.
+# ---------------------------------------------------------------------------
+
+
+def test_touch_activity_returns_true_when_the_write_lands(tmp_path) -> None:
+    """Given an ordinary, writable state dir.
+    When `touch_activity` is called.
+    Then it returns True — the write genuinely landed, threading
+    `_atomic_write`'s own "Return True iff it landed" promise all the way up
+    to `touch_activity`'s caller, its only consumer inside this module."""
+    state_dir = tmp_path / "state"
+    assert touch_activity(state_dir=state_dir, now=lambda: _dt(2026, 7, 28)) is True
+
+
+def test_touch_activity_returns_false_when_os_replace_fails(tmp_path, monkeypatch) -> None:
+    """Given the final `os.replace` step of the atomic write fails (a full
+    disk, a read-only mount, or — the scenario this whole fix exists for — a
+    state dir that turned root-owned or read-only after a stray `sudo`).
+    When `touch_activity` is called.
+    Then it does not raise (the existing C-14 contract, already proven above
+    by `test_touch_activity_warns_once_and_never_raises_when_rename_fails`)
+    AND it returns False — not None, not True — so a caller can finally tell
+    "I tried and it did not land" apart from "it landed", which
+    `_stamp_decision` (exercised further below) needs in order to stop
+    asserting a write that never happened."""
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(
+        os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("simulated: disk full"))
+    )
+    assert touch_activity(state_dir=state_dir, now=lambda: _dt(2026, 7, 28)) is False
+
+
+def test_touch_activity_returns_false_when_the_state_dir_cannot_be_created(
+    tmp_path, monkeypatch
+) -> None:
+    """Mirrors the test above for the OTHER OSError site inside
+    `_atomic_write` (`directory.mkdir(...)` failing, rather than
+    `os.replace`) — both failure sites must report the same False, not only
+    one of the two."""
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(
+        pathlib.Path,
+        "mkdir",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("simulated: permission denied")),
+    )
+    assert touch_activity(state_dir=state_dir, now=lambda: _dt(2026, 7, 28)) is False
+
+
+def test_touch_activity_returns_true_when_a_write_is_correctly_skipped_by_monotonic_protection(
+    tmp_path,
+) -> None:
+    """Given a stamp already recorded at T2, and a call with an OLDER `now`
+    T1 well within the poison ceiling — the "protected, no write needed"
+    branch (a SUCCESS, not a failure: the durable state on disk is already
+    correct and current).
+    When `touch_activity` is called.
+    Then it still returns True — "landed" is read as "the durable record is
+    fine after this call returns", never "a write literally executed just
+    now". A naive implementation that returns False whenever
+    `_atomic_write` itself was never invoked would wrongly report the
+    monotonic-protection guard — an intentional, correct no-op — as an
+    unrecordable failure, which would be the wrong direction one layer up
+    for every OTHER `touch_activity` call site in `partgraph.cli` that this
+    change also touches."""
+    state_dir = tmp_path / "state"
+    t2 = _dt(2026, 7, 28, 12, 0, 0)
+    t1 = t2 - timedelta(minutes=2)
+    touch_activity(state_dir=state_dir, now=lambda: t2)
+
+    assert touch_activity(state_dir=state_dir, now=lambda: t1) is True
+    assert read_activity_stamp(state_dir) == t2, "sanity: the protection itself still held"
+
+
 def test_read_activity_stamp_returns_none_for_missing_file(tmp_path) -> None:
     """Given no stamp file exists.
     When `read_activity_stamp` is called.
@@ -1353,6 +1440,145 @@ def test_no_stamp_bootstrap_protects_for_a_full_budget_window_then_goes_stale(tm
     assert call3 == IdleDecision(should_stop=True, reason=REASON_STALE), (
         "must go stale once a FULL budget window has elapsed since the first observation"
     )
+
+
+# ---------------------------------------------------------------------------
+# [RED — pre-fix, honesty fix] REASON_STAMP_UNRECORDABLE. Today
+# `_stamp_decision` calls `touch_activity(state_dir=directory, now=lambda:
+# moment)` and returns REASON_STAMP_BOOTSTRAPPED / REASON_STAMP_POISON_
+# RECOVERED UNCONDITIONALLY, discarding the boolean pinned in the section
+# above — so on a read-only or root-owned `data/state`, every `db idle-stop`
+# run claims a stamp was written when NONE ever lands, and the database is
+# never stopped: permanently, silently. `REASON_STAMP_UNRECORDABLE` does not
+# exist in `src/partgraph/util/activity.py` yet; it is imported LOCALLY
+# inside each test below (never at this file's module level) specifically so
+# that ONE missing symbol errors only THESE new tests at collection-adjacent
+# run time, not the ~120 other, already-green tests this same file collects.
+#
+# Every test below makes the write GENUINELY fail (`os.replace` raises,
+# exactly like the leaf-level failure injection just above — never a mocked
+# call-count or a hand-typed proxy string) and then asserts both which
+# REASON comes back AND what is actually left on disk — the property, not a
+# proxy. An implementation that returns REASON_STAMP_UNRECORDABLE
+# UNCONDITIONALLY (ignoring whether the write actually failed) is caught by
+# the EXISTING, unmodified tests above —
+# `test_no_stamp_and_db_reachable_bootstraps_a_stamp_and_does_not_stop_yet`,
+# `test_no_stamp_bootstrap_protects_for_a_full_budget_window_then_goes_stale`,
+# `test_future_stamp_beyond_the_poison_ceiling_is_untrustworthy_and_self_
+# heals_via_bootstrap`, `test_extremely_future_stamp_does_not_crash_and_
+# self_heals` — all of which pin the OLD reasons against a genuinely
+# writable tmp_path, so that direction of the mutation is already covered
+# and is not duplicated here.
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_write_failure_reports_unrecordable_not_bootstrapped_and_writes_no_stamp(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """Given a fresh install (no stamp, no lease) with the database
+    REACHABLE right now — ordinarily the bootstrap case — but the state dir
+    is genuinely unwritable (`os.replace` raises).
+    When `evaluate_idle` runs.
+    Then `should_stop` stays False (the safe direction is unchanged) BUT
+    `reason` is `REASON_STAMP_UNRECORDABLE` — NEVER `REASON_STAMP_
+    BOOTSTRAPPED`, which would assert a write that did not happen — and (the
+    actual property, not merely a different string) NO stamp file exists on
+    disk afterward, proving the reported reason matches what is actually
+    durable. A WARNING is logged exactly once, proving the failure is routed
+    through the SAME swallow-and-warn path `_atomic_write` already uses, not
+    a new, separately-untested error path.
+    """
+    from partgraph.util.activity import REASON_STAMP_UNRECORDABLE  # noqa: PLC0415
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(
+        os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("simulated: read-only"))
+    )
+
+    with caplog.at_level("WARNING"):
+        decision = evaluate_idle(
+            state_dir=state_dir,
+            idle_timeout_minutes=30.0,
+            db_reachable=True,
+            now=lambda: _dt(2026, 7, 28, 9, 0, 0),
+            psutil_module=_fake_psutil(),
+        )
+
+    assert decision.should_stop is False
+    assert decision.reason == REASON_STAMP_UNRECORDABLE, (
+        f"a write that genuinely did not land must never be reported as "
+        f"REASON_STAMP_BOOTSTRAPPED: got {decision.reason!r}"
+    )
+    assert not activity_stamp_path(state_dir).exists(), (
+        "no stamp file may exist on disk when the reported reason admits the write failed"
+    )
+    assert any(r.levelname == "WARNING" for r in caplog.records)
+
+
+def test_poison_recovery_write_failure_reports_unrecordable_and_leaves_the_poisoned_stamp_untouched(
+    tmp_path, monkeypatch
+) -> None:
+    """Given a stamp poisoned beyond the ceiling — ordinarily the self-heal/
+    poison-recovery case — with the database reachable, but the write
+    genuinely fails.
+    When `evaluate_idle` runs.
+    Then `reason` is `REASON_STAMP_UNRECORDABLE` — NEVER `REASON_STAMP_
+    POISON_RECOVERED`, which would claim a self-heal that never happened —
+    and the ORIGINAL poisoned stamp is left completely UNCHANGED on disk (a
+    failed `os.replace` never touches the real target, only the temp file it
+    wrote to first), proving the failed self-heal attempt neither corrupted
+    nor partially overwrote the existing record either.
+    """
+    from partgraph.util.activity import REASON_STAMP_UNRECORDABLE  # noqa: PLC0415
+
+    state_dir = tmp_path / "state"
+    now_value = _dt(2026, 7, 28, 12, 0, 0)
+    poisoned = now_value + timedelta(hours=1)
+    touch_activity(state_dir=state_dir, now=lambda: poisoned)  # lands: still writable here
+
+    monkeypatch.setattr(
+        os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("simulated: read-only"))
+    )
+    decision = evaluate_idle(
+        state_dir=state_dir,
+        idle_timeout_minutes=30.0,
+        db_reachable=True,
+        now=lambda: now_value,
+        psutil_module=_fake_psutil(),
+    )
+
+    assert decision.should_stop is False
+    assert decision.reason == REASON_STAMP_UNRECORDABLE, (
+        f"a failed self-heal write must never be reported as "
+        f"REASON_STAMP_POISON_RECOVERED: got {decision.reason!r}"
+    )
+    assert read_activity_stamp(state_dir) == poisoned, (
+        "the original poisoned stamp must survive a failed self-heal attempt untouched"
+    )
+
+
+def test_stamp_unrecordable_reason_constant_is_a_new_distinct_plain_string() -> None:
+    """Given the module's existing REASON_* tags are all distinct, path-free
+    plain strings (module docstring's own stated invariant: "every value is
+    safe to print verbatim: no path, no separator, no operator data").
+    When `REASON_STAMP_UNRECORDABLE` is read.
+    Then it is a `str`, contains no `/`, and collides with none of the seven
+    reason tags this file already imports — including `REASON_NOTHING_TO_DO`
+    (reusing it would conflate "the database is not reachable" with "the
+    database IS up but the record could not be written", exactly the
+    state-collapse this module's own docstring forbids for leases, now
+    pinned here for the stamp too) — proving the new tag is genuinely
+    additive, never an accidental alias for an existing one."""
+    from partgraph.util.activity import REASON_STAMP_UNRECORDABLE  # noqa: PLC0415
+
+    existing = {
+        REASON_DISABLED, REASON_LIVE_LEASE, REASON_UNDETERMINED_LEASE,
+        REASON_FRESH_STAMP, REASON_STALE, REASON_NOTHING_TO_DO,
+        REASON_STAMP_BOOTSTRAPPED, REASON_STAMP_POISON_RECOVERED,
+    }
+    assert isinstance(REASON_STAMP_UNRECORDABLE, str)
+    assert "/" not in REASON_STAMP_UNRECORDABLE
+    assert REASON_STAMP_UNRECORDABLE not in existing
 
 
 # ---------------------------------------------------------------------------
