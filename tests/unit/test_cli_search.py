@@ -4293,3 +4293,270 @@ def test_security_f4_build_dgraph_client_called_exactly_once_across_search_and_p
         f"the search+probe round-trip (the probe reuses the search client). "
         f"Got {build_spy.call_count} call(s)."
     )
+
+
+# ===========================================================================
+# AC-LM: `search --limit` non-positive rejection (issue: the CLI's five
+# --limit commands disagreed — four (ingest jlcparts, embed, refresh-links,
+# refresh) route through cli.py's `_validate_limit` and reject a non-positive
+# value with exit 1 and the fixed "--limit must be a positive integer."
+# message; `search` alone declared `--limit` as a Typer `int`, so Click
+# coerced it before any repo code saw it and `_validate_limit` never ran.
+# `search --limit 0`/`--limit -5` therefore fell straight through to
+# dql_builder's `first = max(1, min(int(limit), MAX_RESULT_LIMIT))` and
+# silently became `--limit 1` — exit 0, a full result set, no error.
+#
+# ADR-0024 (breaking-change record; not written by this test suite) must
+# record: `search --limit 0` / `search --limit <negative>` changes from
+# "exit 0, silently clamped to 1" to "exit 1, rejected" — anyone scripting
+# `search --limit 0` today for its old (accidental) behaviour will start
+# seeing a failure.
+#
+# Explicitly OUT of scope (the tests below pin the boundary so it cannot
+# silently move):
+#   - The upper cap (`--limit 5000` -> still clamped to MAX_RESULT_LIMIT=200,
+#     never an error). search's own --help text says results "stay capped at
+#     200 regardless of --limit" — that is a documented feature, not a bug.
+#   - `--limit abc` (non-integer text). CONFIRMED by direct invocation
+#     (mocked _build_dgraph_client + _autostart_database, PARTGRAPH_AUTOSTART
+#     unset -> the module-level conftest autouse fixture forces "0"): Click's
+#     own `int` coercion already rejects this BEFORE the command body (and
+#     therefore before _validate_limit could ever run) with its own exit
+#     code 2 and "Invalid value for '--limit': 'abc' is not a valid integer."
+#     message — an already-acceptable error. Only the sign is ours to fix.
+# ===========================================================================
+
+@pytest.mark.parametrize("bad_limit", ["0", "-1", "-5", "-999"])
+def test_ac_lm_1_search_limit_non_positive_exits_1_reuses_validate_limit_message(
+    bad_limit: str,
+) -> None:
+    """AC-LM-1: Given `partgraph search MAX232 --limit <n>` where n <= 0
+    (0, -1, -5, -999).
+    When invoked.
+
+    OLD (pre-fix) behaviour: exit 0. `--limit` was typed `int` in the Typer
+    option, so Click coerced the string to an int before any validation ran;
+    the value then reached dql_builder's `max(1, min(int(limit),
+    MAX_RESULT_LIMIT))` and was silently rewritten to 1 — a full query still
+    ran and results (or "No matches found") were printed.
+
+    NEW (post-fix, ADR-0024) behaviour: exit code is 1, and the output
+    contains the EXACT existing "--limit must be a positive integer."
+    message — the same fixed, path-free string `_validate_limit` already
+    emits for `ingest jlcparts` / `embed` / `refresh-links` / `refresh`
+    (cli.py:1259), proving `search` now reuses that validator rather than
+    re-implementing its own copy. No Dgraph client is ever built (parity
+    with `_connect_dgraph`'s own contract: "a bad --limit must be reported
+    without starting anything").
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--limit", bad_limit])
+
+    assert result.exit_code == 1, (
+        f"AC-LM-1: --limit {bad_limit!r} must exit 1 (was exit 0, silently "
+        f"clamped to 1, before this fix). Got {result.exit_code}.\n{result.output}"
+    )
+    assert "--limit must be a positive integer." in result.output, (
+        f"AC-LM-1: must reuse the EXACT _validate_limit message (parity with "
+        f"ingest jlcparts/embed/refresh-links/refresh). Got:\n{result.output!r}"
+    )
+    assert not captured, (
+        f"AC-LM-1: no Dgraph query may be sent for a rejected --limit. "
+        f"Got {len(captured)} captured call(s)."
+    )
+    assert "/home/" not in result.output, (
+        f"AC-LM-1/Security-baseline: no filesystem path leak. Got: {result.output!r}"
+    )
+    assert "Traceback" not in result.output, (
+        f"AC-LM-1/Security-baseline: no raw traceback. Got: {result.output!r}"
+    )
+
+
+def test_ac_lm_2_search_limit_one_boundary_still_succeeds() -> None:
+    """AC-LM-2 (edge case): Given `partgraph search MAX232 --limit 1` — the
+    smallest value _validate_limit accepts as positive.
+    When invoked.
+    Then exit code is 0 (UNCHANGED by this fix: 1 was never rejected, before
+    or after), and the captured DQL's `first:` clause is 1 for every block —
+    the boundary sits exactly at "1 is accepted, 0 is not", matching
+    `_validate_limit`'s own `value <= 0` check (cli.py:1258) exactly, with no
+    off-by-one drift introduced by threading validation into `search`.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--limit", "1"])
+
+    assert result.exit_code == 0, (
+        f"AC-LM-2: --limit 1 must exit 0 (the smallest legal positive value). "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured, "AC-LM-2: expected at least one Dgraph query to be sent."
+    dql, _variables = captured[0]
+    first_values = re.findall(r"first\s*:\s*(\d+)", dql)
+    assert first_values, f"AC-LM-2: expected at least one 'first: N' clause. Got:\n{dql}"
+    for raw_val in first_values:
+        assert int(raw_val) == 1, (
+            f"AC-LM-2: --limit 1 must produce 'first: 1' in every block. "
+            f"Got first: {raw_val} in:\n{dql}"
+        )
+
+
+def test_ac_lm_3_search_limit_5000_stays_silently_clamped_not_rejected() -> None:
+    """AC-LM-3 (scope precision — the upper cap is UNCHANGED by this fix):
+    Given `partgraph search MAX232 --limit 5000` (well above
+    MAX_RESULT_LIMIT=200, but a positive integer).
+    When invoked.
+    Then exit code is 0 (NOT an error, both before and after this fix — the
+    task is explicit that a documented cap must never become a rejection),
+    and the captured DQL's `first:` clause stays <= 200 in every block
+    (dql_builder's own `min(int(limit), MAX_RESULT_LIMIT)` clamp, unchanged).
+    search's own --help text says "results stay capped at 200 regardless of
+    --limit" — that promise must keep holding after ADR-0024 lands.
+    """
+    mock_txn, captured = _make_capturing_txn()
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client):
+        result = _invoke(["search", "MAX232", "--limit", "5000"])
+
+    assert result.exit_code == 0, (
+        f"AC-LM-3: --limit 5000 must stay a silent clamp, NOT an error "
+        f"(the upper cap is deliberate and documented). "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    assert captured, "AC-LM-3: expected at least one Dgraph query to be sent."
+    dql, _variables = captured[0]
+    first_values = re.findall(r"first\s*:\s*(\d+)", dql)
+    assert first_values, f"AC-LM-3: expected at least one 'first: N' clause. Got:\n{dql}"
+    for raw_val in first_values:
+        assert int(raw_val) <= 200, (
+            f"AC-LM-3: PIN MAX_RESULT_LIMIT=200 — effective cap in query is "
+            f"{raw_val}, must stay <= 200. Query text:\n{dql}"
+        )
+
+
+def test_ac_lm_4_search_limit_non_integer_text_keeps_clicks_own_error_out_of_scope() -> None:
+    """AC-LM-4 (scope boundary — CONFIRMED, not assumed, by direct
+    invocation before writing this test: mocked _build_dgraph_client +
+    _autostart_database, PARTGRAPH_AUTOSTART left at the conftest-forced
+    "0"): Given `partgraph search MAX232 --limit abc` (non-integer text).
+    When invoked.
+    Then exit code is 2 (Click's OWN usage-error exit code — NOT 1, and NOT
+    _validate_limit's exit code), the output contains Click's native
+    "Invalid value for '--limit'" phrasing, and the output does NOT contain
+    the reused "--limit must be a positive integer." message. `--limit`
+    stays a Typer `int` option for non-integer text; Click's own coercion
+    already produces an acceptable, clear error before any repo code runs,
+    so only the sign/zero case (AC-LM-1) is this fix's job. This pin exists
+    so a later refactor that reroutes ALL of --limit's validation through
+    _validate_limit (changing the Typer type to `str`, as the other four
+    commands do) cannot silently change this exit code or message without
+    a test noticing.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--limit", "abc"])
+
+    assert result.exit_code == 2, (
+        f"AC-LM-4: --limit abc must stay Click's own usage-error exit code 2 "
+        f"(out of this fix's scope). Got {result.exit_code}.\n{result.output}"
+    )
+    assert "Invalid value for '--limit'" in result.output, (
+        f"AC-LM-4: expected Click's own native error text. Got:\n{result.output!r}"
+    )
+    assert "--limit must be a positive integer." not in result.output, (
+        f"AC-LM-4: must NOT be rerouted through _validate_limit's message — "
+        f"that would change an already-acceptable, out-of-scope error. "
+        f"Got:\n{result.output!r}"
+    )
+    mock_build.assert_not_called()
+
+
+def test_ac_lm_5_json_output_limit_zero_exits_1_no_envelope() -> None:
+    """AC-LM-5 (contract test — API_AND_CONTRACT_RULES): Given `--json`
+    combined with `--limit 0`.
+    When invoked.
+
+    OLD (pre-fix) behaviour: exit 0, a full JSON envelope (`{"count": ...,
+    "results": [...]}`) printed for a single silently-clamped-to-1 result
+    set.
+
+    NEW (post-fix) behaviour: exit code is 1, `_build_dgraph_client` is
+    NEVER called, and stdout is NOT a valid JSON value — matching this
+    file's existing Gate-3 contract ("Errors still exit non-zero and print
+    no JSON") already pinned for --package/--min-stock/empty-query in
+    test_gate3_json_invalid_package_exit_1_no_db_client_no_envelope and
+    test_gate3_json_invalid_min_stock_exit_1_no_db_client_no_envelope.
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(cli_mod, "_build_dgraph_client") as mock_build:
+        result = _invoke(["search", "MAX232", "--json", "--limit", "0"])
+
+    assert result.exit_code == 1, (
+        f"AC-LM-5: --json + --limit 0 must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    mock_build.assert_not_called()
+    with pytest.raises(ValueError):
+        json.loads(result.output)
+
+
+def test_ac_lm_6_semantic_search_shares_the_same_limit_validation() -> None:
+    """AC-LM-6 (integration coverage — the two branches of `search` share ONE
+    `--limit` Typer option, so validation must run BEFORE the `if semantic is
+    not None:` split, exactly like every other AC-SF flag validator already
+    does): Given `partgraph search --semantic "rs232 transceiver" --limit 0`.
+    When invoked.
+
+    OLD (pre-fix) behaviour: exit 0. The semantic path never validated
+    --limit either; it flowed into `_run_semantic_search`'s own
+    `candidate_k = min(max(limit * 20, 200), 1500)` oversampling formula,
+    where `0 * 20 = 0` and `max(0, 200) = 200` — a full semantic search still
+    ran on a 200-candidate pool.
+
+    NEW (post-fix) behaviour: exit code is 1, the output contains the exact
+    "--limit must be a positive integer." message, the embedding encoder is
+    NEVER invoked, and no Dgraph query is ever sent — proving the fix does
+    not just patch the lexical `search` path while leaving `--semantic`
+    silently broken.
+    """
+    import partgraph.cli as cli_mod
+
+    encoder_called = [False]
+
+    def _counting_get_encoder():
+        def _enc(texts):
+            encoder_called[0] = True
+            return [_FAKE_VECTOR for _ in texts]
+        return _enc
+
+    mock_txn, captured = _make_capturing_txn({"exact": [], "trig": [], "fts": [], "semantic": []})
+    mock_client = _make_mock_client(mock_txn)
+
+    with _patch_dgraph(mock_client), \
+         patch.object(cli_mod, "get_encoder", _counting_get_encoder, create=True):
+        result = _invoke(["search", "--semantic", "rs232 transceiver", "--limit", "0"])
+
+    assert result.exit_code == 1, (
+        f"AC-LM-6: --semantic ... --limit 0 must exit 1 (was exit 0, a full "
+        f"semantic search on a 200-candidate pool, before this fix). "
+        f"Got {result.exit_code}.\n{result.output}"
+    )
+    assert "--limit must be a positive integer." in result.output, (
+        f"AC-LM-6: must reuse the exact _validate_limit message on the "
+        f"semantic path too. Got:\n{result.output!r}"
+    )
+    assert not encoder_called[0], (
+        "AC-LM-6: the encoder must NOT be invoked for a rejected --limit "
+        "(it was invoked before this fix)."
+    )
+    assert not captured, (
+        f"AC-LM-6: no Dgraph query may be sent for a rejected --limit. "
+        f"Got {len(captured)} captured call(s)."
+    )
