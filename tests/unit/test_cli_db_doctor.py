@@ -213,6 +213,26 @@ _UNIT_LOADED_EMPTY_WANTEDBY_LINES = [
     "LoadState=loaded", "ActiveState=inactive", "SubState=dead",
     "UnitFileState=generated", "WantedBy=",
 ]
+#: Same loaded/inactive unit as above, but the `WantedBy` property line is
+#: ABSENT from `systemctl show`'s output altogether — never printed at all,
+#: as opposed to printed with an empty value (see
+#: `_UNIT_LOADED_EMPTY_WANTEDBY_LINES` immediately above). Only THIS shape
+#: is genuinely undeterminable; the shape above is a confirmed False.
+_UNIT_LOADED_WANTEDBY_LINE_MISSING_LINES = [
+    "LoadState=loaded", "ActiveState=inactive", "SubState=dead",
+    "UnitFileState=generated",
+]
+#: A unit an operator has explicitly MASKED (`systemctl --user mask
+#: partgraph-dgraph.service`) — systemd's real shape: masking symlinks the
+#: unit to /dev/null, so LoadState is "masked" (never "loaded") and there is
+#: no [Install] section to read, hence the SAME empty WantedBy= this file's
+#: confirmed-False fixture above also carries. The state most likely to be
+#: confused with the one this PR fixed: a masked unit also never starts at
+#: login, but for a completely different, unrelated reason.
+_UNIT_MASKED_EMPTY_WANTEDBY_LINES = [
+    "LoadState=masked", "ActiveState=inactive", "SubState=dead",
+    "UnitFileState=masked", "WantedBy=",
+]
 
 
 def _make_doctor_scripted_run(  # noqa: PLR0913 — one keyword-only knob per scriptable outcome.
@@ -402,14 +422,22 @@ def test_doctor_reports_wanted_by_default_false_without_claiming_enabled() -> No
     )
 
 
-def test_doctor_reports_wanted_by_default_none_as_unknown_never_guessed() -> None:
-    """[Contract: UnitState.wanted_by_default is None when undeterminable —
-    NEVER guessed] Given the unit is present/loaded, but its own WantedBy=
-    property line is EMPTY (no evidence either way — a real, if unusual,
-    systemd answer, e.g. a static unit with no [Install] section active).
+def test_doctor_reports_wanted_by_default_false_when_wantedby_present_and_empty_on_loaded_unit() -> None:
+    """[Honesty fix] Given the unit is present/loaded (systemd genuinely
+    loaded the quadlet unit) and its own `WantedBy=` property line is
+    PRESENT but its value is the empty string — the LIVE-VERIFIED shape this
+    repo's OWN documented drop-in procedure (docs/db-lifecycle.md) produces
+    on a real host once autostart has actually been removed. This is
+    positive evidence of absence, not absence of evidence.
     When `partgraph db doctor` runs.
-    Then the WantedBy-related line says "unknown" and asserts NEITHER an
-    affirmative NOR a negative autostart claim.
+    Then the WantedBy-related line does NOT say "unknown" (it must not hedge
+    on an answer it actually has), does NOT claim autostart is enabled, DOES
+    plainly signal the confirmed negative (mirrors the SAME
+    "no"/"disabled"/"false" vocabulary this suite already uses to detect a
+    confirmed-negative render, one whole-word class below), and — because
+    the evidence here is an EMPTY WantedBy=, not a WantedBy naming some
+    OTHER target — must not fabricate a specific alternate target that no
+    evidence supports.
     """
     fake = _make_doctor_scripted_run(
         ps_rows=[], unit_lines=_UNIT_LOADED_EMPTY_WANTEDBY_LINES, volume_returncode=1,
@@ -425,7 +453,132 @@ def test_doctor_reports_wanted_by_default_none_as_unknown_never_guessed() -> Non
     _assert_clean(result, 0)
     wanted_by_line = _line_with(result.output, "WantedBy")
     low = wanted_by_line.lower()
+    assert "unknown" not in low, (
+        f"a confirmed-empty WantedBy= on a loaded unit must not hedge as "
+        f"unknown: {wanted_by_line!r}"
+    )
+    import re as _re
+    assert not _re.search(r"\b(yes|enabled|true)\b", low), (
+        f"must not claim autostart is enabled when confirmed False: {wanted_by_line!r}"
+    )
+    assert _re.search(r"\b(no|disabled|false|does not)\b", low), (
+        f"a confirmed-empty WantedBy= must render a plain negative signal, "
+        f"not silence: {wanted_by_line!r}"
+    )
+    assert "some other target" not in low, (
+        f"WantedBy= was genuinely EMPTY (wanted by nothing), not a different "
+        f"target — the line must not fabricate a target no evidence names: "
+        f"{wanted_by_line!r}"
+    )
+
+
+def test_doctor_reports_wanted_by_default_none_as_unknown_when_wantedby_property_missing_entirely() -> None:
+    """[Contract: UnitState.wanted_by_default is None when undeterminable —
+    NEVER guessed] Given the unit is present/loaded, but `systemctl show`'s
+    output never carries a `WantedBy=` property line AT ALL — distinct from
+    the fixture in the test above, where the SAME property line is present
+    but its value is empty. No evidence either way was ever returned.
+    When `partgraph db doctor` runs.
+    Then the WantedBy-related line says "unknown" and asserts NEITHER an
+    affirmative NOR a negative autostart claim. A naive fix that treats
+    "loaded, and WantedBy did not literally equal a non-empty string
+    containing default.target" as False — rather than specifically keying
+    off "WantedBy present-and-empty" — would wrongly turn THIS case into a
+    guessed False too; this test exists to catch exactly that mutation.
+    """
+    fake = _make_doctor_scripted_run(
+        ps_rows=[], unit_lines=_UNIT_LOADED_WANTEDBY_LINE_MISSING_LINES, volume_returncode=1,
+    )
+    with (
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "doctor"])
+
+    _assert_clean(result, 0)
+    wanted_by_line = _line_with(result.output, "WantedBy")
+    low = wanted_by_line.lower()
     assert "unknown" in low, f"undeterminable WantedBy must render as 'unknown': {wanted_by_line!r}"
+    import re as _re
+    assert not _re.search(r"\b(yes|enabled|true|no|disabled|false)\b", low), (
+        f"an undetermined WantedBy must never be rendered as a guessed yes/no: {wanted_by_line!r}"
+    )
+
+
+def test_doctor_reports_wanted_by_default_none_as_unknown_when_systemctl_not_found_even_with_empty_wantedby() -> None:
+    """[Contract: UnitState.wanted_by_default is None when undeterminable —
+    NEVER guessed] Given the unit is NOT FOUND (`LoadState=not-found`) and
+    ALSO happens to answer with an empty WantedBy= (systemd's real shape for
+    a not-found unit — `_UNIT_NOT_FOUND_LINES`, this file's own default
+    fixture, reused here rather than inventing a parallel one).
+    When `partgraph db doctor` runs.
+    Then the WantedBy-related line still says "unknown", NOT a confirmed
+    "no": an empty WantedBy= is only positive evidence of absence on a unit
+    systemd actually LOADED — a not-found unit's empty WantedBy= means
+    nothing, and must not be confused for the confirmed-absent case pinned
+    above.
+    """
+    fake = _make_doctor_scripted_run(
+        ps_rows=[], unit_lines=_UNIT_NOT_FOUND_LINES, volume_returncode=1,
+    )
+    with (
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "doctor"])
+
+    _assert_clean(result, 0)
+    wanted_by_line = _line_with(result.output, "WantedBy")
+    low = wanted_by_line.lower()
+    assert "unknown" in low, (
+        f"a not-found unit's empty WantedBy= must still render as 'unknown', "
+        f"never as a confirmed no: {wanted_by_line!r}"
+    )
+    import re as _re
+    assert not _re.search(r"\b(yes|enabled|true|no|disabled|false)\b", low), (
+        f"an undetermined WantedBy must never be rendered as a guessed yes/no: {wanted_by_line!r}"
+    )
+
+
+def test_doctor_reports_wanted_by_default_none_as_unknown_when_unit_is_masked_even_with_empty_wantedby() -> None:
+    """[Contract: UnitState.wanted_by_default is None when undeterminable —
+    NEVER guessed] Given the unit is MASKED (`systemctl --user mask
+    partgraph-dgraph.service` — a realistic operator action, and the state
+    most likely to be confused with the one this PR fixed: a masked unit
+    ALSO never starts at login, but for a completely different, unrelated
+    reason) — `LoadState=masked`, never `loaded` — while ALSO answering
+    with an empty WantedBy= (systemd's real shape for a masked unit: masking
+    symlinks the unit to /dev/null, so there is no [Install] section to
+    read; the SAME empty value the confirmed-False fixture above carries).
+    When `partgraph db doctor` runs.
+    Then the WantedBy-related line still says "unknown", NOT the new
+    confirmed "no": the empty-WantedBy-is-a-confirmed-no reading is licensed
+    only on a unit systemd actually loaded, and a masked unit is not that —
+    conflating the two would render a masked unit's autostart status as a
+    confident "no" for the wrong reason.
+    """
+    fake = _make_doctor_scripted_run(
+        ps_rows=[], unit_lines=_UNIT_MASKED_EMPTY_WANTEDBY_LINES, volume_returncode=1,
+    )
+    with (
+        patch("partgraph.cli.engine_command", return_value=["docker"]),
+        patch("partgraph.cli.probe_health", side_effect=_healthy(False)),
+        patch("subprocess.run", side_effect=fake),
+        patch("shutil.which", side_effect=_which_systemctl_present),
+    ):
+        result = _invoke(["db", "doctor"])
+
+    _assert_clean(result, 0)
+    wanted_by_line = _line_with(result.output, "WantedBy")
+    low = wanted_by_line.lower()
+    assert "unknown" in low, (
+        f"a masked unit's empty WantedBy= must still render as 'unknown', "
+        f"never as a confirmed no: {wanted_by_line!r}"
+    )
     import re as _re
     assert not _re.search(r"\b(yes|enabled|true|no|disabled|false)\b", low), (
         f"an undetermined WantedBy must never be rendered as a guessed yes/no: {wanted_by_line!r}"

@@ -1053,6 +1053,17 @@ def _doctor_wanted_by_line(wanted_by_default: bool | None) -> str:
     Tri-state, mirroring the field it reports: an undeterminable answer prints
     as "unknown" and asserts NEITHER direction. A diagnostic that turns "I could
     not tell" into "no" is worse than one that says nothing.
+
+    The False branch states ONLY what the incoming bool actually licenses —
+    that ``default.target`` is not among the targets wanting the unit. It used
+    to say the unit "is wanted by some other target", which was true only while
+    False was reachable exclusively from a ``WantedBy`` naming a different
+    target. It is now also reachable from a ``WantedBy=`` that is present and
+    EMPTY, where the evidence is that NOTHING wants the unit; naming an
+    alternate target there would invent one. :class:`~partgraph.util.lifecycle.
+    UnitState` carries no target names, so this renderer cannot tell the two
+    sub-cases apart and must not word itself as though it could — the single
+    sentence below is exactly true of both.
     """
     if wanted_by_default is None:
         return (
@@ -1065,8 +1076,8 @@ def _doctor_wanted_by_line(wanted_by_default: bool | None) -> str:
             "starts at every login, whether or not partgraph is invoked."
         )
     return (
-        "Autostart at login (WantedBy=default.target): the unit is wanted by "
-        "some other target, so it does not start at login."
+        "Autostart at login (WantedBy=default.target): no - the unit is not "
+        "wanted by default.target, so it does not start at login."
     )
 
 

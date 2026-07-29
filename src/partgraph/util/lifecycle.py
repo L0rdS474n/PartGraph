@@ -375,8 +375,14 @@ _NOT_RUNNING_STATES = frozenset(
 
 #: ``systemctl show`` values.
 _LOAD_STATE_NOT_FOUND = "not-found"
+#: The ONE ``LoadState`` under which systemd has actually read the unit, and
+#: therefore the only one under which its ``WantedBy`` answer — including an
+#: EMPTY one — carries information (see :func:`_wanted_by_default`).
+_LOAD_STATE_LOADED = "loaded"
 _ACTIVE_STATE_ACTIVE = "active"
 _DEFAULT_TARGET = "default.target"
+#: The ``systemctl show`` property naming the targets that want the unit.
+_WANTED_BY_PROPERTY = "WantedBy"
 
 #: The ``Mounts[].Type`` value that marks a NAMED volume (as opposed to a bind
 #: mount, whose ``Name`` is absent).
@@ -444,7 +450,10 @@ class UnitState:
         wanted_by_default: True iff the unit is wanted by ``default.target``
             (and would therefore come back on the next login), False when the
             evidence says otherwise, and **None when undeterminable** — never
-            guessed.
+            guessed. False covers two sub-cases that this DTO deliberately does
+            NOT distinguish, because it carries no target names: another target
+            wants the unit, or nothing wants it. See :func:`_wanted_by_default`
+            for which shapes are evidence and which are silence.
     """
 
     present: bool
@@ -1014,6 +1023,13 @@ def unit_state(*, which: Callable[[str], str | None] | None = None) -> UnitState
     query itself could not be executed — an undeterminable unit is reported as
     absent rather than guessed at, and ``wanted_by_default`` stays None.
 
+    ``wanted_by_default`` stays None in exactly five shapes: ``systemctl``
+    absent from PATH, the show call raising, empty output, ``LoadState`` other
+    than ``loaded`` (including ``not-found``), and the ``WantedBy`` property
+    missing from otherwise-normal output. A ``WantedBy=`` line that is PRESENT
+    with an empty value on a ``loaded`` unit is none of those — it is a
+    confirmed False; see :func:`_wanted_by_default`.
+
     Args:
         which: PATH-lookup callable; defaults to :func:`shutil.which`, resolved
             at call time.
@@ -1048,12 +1064,11 @@ def unit_state(*, which: Callable[[str], str | None] | None = None) -> UnitState
 
     properties = _parse_property_lines(result.stdout)
     load_state = _property_or_none(properties, "LoadState")
-    wanted_by = properties.get("WantedBy") or ""
     return UnitState(
         present=load_state is not None and load_state != _LOAD_STATE_NOT_FOUND,
         load_state=load_state,
         active_state=_property_or_none(properties, "ActiveState"),
-        wanted_by_default=(_DEFAULT_TARGET in wanted_by.split()) if wanted_by else None,
+        wanted_by_default=_wanted_by_default(properties, load_state),
     )
 
 
@@ -1132,9 +1147,49 @@ def _parse_property_lines(stdout: str) -> dict[str, str]:
 
 
 def _property_or_none(properties: Mapping[str, str], key: str) -> str | None:
-    """Return a systemd property value, or None when absent or empty."""
+    """Return a systemd property value, or None when absent or empty.
+
+    Folds "key absent" and "key present but empty" into the same None. That is
+    the CORRECT reading for ``LoadState`` and ``ActiveState``, this helper's
+    only callers: an empty value for either is uninformative, so both shapes
+    are equally "systemd told us nothing". It is the WRONG reading for
+    ``WantedBy``, which is why that property is decided by
+    :func:`_wanted_by_default` instead of here.
+    """
     value = properties.get(key)
     return value or None
+
+
+def _wanted_by_default(
+    properties: Mapping[str, str], load_state: str | None
+) -> bool | None:
+    """Decide autostart-at-login from ``WantedBy``, tri-state and never guessed.
+
+    Deliberately NOT routed through :func:`_property_or_none`: an empty
+    ``WantedBy=`` on a unit systemd actually LOADED is systemd's complete
+    answer that **nothing** wants the unit — positive evidence of absence, not
+    absence of evidence, and exactly what this repo's own documented drop-in
+    procedure (``docs/db-lifecycle.md``) produces on a real host once autostart
+    has been removed. Collapsing it into None reported a confirmed "no" as
+    "unknown".
+
+    Returns:
+        True — ``default.target`` is among the targets that want the unit, so
+        it comes back at every login.
+        False — the loaded unit answered, and ``default.target`` is not among
+        them: either some other target wants it, or nothing does. Those two are
+        indistinguishable in this return value BY DESIGN, because
+        :class:`UnitState` carries no target names; a caller must therefore not
+        render either sub-case as if it had been told which one it was.
+        None — undeterminable, never guessed: the property line was absent from
+        the output entirely (systemd returned no answer to key off), or the
+        unit is not ``loaded`` (a ``not-found`` unit's empty ``WantedBy=`` is an
+        artefact of there being no unit at all, and says nothing about
+        autostart).
+    """
+    if load_state != _LOAD_STATE_LOADED or _WANTED_BY_PROPERTY not in properties:
+        return None
+    return _DEFAULT_TARGET in properties[_WANTED_BY_PROPERTY].split()
 
 
 def _stop_unit_if_active(*, which: Callable[[str], str | None], dry_run: bool) -> bool:

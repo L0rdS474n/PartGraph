@@ -192,9 +192,11 @@ instruction is also harder to reason about than an always-visible one.
 
 #### 3b. Every value is rendered honestly, or as unknown
 
-A tri-state never collapses in the renderer. `WantedBy` prints as `yes`, as a
-statement that some other target wants the unit, or as `unknown` — and the
-`unknown` line asserts neither direction, not even implicitly. The volume prints
+A tri-state never collapses in the renderer. `WantedBy` prints as `yes`, as `no`,
+or as `unknown` — and the `unknown` line asserts neither direction, not even
+implicitly. (This paragraph originally read "as a statement that some other
+target wants the unit" for the negative case; see the 2026-07-29 amendment at the
+end of this ADR for why that wording was retired.) The volume prints
 `present` / `absent` / `unknown`. `LoadState` and `ActiveState` print
 **verbatim**: paraphrasing them would hide the exact detail the operator ran the
 command to see.
@@ -925,3 +927,89 @@ nothing was written to any unit directory, which is the same promise § 1 makes 
 the operator. The operator procedures in § 5 and § 6 are derived from
 podman-systemd.unit(5) and from the § 6 measurements recorded in ADR-0021, not
 from a fresh live run.
+
+## Amendment (2026-07-29): an empty `WantedBy=` is an answer, not a shrug
+
+§ 3b's rule — *a tri-state never collapses in the renderer* — was upheld. The
+**leaf** collapsed one instead, and § 3b's own negative wording then dressed the
+result up as something it was not. Both are corrected here.
+
+**The defect, observed live.** After an operator followed § 5's drop-in procedure
+verbatim — which worked — `db doctor` reported `Autostart at login
+(WantedBy=default.target): unknown - systemd reported neither answer`. The host's
+real state, captured byte-for-byte, was:
+
+```
+WantedBy=
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+UnitFileState=generated
+```
+
+`WantedBy` is **present with an empty value** on a unit systemd genuinely
+**loaded**. That is systemd's complete answer that nothing wants the unit — the
+exact success state this ADR's own documented remediation produces. Reporting it
+as `unknown` told the operator their fix could not be confirmed, when it had in
+fact been confirmed.
+
+**Cause.** `unit_state()` read the property as `properties.get("WantedBy") or ""`
+and mapped the resulting falsy string to `None`. That single `or` erased the
+distinction between *key absent* and *key present, value empty*.
+`_parse_property_lines` had never lost it — a `WantedBy=` line stores `""`, a
+missing line never enters the dict at all — so the evidence existed one frame
+below where it was discarded. The tri-state was not being protected; it was being
+manufactured.
+
+**The rule now.** `wanted_by_default` is a confirmed `False` when **both**
+`"WantedBy" in properties` **and** `LoadState == "loaded"`. Both conjuncts carry
+weight, and neither is decorative:
+
+- Presence alone is not enough. A `not-found` unit's output *also* carries
+  `WantedBy=`; there is no unit there, so that emptiness is an artefact rather
+  than evidence, and it must stay `None`.
+- `loaded` alone is not enough. If the property line never appears in the
+  output, systemd returned nothing to key off, and that must stay `None` too.
+
+The logic lives in a dedicated `_wanted_by_default()` and was deliberately **not**
+pushed into `_property_or_none()`. That helper is shared with `LoadState` and
+`ActiveState`, where an empty value genuinely *is* uninformative; folding
+absent-into-empty is correct for them and was left untouched.
+
+`None` still means undeterminable and is still never guessed, in exactly five
+shapes: `systemctl` absent from PATH, the show call raising, empty output,
+`LoadState` other than `loaded`, and the property missing from otherwise-normal
+output. Precisely one case left `None`, and it left because it had never been
+undeterminable.
+
+**The renderer's negative wording, retired.** § 3b previously described the `no`
+case as *"a statement that some other target wants the unit"*, and the code said
+so literally. That was accurate only while `False` was reachable **only** from a
+`WantedBy` naming a different target. It is now also reachable from a present-and-
+empty `WantedBy`, where the evidence is that **nothing** wants the unit — a
+different claim, and naming an alternate target there would be fabricating one.
+
+`UnitState` carries no target names (its field set is four fields, pinned by
+test), so the renderer cannot tell the two sub-cases apart. Rather than invent a
+name or widen the DTO past what any test requires, the line now states only what
+the incoming boolean licenses, which is exactly true of both sub-cases:
+
+```
+Autostart at login (WantedBy=default.target): no - the unit is not wanted by
+default.target, so it does not start at login.
+```
+
+**Verified live, on the host that produced the defect.** `partgraph db doctor`
+now prints that `no` line, exit 0 — the first claim in this ADR's family checked
+against a real systemd unit rather than only a scripted fake. The command remains
+strictly read-only: it is absent from § 7e's autostart allowlist, so it starts
+nothing, and no unit file was written or reloaded to obtain this result.
+
+Two tests were written first and were red before either change: one at the leaf
+(`test_lifecycle.py`, that a present-and-empty `WantedBy` on a loaded unit is a
+confirmed `False`) and one at the CLI (`test_cli_db_doctor.py`, that the rendered
+line neither hedges as `unknown` nor names "some other target"). Each is
+accompanied by a mutation-catching sibling pinning the shapes that must stay
+`None` — the property line missing entirely, and the not-found unit's empty
+`WantedBy=` — so a naive "loaded and not True means False" fix fails.
+`ruff check .` clean; full non-integration suite **1568 passed, 0 failed**.
