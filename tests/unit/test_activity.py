@@ -1603,6 +1603,135 @@ def test_stamp_unrecordable_reason_constant_is_a_new_distinct_plain_string() -> 
 
 
 # ---------------------------------------------------------------------------
+# [Gate 5 finding 2] The two-state invariant, pinned as a BLACK-BOX
+# regression test, not merely argued in a comment. `_stamp_decision`'s own
+# comment (`src/partgraph/util/activity.py`) records WHY `touch_activity`'s
+# "declined a needless write under monotonic protection -> True" success
+# case is structurally unreachable from its one call site: that branch runs
+# ONLY when the freshly-read stamp is absent or poisoned, and a fresh read
+# of an already-correct (non-poisoned) stamp is neither. That reasoning was
+# confirmed by inspection but asserted nowhere — precisely the "prose only"
+# criticism this commit's own earlier finding made of the docstring it
+# fixed. These two tests patch the module's OWN `touch_activity` name with
+# a fail-fast fake and prove it is NEVER CALLED AT ALL when an existing
+# stamp is already fresh or already stale (both are "already correct":
+# present and non-poisoned) — so a future change that widens the gating to
+# also call `touch_activity` in either of those cases trips this
+# immediately, rather than only being caught if someone happens to reread
+# the comment.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("existing_stamp_age_minutes", "expected_reason"),
+    [
+        pytest.param(5.0, REASON_FRESH_STAMP, id="already_fresh"),
+        pytest.param(120.0, REASON_STALE, id="already_stale"),
+    ],
+)
+def test_stamp_decision_never_calls_touch_activity_when_an_existing_stamp_is_already_correct(
+    tmp_path, monkeypatch, existing_stamp_age_minutes: float, expected_reason: str
+) -> None:
+    """[Gate 5 finding 2 — the regression test] Given a stamp already on
+    disk that is neither absent nor poisoned — either FRESH (well within
+    the timeout) or STALE (well past it), the two ways an "already correct"
+    stamp reaches `_stamp_decision`.
+    When `evaluate_idle` runs, with `partgraph.util.activity.touch_activity`
+    itself replaced by a fake that raises `AssertionError` if ever called.
+    Then the decision is unaffected (still the ordinary fresh/stale reason)
+    AND the fake is never invoked — proving, black-box, that widening
+    `_stamp_decision`'s gating to call `touch_activity` for an
+    already-correct stamp would be caught here, not left to a comment."""
+    import partgraph.util.activity as activity_module
+
+    state_dir = tmp_path / "state"
+    t0 = _dt(2026, 7, 28, 9, 0, 0)
+    touch_activity(state_dir=state_dir, now=lambda: t0)  # a real, landed, non-poisoned stamp
+
+    def _forbid_touch_activity(**kwargs):
+        raise AssertionError(
+            "touch_activity must never be called by _stamp_decision when an "
+            "existing stamp is already correct (fresh or stale, never absent "
+            "or poisoned) — this is exactly the gating widening Gate 5 asked "
+            "to be regression-tested"
+        )
+
+    monkeypatch.setattr(activity_module, "touch_activity", _forbid_touch_activity)
+
+    decision = evaluate_idle(
+        state_dir=state_dir,
+        idle_timeout_minutes=30.0,
+        db_reachable=True,
+        now=lambda: t0 + timedelta(minutes=existing_stamp_age_minutes),
+        psutil_module=_fake_psutil(),
+    )
+    assert decision == IdleDecision(should_stop=(expected_reason == REASON_STALE), reason=expected_reason)
+
+
+# ---------------------------------------------------------------------------
+# [Gate 5 finding 3] "Not sticky" — pinned hermetically, not only by hand
+# with a real `chmod 0500` (as both the implementer's and the reviewer's own
+# commit messages record). A call-counter over `os.replace` fails exactly
+# ONCE, then behaves normally, across TWO SEQUENTIAL `evaluate_idle` calls
+# sharing the SAME on-disk state — mirroring
+# `test_no_stamp_bootstrap_protects_for_a_full_budget_window_then_goes_stale`'s
+# own "two real, sequential calls sharing on-disk state" pattern, the actual
+# property rather than a single-call proxy.
+# ---------------------------------------------------------------------------
+
+
+def test_unrecordable_state_self_heals_to_bootstrapped_once_the_write_succeeds_again(
+    tmp_path, monkeypatch
+) -> None:
+    """[Gate 5 finding 3 — hermetic, not manual-only] Given a fresh install
+    (no stamp) where the FIRST `evaluate_idle` call's underlying write
+    genuinely fails (`os.replace` raises), and the SECOND call's write
+    succeeds — modelling the state directory becoming writable again (an
+    operator fixing a permission, or a full disk being freed), driven by an
+    in-process call-counter, never a real filesystem permission change.
+    When both calls run in sequence against the same `tmp_path` state dir.
+    Then the FIRST reports `REASON_STAMP_UNRECORDABLE` and leaves no stamp
+    on disk; the SECOND reports `REASON_STAMP_BOOTSTRAPPED` and a real
+    stamp now exists — proving the unrecordable state reflects only THIS
+    call's own write attempt, never a remembered failure from a previous
+    one: it is not sticky.
+    """
+    from partgraph.util.activity import REASON_STAMP_UNRECORDABLE  # noqa: PLC0415
+
+    state_dir = tmp_path / "state"
+    real_replace = os.replace
+    call_count = {"n": 0}
+
+    def _fails_once_then_succeeds(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OSError("simulated: read-only (first attempt only)")
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", _fails_once_then_succeeds)
+
+    first = evaluate_idle(
+        state_dir=state_dir, idle_timeout_minutes=30.0, db_reachable=True,
+        now=lambda: _dt(2026, 7, 28, 9, 0, 0), psutil_module=_fake_psutil(),
+    )
+    assert first.reason == REASON_STAMP_UNRECORDABLE
+    assert not activity_stamp_path(state_dir).exists()
+
+    second_moment = _dt(2026, 7, 28, 9, 1, 0)
+    second = evaluate_idle(
+        state_dir=state_dir, idle_timeout_minutes=30.0, db_reachable=True,
+        now=lambda: second_moment, psutil_module=_fake_psutil(),
+    )
+    assert second == IdleDecision(should_stop=False, reason=REASON_STAMP_BOOTSTRAPPED), (
+        "the state must self-heal to an honest bootstrap the moment the write "
+        "starts landing again — it must never stay stuck reporting unrecordable "
+        "once the underlying failure is gone"
+    )
+    assert read_activity_stamp(state_dir) == second_moment
+    assert call_count["n"] == 2, "sanity: both evaluate_idle calls must have attempted the write"
+
+
+# ---------------------------------------------------------------------------
 # [Gate 3a SHOULD-FIX] size/shape bounds on stamp and lease reads — mirrors
 # `partgraph.util.lifecycle.MAX_PS_OUTPUT_BYTES`'s own bounded-constant
 # precedent ("ps output is bounded ... before it is decoded"), applied here
