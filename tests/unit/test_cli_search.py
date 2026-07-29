@@ -4344,10 +4344,18 @@ def test_ac_lm_1_search_limit_non_positive_exits_1_reuses_validate_limit_message
     contains the EXACT existing "--limit must be a positive integer."
     message — the same fixed, path-free string `_validate_limit` already
     emits for `ingest jlcparts` / `embed` / `refresh-links` / `refresh`
-    (cli.py:1259), proving `search` now reuses that validator rather than
-    re-implementing its own copy. No Dgraph client is ever built (parity
-    with `_connect_dgraph`'s own contract: "a bad --limit must be reported
+    (cli.py:1259). No Dgraph client is ever built (parity with
+    `_connect_dgraph`'s own contract: "a bad --limit must be reported
     without starting anything").
+
+    NOTE on what this test does NOT prove: an identical, byte-for-byte
+    duplicate literal (`if limit <= 0: _err_console.print(...); raise
+    typer.Exit(code=1)`) copy-pasted straight into `search` would satisfy
+    every assertion below just as well as real delegation to
+    `_validate_limit` would — this test only inspects rendered output text,
+    so it cannot tell reuse from copy-paste. See
+    test_ac_lm_8_search_limit_rejection_delegates_to_validate_limit_not_a_duplicate,
+    which spies on `_validate_limit` itself and is the one that can.
     """
     mock_txn, captured = _make_capturing_txn()
     mock_client = _make_mock_client(mock_txn)
@@ -4559,4 +4567,91 @@ def test_ac_lm_6_semantic_search_shares_the_same_limit_validation() -> None:
     assert not captured, (
         f"AC-LM-6: no Dgraph query may be sent for a rejected --limit. "
         f"Got {len(captured)} captured call(s)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-LM-8 — closes a proxy gap: AC-LM-1..6 assert only rendered output text
+# (message string, exit code), never that `_validate_limit` was actually
+# CALLED. A hand-copied duplicate literal —
+#
+#     if limit <= 0:
+#         _err_console.print("[red]Error:[/red] --limit must be a positive integer.")
+#         raise typer.Exit(code=1)
+#
+# — placed directly in `search`, satisfies every AC-LM-1..6 assertion just
+# as well as genuine delegation to `_validate_limit(str(limit))` does,
+# because both paths render byte-identical text and the same exit code. Text
+# assertions cannot distinguish "search reuses the shared validator" from
+# "search re-implements a copy of it". This test can: it wraps
+# `partgraph.cli._validate_limit` with a call-tracking spy and asserts the
+# spy was actually invoked, with the user's --limit value coerced to the
+# string `_validate_limit`'s own `str | None` signature expects.
+#
+# DEMONSTRATED (mutation-testing style, against two standalone SCRATCH
+# copies of src/partgraph/cli.py loaded outside the repo — the tracked
+# src/partgraph/cli.py itself was never edited by this check, deliberately,
+# because another agent had live uncommitted work in progress on that exact
+# file at the time; see the Test Engineer's session report for the scratch
+# file paths and the exact `pytest` runs):
+#   - Real delegation (`_validate_limit(str(limit))` in `search`, before the
+#     --semantic branch split): AC-LM-1..6-style text assertions pass AND
+#     this test's spy assertion passes (`_validate_limit` was called).
+#   - Hand-copied duplicate literal (same `if limit <= 0: ...` block,
+#     inlined instead of calling `_validate_limit`): AC-LM-1..6-style text
+#     assertions STILL pass (byte-identical rendered text) but THIS test's
+#     spy assertion fails — `_validate_limit` was never called.
+# ---------------------------------------------------------------------------
+
+def test_ac_lm_8_search_limit_rejection_delegates_to_validate_limit_not_a_duplicate() -> None:
+    """AC-LM-8: Given `partgraph search MAX232 --limit 0`, with
+    `partgraph.cli._validate_limit` wrapped by a call-tracking spy (`wraps=`
+    the real function, so its own behaviour — the exit-1 side effect — still
+    runs unchanged; only the call itself is observed).
+    When invoked.
+    Then:
+    - `_validate_limit` is called at least once (proves DELEGATION, not a
+      hand-copied duplicate literal that happens to emit the same text —
+      see the block comment above this test, and AC-LM-1's docstring, which
+      explicitly does NOT claim more than its own (text-only) assertions
+      prove).
+    - It is called with a STRING "0" (`_validate_limit`'s declared
+      `str | None` signature; `search`'s Typer option stays `int`-typed per
+      AC-LM-4, so the call site must coerce with `str(limit)` before
+      delegating — passing the raw int would crash inside
+      `_validate_limit` on `limit.strip()`).
+    - exit code is still 1 and the shared message still appears (unchanged
+      from AC-LM-1; this test adds a NEW assertion, it does not replace the
+      existing one).
+    """
+    import partgraph.cli as cli_mod
+
+    with patch.object(
+        cli_mod, "_validate_limit", wraps=cli_mod._validate_limit
+    ) as spy_validate_limit:
+        result = _invoke(["search", "MAX232", "--limit", "0"])
+
+    assert result.exit_code == 1, (
+        f"AC-LM-8: --limit 0 must exit 1. Got {result.exit_code}.\n{result.output}"
+    )
+    assert "--limit must be a positive integer." in result.output, (
+        f"AC-LM-8: expected the shared _validate_limit message. Got:\n{result.output!r}"
+    )
+    assert spy_validate_limit.called, (
+        "AC-LM-8: _validate_limit must be CALLED for search's --limit too — "
+        "a hand-copied duplicate literal that renders the same text would "
+        "make every AC-LM-1..6 text assertion pass while never calling the "
+        "shared validator. This is the assertion that tells them apart."
+    )
+    call_args, call_kwargs = spy_validate_limit.call_args
+    called_value = call_args[0] if call_args else call_kwargs.get("limit")
+    assert isinstance(called_value, str), (
+        f"AC-LM-8: _validate_limit's own signature is `str | None` — search "
+        f"must call it with the coerced STRING form (e.g. str(limit)), not "
+        f"a raw int (that would crash inside _validate_limit on "
+        f"limit.strip()). Got {called_value!r} ({type(called_value).__name__})."
+    )
+    assert int(called_value) == 0, (
+        f"AC-LM-8: _validate_limit must be called with the user's actual "
+        f"--limit value (0), not some other value. Got {called_value!r}."
     )

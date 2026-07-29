@@ -1247,6 +1247,12 @@ def _validate_limit(limit: str | None) -> int | None:
     Returns the parsed positive integer, or ``None`` when no limit was given.
     Raises :class:`typer.Exit` (code 1) with the exact, test-pinned message
     when the value is not a positive integer.
+
+    Shared by all five ``--limit`` commands, so the message has one definition.
+    Four of them (``ingest jlcparts``, ``embed``, ``refresh-links``, ``refresh``)
+    declare the option as ``str | None`` and hand the raw text straight over;
+    ``search`` declares it as a Typer ``int`` and calls this with ``str(limit)``
+    for the sign check alone, leaving non-integer text to Click (ADR-0024).
     """
     if limit is None:
         return None
@@ -1904,9 +1910,10 @@ def search(  # noqa: PLR0913, PLR0917 — Typer command surface: one option per 
         20,
         "--limit",
         help=(
-            "Maximum number of results to show (capped at 200). For --semantic, "
-            "the candidate pool is internally oversampled before the top results "
-            "are selected, so results stay capped at 200 regardless of --limit."
+            "Maximum number of results to show (capped at 200). Must be a "
+            "positive integer. For --semantic, the candidate pool is internally "
+            "oversampled before the top results are selected, so results stay "
+            "capped at 200 regardless of --limit."
         ),
     ),
     no_truncate: bool = typer.Option(
@@ -2032,6 +2039,15 @@ def search(  # noqa: PLR0913, PLR0917 — Typer command surface: one option per 
     # flag BEFORE the --semantic branch split and BEFORE any Dgraph client is
     # built, so both paths share one contract and a bad value never opens a
     # connection. Each helper emits a fixed, path-free error and exits 1.
+    #
+    # --limit is delegated to the SAME `_validate_limit` the other four --limit
+    # commands use (ADR-0024), so the sign check and its message have exactly one
+    # definition. The option stays a Typer `int`: Click's own coercion keeps
+    # owning non-integer text with its exit-2 usage error, and re-typing the
+    # option to `str` for symmetry would silently take that over. The return
+    # value is discarded: `limit` is already the parsed int, and rebinding it
+    # here would make this call load-bearing for more than validation.
+    _validate_limit(str(limit))
     _validate_filter_text_flag(manufacturer, flag="--manufacturer")
     _validate_filter_text_flag(category, flag="--category")
     min_stock_val = _validate_min_stock_flag(min_stock, in_stock=in_stock)
